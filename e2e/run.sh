@@ -441,7 +441,7 @@ echo "==> Step 2.2: Data plane and privileges"
 gw_exec nft list table inet gw >/dev/null
 gw_exec /usr/local/bin/gwctl dataplane check --config /etc/gatewayd/gatewayd.yaml
 
-gw_exec bash -ceu '
+gw_exec bash -eu <<'EOF'
   check_sysctl() {
     local k="$1" want="$2" got
     got="$(sysctl -n "$k")"
@@ -461,40 +461,50 @@ gw_exec bash -ceu '
 
   gw_pid="$(systemctl show -p MainPID --value gatewayd.service)"
   grep -E "^(Uid|CapEff|CapPrm|CapAmb):" "/proc/${gw_pid}/status"
-  uid="$(awk "/^Uid:/{print \$2}" "/proc/${gw_pid}/status")"
+  uid="$(awk '/^Uid:/{print $2}' "/proc/${gw_pid}/status")"
   [[ "$uid" != "0" ]] || { echo "FAIL: gatewayd running as root" >&2; exit 1; }
   for cap in CapEff CapPrm CapAmb; do
-    val="$(awk -v c="${cap}:" "\$1==c{print \$2}" "/proc/${gw_pid}/status")"
+    val="$(awk -v c="${cap}:" '$1==c{print $2}' "/proc/${gw_pid}/status")"
     [[ "$val" == "0000000000000000" ]] || { echo "FAIL: gatewayd ${cap}=${val}" >&2; exit 1; }
   done
 
   ss_out="$(ss -ltnup)"
   echo "$ss_out"
-  gw_socks="$(echo "$ss_out" | grep "\"gatewayd\"" || true)"
-  if [[ -z "$gw_socks" ]]; then
-    echo "FAIL: gatewayd has zero listeners in ss -ltnup" >&2
-    exit 1
-  fi
-  if echo "$gw_socks" | grep -E "(\*|0\.0\.0\.0|\[::\]|::):"; then
-    echo "FAIL: gatewayd has a wildcard listener" >&2
-    exit 1
-  fi
-  dm_socks="$(echo "$ss_out" | grep "\"dnsmasq\"" || true)"
-  if [[ -z "$dm_socks" ]]; then
-    echo "FAIL: dnsmasq has zero listeners in ss -ltnup" >&2
-    exit 1
-  fi
-  if echo "$dm_socks" | grep -E ":53\b"; then
-    echo "FAIL: dnsmasq is listening on :53" >&2
-    exit 1
-  fi
-  non_dhcp="$(echo "$dm_socks" | grep -vE "^udp[[:space:]].*:67\b" || true)"
-  if [[ -n "$non_dhcp" ]]; then
-    echo "FAIL: dnsmasq has socket(s) other than UDP :67:" >&2
-    echo "$non_dhcp" >&2
-    exit 1
-  fi
-'
+  echo "$ss_out" | awk '
+    /"gatewayd"/ {
+      gw_count++
+      addr = $5
+      sub(/:[^:]+$/, "", addr)
+      sub(/%.*$/, "", addr)
+      if (addr == "0.0.0.0" || addr == "*" || addr == "[::]" || addr == "::") {
+        printf "FAIL: gatewayd has wildcard local address: %s\n", $0 > "/dev/stderr"
+        bad = 1
+      }
+    }
+    /"dnsmasq"/ {
+      dm_count++
+      if ($5 ~ /:53$/) {
+        printf "FAIL: dnsmasq is listening on :53: %s\n", $0 > "/dev/stderr"
+        bad = 1
+      }
+      if ($1 != "udp" || $5 !~ /:67$/) {
+        printf "FAIL: dnsmasq has socket other than UDP :67: %s\n", $0 > "/dev/stderr"
+        bad = 1
+      }
+    }
+    END {
+      if (gw_count < 1) {
+        print "FAIL: gatewayd has zero listeners in ss -ltnup" > "/dev/stderr"
+        bad = 1
+      }
+      if (dm_count < 1) {
+        print "FAIL: dnsmasq has zero listeners in ss -ltnup" > "/dev/stderr"
+        bad = 1
+      }
+      if (bad) exit 1
+    }
+  '
+EOF
 
 echo "==> Step 2.3: DHCPv4 leases and dnsmasq privilege drop"
 configure_guest_dhcp() {
