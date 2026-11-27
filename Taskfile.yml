@@ -67,3 +67,8 @@ tasks:
     cmds:
       - task: lint
       - task: test
+
+  e2e:
+    desc: Run real Incus E2E harness against a throwaway project (pass flags after --)
+    cmds:
+      - ./e2e/run.sh {{.CLI_ARGS}}
