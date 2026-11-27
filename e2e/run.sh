@@ -521,21 +521,37 @@ DHCP=ipv4
 LinkLocalAddressing=no
 IPv6AcceptRA=no
 NET
+    ip addr flush dev eth0
+    ip route flush dev eth0 || true
     systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
     networkctl reconfigure eth0 >/dev/null 2>&1 || systemctl restart systemd-networkd
+
     got_ip=''
+    gw=''
+    ready=0
     for _ in \$(seq 1 30); do
-      got_ip=\"\$(ip -4 -o addr show dev eth0 | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
-      if [[ -n \"\$got_ip\" ]]; then
+      got_ip=\"\$(ip -4 -o addr show dev eth0 | awk '{print \$4}' | cut -d/ -f1 | python3 -c '
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1])
+for line in sys.stdin:
+    s = line.strip()
+    if not s:
+        continue
+    if ipaddress.ip_address(s) in net:
+        print(s)
+        break
+' '${want_cidr}')\"
+      gw=\"\$(ip -4 route show default dev eth0 | awk '{print \$3}' | head -n1)\"
+      if [[ -n \"\$got_ip\" && \"\$gw\" == '${want_gw}' ]]; then
+        ready=1
         break
       fi
       sleep 1
     done
-    [[ -n \"\$got_ip\" ]] || { echo 'FAIL: no IPv4 address received via DHCP on ${ginst}' >&2; exit 1; }
-    python3 -c 'import ipaddress,sys; ip=ipaddress.ip_address(sys.argv[1]); net=ipaddress.ip_network(sys.argv[2]); assert ip in net, f\"{ip} not in {net}\"' \"\$got_ip\" '${want_cidr}'
-
-    gw=\"\$(ip -4 route show default dev eth0 | awk '{print \$3}' | head -n1)\"
-    [[ \"\$gw\" == '${want_gw}' ]] || { echo \"FAIL: ${ginst} default route gw=\${gw}, want ${want_gw}\" >&2; exit 1; }
+    if [[ \"\$ready\" -ne 1 ]]; then
+      echo \"FAIL: ${ginst} did not acquire DHCP IP in ${want_cidr} with gw=${want_gw} within 30s (got_ip='\${got_ip}', gw='\${gw}')\" >&2
+      exit 1
+    fi
 
     # Assert DHCP handed out link_IP as DNS BEFORE touching any resolver config.
     dhcp_dns=''
