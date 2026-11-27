@@ -5,10 +5,11 @@
 `gateway` separates host network privilege from the guest-facing data plane across three runtime roles (plus operator subcommands in the same binary):
 
 1. **`gateway netsetup --config <path>` (root, one-shot via systemd `ExecStartPre=+`):**
-   Removes any stale `dataplane.ready_file` first, generates and applies kernel sysctls, per-link
-   `ip addr` / `ip rule` / `ip route` configuration, atomic `nft -f` ruleset (`table inet gw`),
-   and the DHCP-only `dnsmasq` config from the single YAML config, and writes `dataplane.ready_file`
-   last only after every step succeeds.
+   Removes any stale `dataplane.ready_file` first, generates and applies kernel sysctls and the
+   atomic `nft -f` ruleset (`table inet gw`, verified with `nft list table`) **before** bringing up
+   any sandbox link or assigning per-link `ip addr` / `ip rule` / `ip route` state, then atomically
+   writes the DHCP-only `dnsmasq` config and `dataplane.ready_file` into root-owned `0755`
+   `/run/gateway-dataplane/` (refusing symlinks or non-root/group-/other-writable directories).
 2. **`dnsmasq` (unprivileged DHCPv4 only, started after `netsetup`):**
    Runs with `--port=0 --dhcp-broadcast --no-ping --bind-interfaces --user=<dhcp.user>` and one
    `--interface` per sandbox link so it drops root and all network capabilities (`CAP_NET_ADMIN`,
@@ -36,30 +37,41 @@ Guest packet on sandbox interface (sbxN)
        forward (policy accept): drop iifname @sandbox_ifs and oifname @sandbox_ifs
        output (policy accept): drop IPv6 to @sandbox_ifs
   -> DNS (internal/dns, UDP+TCP on link_ip:dns_port):
-       Never forwards upstream. Ignores+audits QR=1 response packets; returns REFUSED/NOTIMP for
-       malformed/non-QUERY/non-IN packets; returns synthetic A from dns.fake_cidr (198.18.0.0/15)
-       for allowlisted names, NODATA for AAAA/HTTPS/SVCB, REFUSED for all other qtypes/hosts.
+       Never forwards upstream. Ignores+audits QR=1 response packets; audits unparseable packets as
+       effect=deny reason=malformed; returns REFUSED/NOTIMP for non-QUERY/non-IN/multi-question
+       packets; returns deterministic stateless-hash synthetic A from dns.fake_cidr (198.18.0.0/15)
+       for allowlisted names, NODATA for AAAA/HTTPS/SVCB, REFUSED for all other qtypes/hosts
+       (preserving explicit rule-deny + rule_id).
   -> Proxy listener (internal/proxy, explicit-bind link_ip:https_port and link_ip:http_port):
+       Shared per-link connection semaphore caps concurrent HTTPS+HTTP connections at
+       http.max_conns_per_link (default 512; excess connections closed immediately and counted in
+       gateway_conns_rejected_total). Attribution is strictly per link (src_ip is logged, never trusted).
        TLS ClientHello (getCertificate): rejects missing/IP/denied SNIs before minting or caching
          any leaf certificate; mints ECDSA P-256 leaves via RWMutex + singleflight LeafCache.
        HTTP request (serveHTTP) runs three linear stages:
-         1. admit():   rejects CONNECT, non-origin/non-canonical paths, H2 explicit Host, Host/port
-                       or SNI mismatch, non-WS upgrades, policy denies, WS with body, oversized
-                       Content-Length.
-         2. prepare(): copies end-to-end headers, substitutes bound secrets on HTTPS :443 only
-                       (failing closed 403 before dial on unresolved secrets), unconditionally
-                       sweeps Proxy-Authorization and remaining mf_ph_* (incl. decoded Basic Auth),
-                       and forces Accept-Encoding: identity on bound hosts.
-         3. relay():   registers flow in FlowRegistry, writes synchronous admission audit (503 on
-                       error), then either upgrades WebSocket (bridgeWebSocket with egress cap) or
-                       calls http.Transport.RoundTrip (no 3xx redirects), enforces identity-only
-                       Content-Encoding and fail-closed redaction on bound hosts, strips
-                       Content-Length on bound hosts, streams body+trailers, and writes completion
-                       audit.
+         1. admit():   rejects CONNECT, non-origin/non-canonical/escaped-separator paths, H2 explicit
+                       Host, Host/port or SNI mismatch, non-WS upgrades, policy denies (evaluated
+                       from a single compiledSet snapshot), WS with body, oversized Content-Length.
+         2. prepare(): copies end-to-end headers, substitutes bound secrets on HTTPS :443 only when
+                       matched on their owning rule (failing closed 403 before dial on unresolved
+                       secrets), unconditionally sweeps Proxy-Authorization and remaining mf_ph_*
+                       (incl. decoded Basic Auth), and forces Accept-Encoding: identity on bound hosts.
+         3. relay():   registers flow in FlowRegistry, re-checks admission if config or grants changed
+                       since admit(), writes synchronous admission audit (503 on error), then either
+                       upgrades WebSocket (30s handshake deadline + cancel-aware dial + bridgeWebSocket
+                       with egress cap) or calls http.Transport.RoundTrip (no 3xx redirects,
+                       http.upstream_response_header_timeout default 10m), enforces identity-only
+                       Content-Encoding and fail-closed redaction on bound hosts (literal, URL-encoded,
+                       and JSON-escaped forms), strips Content-Length on bound hosts, streams
+                       body+trailers (aborting guest stream via http.ErrAbortHandler on truncated
+                       upstream body), records metrics with a bounded reason label even if completion
+                       audit fails, and writes completion audit with explicit teardown reason on
+                       revoked/grant-expired/reload/client-canceled flows.
   -> Upstream dial (internal/netguard.Dialer):
-       Dial-by-name only (refuses IP literals). Static `records` entries dial ONLY the exact pinned
-       IP; all other names resolve via upstream DNS and validate every connect-time address in
-       net.Dialer.Control (Unmap() -> IPv4 special/private deny list; IPv6 2000::/3 minus specials).
+       Dial-by-name only (refuses IP literals). Global static `records` entries (not scoped per
+       principal or rule) dial ONLY the exact pinned IP; all other names resolve via upstream DNS
+       and validate every connect-time address in net.Dialer.Control (Unmap() -> IPv4 special/private
+       deny list; IPv6 2000::/3 minus specials).
 ```
 
 ## 3. Lifecycle Ownership
@@ -71,19 +83,23 @@ Guest packet on sandbox interface (sbxN)
   and additionally closes `upConn` directly for WebSockets, where `gateway` owns the raw socket.
   Every teardown (explicit revoke, grant expiry, or config reload) increments
   `gateway_revocations_total`.
-- **Live config reload:** `config.Store.Reload` (triggered by `SIGHUP` or `POST /v1/reload`)
-  re-parses and validates YAML strictly (`KnownFields(true)`). Any change to restart-only sections
-  (`ca`, `audit`, `admin`, `metrics`, `dns.fake_cidr`, `dataplane`, `http.max_header_bytes`,
-  `http.max_conns_per_link`, `http.upstream_response_header_timeout`, `links`/principals) is refused
-  while keeping the prior snapshot and active grants intact. On
-  success, the snapshot swaps atomically, all ephemeral TTL grants are wiped, and per-link
-  `onConfigReload` callbacks tear down flows that are no longer allowed and WebSockets on hosts
-  that gained a secret binding.
+- **Live config reload:** `config.Store.Reload` (triggered by `SIGHUP` or `POST /v1/reload`,
+  serialized under a reload mutex) re-parses and validates YAML strictly (`KnownFields(true)`). Any
+  change to restart-only sections (`ca`, `audit`, `admin`, `metrics`, `dns.fake_cidr`, `dataplane`,
+  `http.max_header_bytes`, `http.max_conns_per_link`, `http.upstream_response_header_timeout`,
+  `links`/principals) is refused while keeping the prior snapshot and active grants intact. On
+  success, the snapshot swaps atomically, all ephemeral TTL grants are wiped, and a single
+  daemon-registered reload callback tears down flows across all links that are no longer allowed (or
+  WebSockets on hosts that gained a secret binding), closes idle upstream connections, and returns
+  the `revoked_flows` count recorded in the reload audit event.
 - **Grant TTL expiry & WebSocket grants:** One `config.Store.RunGrantPruner` goroutine owned by `cmd/gateway`
-  periodically prunes expired grants and invokes all registered `OnGrantExpired` callbacks
-  across links so expired grant flows tear down immediately. Ephemeral grants (`POST /v1/grants`)
-  may carry `allow_websocket`, using the default egress cap (`http.ws_max_egress_bytes`, 64 MiB
-  by default), and are refused on any host with a secret binding for that principal.
+  periodically prunes expired grants and invokes registered `OnGrantExpired` callbacks (one shared
+  teardown callback across links + one audit callback) so expired grant flows tear down immediately
+  with `error="grant-expired"`. `Store.ActiveGrants()` is a pure read and never mutates grants or
+  fires callbacks. Ephemeral grants (`POST /v1/grants`) may carry `allow_websocket`, using the
+  default egress cap (`http.ws_max_egress_bytes`, 64 MiB by default), and are refused on any host
+  with a secret binding for that principal. `grant-created` audits record `methods`, `paths`, and
+  `allow_websocket`; `grant-deleted` records `principal`, `host`, `port`, and `revoked_flows`.
 - **Audit sink:** One `audit.Writer` owned by `cmd/gateway` is shared across all link DNS/proxy
   servers and the Admin server, and closed last during graceful shutdown.
 
@@ -156,7 +172,8 @@ Loki.
   reconnect, while separate guest connections remain untouched.
 - **No `DeniedSNILimiter`:** Denied SNIs never mint a leaf certificate and are audited
   unconditionally alongside denied HTTP requests and DNS queries; disk usage from denial floods is
-  bounded by audit rotation and retention.
+  bounded by `audit.max_total_bytes` (default `10 GiB`) and daily retention pruning
+  (`audit.retain_days`).
 - **Transport-managed upstream teardown (`NOW.md:64` deviation):** For `http.Transport`-managed
   HTTP/H2/SSE requests, teardown calls `reqCancel()` + `guestConn.Close()` instead of poking into
   `http.Transport`'s connection pool to close upstream sockets directly. Direct `upConn.Close()` is

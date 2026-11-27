@@ -189,17 +189,16 @@ CREATED_MGMT_NET=0
 CREATED_NET0=0
 CREATED_NET1=0
 UPSTREAM_PID=""
+EXTRA_PIDS=()
 TMPDIR_WORK="$(mktemp -d)"
 
 cleanup() {
   local rc=$?
-  if [[ -n "$UPSTREAM_PID" ]]; then
-    if [[ "$(id -u)" -eq 0 ]]; then
-      kill "$UPSTREAM_PID" 2>/dev/null || true
-    else
-      sudo kill "$UPSTREAM_PID" 2>/dev/null || true
-    fi
-  fi
+  local p
+  for p in ${UPSTREAM_PID:+"$UPSTREAM_PID"} "${EXTRA_PIDS[@]}"; do
+    [[ -n "$p" ]] || continue
+    if [[ "$(id -u)" -eq 0 ]]; then kill "$p" 2>/dev/null || true; else sudo kill "$p" 2>/dev/null || true; fi
+  done
   rm -rf "$TMPDIR_WORK"
   if [[ "$KEEP" -eq 1 ]]; then
     echo "[cleanup] --keep set; leaving Incus project '${RPREFIX}${PROJECT}' intact"
@@ -685,6 +684,8 @@ run_probe_guest0() {
     --https-port 10443 \
     --lan-addr "$LAN_ADDR" \
     --mgmt-ip "$GW_MGMT_IP" \
+    --tcp22-target "${GW_UPSTREAM_GW}:22" \
+    --dot-target "${GW_UPSTREAM_GW}:853" \
     --peer-link-ip 10.200.0.17 \
     --peer-guest-addr "${G1_IP}:8080"
 }
@@ -696,6 +697,8 @@ run_probe_guest1() {
     --https-port 10443 \
     --lan-addr "$LAN_ADDR" \
     --mgmt-ip "$GW_MGMT_IP" \
+    --tcp22-target "${GW_UPSTREAM_GW}:22" \
+    --dot-target "${GW_UPSTREAM_GW}:853" \
     --peer-link-ip 10.200.0.1 \
     --peer-guest-addr "${G0_IP}:8080"
 }
@@ -723,7 +726,23 @@ start_guest_peer_listener() {
   "
 }
 
-echo "==> Step 2.4: Verifying LAN control from gateway, guest :8080 controls, and running gateway-probe"
+ensure_host_tcp_control() {
+  local port="$1"
+  if ! gw_exec bash -ceu "timeout 2s bash -c 'exec 3<>/dev/tcp/${GW_UPSTREAM_GW}/${port}'" 2>/dev/null; then
+    local py_cmd=(python3 -c 'import socket,sys; s=socket.create_server((sys.argv[1],int(sys.argv[2])),reuse_address=True); [s.accept()[0].close() for _ in iter(int,1)]' "$GW_UPSTREAM_GW" "$port")
+    [[ "$(id -u)" -eq 0 ]] || py_cmd=(sudo "${py_cmd[@]}")
+    "${py_cmd[@]}" &
+    EXTRA_PIDS+=("$!")
+    sleep 0.3
+  fi
+  if ! gw_exec bash -ceu "timeout 5s bash -c 'exec 3<>/dev/tcp/${GW_UPSTREAM_GW}/${port}'"; then
+    echo "FAIL: host control ${GW_UPSTREAM_GW}:${port} did not accept TCP from gateway" >&2
+    exit 1
+  fi
+  echo "    PASS: host control ${GW_UPSTREAM_GW}:${port} accepts TCP from gateway container"
+}
+
+echo "==> Step 2.4: Verifying LAN/22/853 controls from gateway, guest :8080 controls, and running gateway-probe"
 lan_host="${LAN_ADDR%:*}"
 lan_port="${LAN_ADDR##*:}"
 if ! gw_exec bash -ceu "timeout 5s bash -c 'exec 3<>/dev/tcp/${lan_host}/${lan_port}'"; then
@@ -731,6 +750,8 @@ if ! gw_exec bash -ceu "timeout 5s bash -c 'exec 3<>/dev/tcp/${lan_host}/${lan_p
   exit 1
 fi
 echo "    PASS: LAN control ${LAN_ADDR} accepts TCP from gateway container"
+ensure_host_tcp_control 22
+ensure_host_tcp_control 853
 start_guest_peer_listener "$G0_INST" "$G0_IP"
 start_guest_peer_listener "$G1_INST" "$G1_IP"
 run_probe_guest0

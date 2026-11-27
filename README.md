@@ -12,7 +12,7 @@ Linux-first, headless, egress-only network gateway for isolating sandboxed guest
     - `gateway reload`
     - `gateway flows`
     - `gateway revoke (--flow ID | --grant ID | --principal NAME [--host HOST])`
-    - `gateway grant --principal NAME --host HOST [--port 443|80] [--methods CSV] [--paths CSV] [--ttl 5m]`
+    - `gateway grant --principal NAME --host HOST [--port 443|80] [--methods CSV] [--paths CSV] [--ttl 5m]` (note: `gateway grant` has no `--allow-websocket` flag; WebSocket grants are Admin-API only via `POST /v1/grants`)
     - `gateway grants`
     - `gateway grant revoke <id>`
     - `gateway ca init --cert <path> --key <path>`
