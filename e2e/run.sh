@@ -802,16 +802,23 @@ run_same_ip_step() {
 
   local out0="$TMPDIR_WORK/same0-${src_port}.jsonl"
   local out1="$TMPDIR_WORK/same1-${src_port}.jsonl"
-  # Start guest0 slightly ahead with a longer hold so its conntrack entries are
-  # established when guest1 sends the identical 4-tuple (10.77.0.50:<src_port>).
+  local start_delay=1 dns_timeout=3 hold0=8 hold1=6
+  if [[ "$mode" == "defect" ]]; then
+    # Hold guest0's TCP connection open past guest1's start delay + DNS timeout + 5s
+    # so guest1's TCP :443 request overlaps guest0's open TCP connection.
+    hold0=$((start_delay + dns_timeout + 5))
+  fi
+  local t0_start t1_start t0_end
+  t0_start="$(date +%s)"
   g0_exec /usr/local/bin/gateway-probe \
-    --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 8s \
+    --same-ip --src-ip "$static_ip" --src-port "$src_port" --timeout "${dns_timeout}s" --hold "${hold0}s" \
     --allow-host "$UPSTREAM_HOST" >"$out0" 2>&1 &
   local pid0=$!
   [[ -n "$pid0" ]] || return 2
-  sleep 1
+  sleep "$start_delay"
+  t1_start="$(date +%s)"
   g1_exec /usr/local/bin/gateway-probe \
-    --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 6s \
+    --same-ip --src-ip "$static_ip" --src-port "$src_port" --timeout "${dns_timeout}s" --hold "${hold1}s" \
     --allow-host "$UPSTREAM_HOST" >"$out1" 2>&1 &
   local pid1=$!
   [[ -n "$pid1" ]] || return 2
@@ -825,6 +832,7 @@ run_same_ip_step() {
 
   local rc0=0 rc1=0
   wait "$pid0" || rc0=$?
+  t0_end="$(date +%s)"
   wait "$pid1" || rc1=$?
   echo "    guest0 (sport=${src_port}) exit=${rc0}:"
   cat "$out0"
@@ -848,6 +856,23 @@ run_same_ip_step() {
   fi
 
   if [[ "$mode" == "defect" ]]; then
+    python3 - "$out0" "$out1" "$t0_start" "$t0_end" "$t1_start" "$dns_timeout" <<'PY'
+import json, sys
+p0, p1, t0s, t0e, t1s, dnst = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+def parse(p):
+    res = {}
+    for line in open(p, encoding="utf-8"):
+        s = line.strip()
+        if s.startswith("{"):
+            o = json.loads(s)
+            res[o["check"]] = "pass" if o.get("pass") else f"fail ({o.get('got','')})"
+    return res
+r0, r1 = parse(p0), parse(p1)
+overlap = (t1s + dnst) < t0e
+print(f"    zone-defect UDP: guest0={r0.get('same_ip_udp_53','missing')} guest1={r1.get('same_ip_udp_53','missing')}")
+print(f"    zone-defect TCP: guest0={r0.get('same_ip_tcp_443','missing')} guest1={r1.get('same_ip_tcp_443','missing')}")
+print(f"    zone-defect TCP overlap: {'yes' if overlap else 'no'} (guest0={t0e - t0s}s, guest1_tcp_latest_start<=+{t1s - t0s + dnst}s)")
+PY
     # Defect mode must fail for a functional reason (probe non-zero exit or
     # wrong-link/missing principal attribution), never conntrack -L string grep.
     local reasons=()
