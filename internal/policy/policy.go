@@ -21,6 +21,8 @@ type Decision struct {
 	AllowWebSocket   bool
 	WSMaxEgressBytes int64
 	HasBindings      bool
+	MatchedBindings  []config.BindingConfig
+	HostBindings     []config.BindingConfig
 }
 
 type compiledRule struct {
@@ -242,7 +244,8 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 
 	cs := e.currentCompiled()
 	grants := e.store.ActiveGrants()
-	hasBindings := len(cs.boundHosts[principal][host]) > 0
+	hostBindings := slices.Clone(cs.boundHosts[principal][host])
+	hasBindings := len(hostBindings) > 0
 
 	var best candidate
 	hasBest := false
@@ -278,6 +281,7 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 			ruleID:           r.id,
 			allowWebSocket:   r.allowWebSocket,
 			wsMaxEgressBytes: wsCap,
+			bindings:         r.bindings,
 		}
 		if !hasBest || c.beats(best) {
 			best = c
@@ -316,14 +320,18 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 	}
 
 	if !hasBest {
-		return Decision{Allow: false, Reason: "default-deny", HasBindings: hasBindings}
+		return Decision{Allow: false, Reason: "default-deny", HasBindings: hasBindings, HostBindings: hostBindings}
 	}
 	if !best.allow {
-		return Decision{Allow: false, RuleID: best.ruleID, Reason: "rule-deny", HasBindings: hasBindings}
+		return Decision{Allow: false, RuleID: best.ruleID, Reason: "rule-deny", HasBindings: hasBindings, HostBindings: hostBindings}
 	}
 	reason := "rule-allow"
 	if best.grantID != "" {
 		reason = "grant-allow"
+	}
+	var matchedBindings []config.BindingConfig
+	if best.ruleID != "" {
+		matchedBindings = matchRuleBindings(best.bindings, host, port, methodUpper, reqPath)
 	}
 	return Decision{
 		Allow:            true,
@@ -333,37 +341,20 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 		AllowWebSocket:   best.allowWebSocket && !hasBindings,
 		WSMaxEgressBytes: best.wsMaxEgressBytes,
 		HasBindings:      hasBindings,
+		MatchedBindings:  matchedBindings,
+		HostBindings:     hostBindings,
 	}
 }
 
-// HostBindings returns every Binding declared for (principal, rawHost).
-func (e *Evaluator) HostBindings(principal, rawHost string) []config.BindingConfig {
-	host, ok := normalizeLookupHost(rawHost)
-	if !ok {
-		return nil
-	}
-	cs := e.currentCompiled()
-	return slices.Clone(cs.boundHosts[principal][host])
-}
-
-// MatchBindings returns the bindings that apply to (principal, rawHost, port, method, path).
-// Bindings match ONLY on HTTPS port 443 (never cleartext port 80).
-func (e *Evaluator) MatchBindings(principal, rawHost string, port uint16, method, reqPath string) []config.BindingConfig {
-	if port != 443 {
-		return nil
-	}
-	host, ok := normalizeLookupHost(rawHost)
-	if !ok {
-		return nil
-	}
-	methodUpper := strings.ToUpper(method)
-	cs := e.currentCompiled()
-	all := cs.boundHosts[principal][host]
-	if len(all) == 0 {
+func matchRuleBindings(bindings []config.BindingConfig, host string, port uint16, methodUpper, reqPath string) []config.BindingConfig {
+	if port != 443 || len(bindings) == 0 {
 		return nil
 	}
 	var matched []config.BindingConfig
-	for _, b := range all {
+	for _, b := range bindings {
+		if b.Host != host {
+			continue
+		}
 		if len(b.Methods) > 0 && !slices.Contains(b.Methods, methodUpper) {
 			continue
 		}
@@ -420,6 +411,7 @@ type candidate struct {
 	grantID          string
 	allowWebSocket   bool
 	wsMaxEgressBytes int64
+	bindings         []config.BindingConfig
 }
 
 func (c candidate) beats(other candidate) bool {

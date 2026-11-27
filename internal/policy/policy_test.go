@@ -147,15 +147,15 @@ func TestPolicySpecificityDenyTiesAndIsolation(t *testing.T) {
 		t.Fatalf("expected worker-b ws allow, got %+v", d)
 	}
 
-	// Containment: bindings match ONLY on port 443, never port 80; HasBindings true for host.
-	if b := ev.MatchBindings("worker-a", "code.lan.example", 80, "POST", "/api/v1"); len(b) != 0 {
-		t.Fatalf("bindings must never match port 80, got %+v", b)
+	// Containment: bindings match ONLY on port 443 and ONLY under their owning rule; HasBindings true for host.
+	if d := ev.DecideRequest("worker-a", "code.lan.example", 80, "POST", "/api/v1"); !d.Allow || len(d.MatchedBindings) != 0 {
+		t.Fatalf("bindings must never match port 80, got %+v", d)
 	}
-	if b := ev.MatchBindings("worker-a", "code.lan.example", 443, "POST", "/api/v1"); len(b) != 1 {
-		t.Fatalf("expected 1 binding on 443 POST /api/v1, got %+v", b)
+	if d := ev.DecideRequest("worker-a", "code.lan.example", 443, "POST", "/api/v1"); !d.Allow || len(d.MatchedBindings) != 1 || len(d.HostBindings) != 1 {
+		t.Fatalf("expected 1 matched and host binding on 443 POST /api/v1, got %+v", d)
 	}
-	if d := ev.DecideRequest("worker-a", "code.lan.example", 443, "GET", "/other"); !d.Allow || !d.HasBindings {
-		t.Fatalf("expected HasBindings=true on any request to bound host, got %+v", d)
+	if d := ev.DecideRequest("worker-a", "code.lan.example", 443, "GET", "/other"); !d.Allow || !d.HasBindings || len(d.MatchedBindings) != 0 || len(d.HostBindings) != 1 {
+		t.Fatalf("expected HasBindings=true and 0 matched bindings on GET /other, got %+v", d)
 	}
 
 	// Ephemeral TTL grant lifecycle: allow while active, deny beats grant on tie, deny after expiry.

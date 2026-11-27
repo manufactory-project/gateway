@@ -451,8 +451,7 @@ func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
 		return true
 	}
 
-	matchedBindings := s.eval.MatchBindings(s.link.Principal, rc.host, rc.dstPort, rc.r.Method, rc.r.URL.Path)
-	secretNames, subPairs, subErr := secret.ApplyRequest(rc.outHeaders, matchedBindings, rc.dstPort, secret.FileResolver{})
+	secretNames, subPairs, subErr := secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, rc.dstPort, secret.FileResolver{})
 	if subErr != nil {
 		var resErr *secret.ResolveError
 		if errors.As(subErr, &resErr) && resErr.Name != "" {
@@ -463,7 +462,7 @@ func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
 	}
 	rc.secretNames = secretNames
 	rc.subPairs = subPairs
-	if rc.dec.HasBindings {
+	if rc.dec.HasBindings || len(rc.subPairs) > 0 {
 		// Force identity encoding on every request to a bound host.
 		rc.outHeaders.Set("Accept-Encoding", "identity")
 	}
@@ -536,7 +535,7 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		return
 	}
 
-	bytesIn, copyErr := writeProxiedResponse(w, resp, rc.dec.HasBindings, redactor)
+	bytesIn, copyErr := writeProxiedResponse(w, resp, rc.dec.HasBindings || len(rc.subPairs) > 0, redactor)
 	errText := ""
 	if copyErr != nil {
 		errText = copyErr.Error()
@@ -564,7 +563,7 @@ func buildOutboundRequest(ctx context.Context, rc *reqContext, body io.Reader) (
 }
 
 func (s *Server) prepareResponseRedactor(w http.ResponseWriter, rc *reqContext, resp *http.Response, bytesOut int64) (*secret.Redactor, bool) {
-	if !rc.dec.HasBindings {
+	if !rc.dec.HasBindings && len(rc.subPairs) == 0 {
 		return nil, true
 	}
 	if !isIdentityContentEncoding(resp.Header.Values("Content-Encoding")) {
@@ -572,7 +571,7 @@ func (s *Server) prepareResponseRedactor(w http.ResponseWriter, rc *reqContext, 
 		http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
 		return nil, false
 	}
-	hostPairs, pairErr := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, rc.host), rc.subPairs, secret.FileResolver{})
+	hostPairs, pairErr := secret.ResolveHostPairs(rc.dec.HostBindings, rc.subPairs, secret.FileResolver{})
 	if pairErr != nil {
 		rc.auditCompleted(http.StatusBadGateway, bytesOut, 0, "redaction-secret-unresolved")
 		http.Error(w, "bound secret unavailable for response redaction", http.StatusBadGateway)

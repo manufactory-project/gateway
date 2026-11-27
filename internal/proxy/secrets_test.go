@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBoundSecretSubstitutionUnboundSweepAndCorruptSecretFailClosed(t *testing.T) {
@@ -335,4 +337,241 @@ func TestNoSecretSubstitutionInBodyOrQuery(t *testing.T) {
 		t.Fatalf("placeholder was substituted in query: got %q", gotQuery)
 	}
 	gw.AssertAuditNotContains(t, forgeSec)
+}
+
+func TestBindingScopedToOwningRuleAndSingleSnapshotRedaction(t *testing.T) {
+	secDir := t.TempDir()
+	secScoped := "scoped_secret_" + randHex(t)
+	secFile := writeSecretFile(t, secDir, "scoped.secret", secScoped+"\n")
+
+	var (
+		mu             sync.Mutex
+		lastKey        string
+		lastAcceptEnc  string
+	)
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"scoped.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			lastKey = r.Header.Get("X-Api-Key")
+			lastAcceptEnc = r.Header.Get("Accept-Encoding")
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.WriteString(w, "echo="+secScoped); err != nil {
+				return
+			}
+		}),
+		RulesYAML: fmt.Sprintf(`
+  - id: rule-a-bound
+    principal: worker-test
+    effect: allow
+    hosts: [scoped.example.com]
+    ports: [443]
+    methods: [POST]
+    paths: ["/api/**"]
+    bindings:
+      - name: scoped-key
+        host: scoped.example.com
+        header: X-Api-Key
+        scheme: raw
+        placeholder: mf_ph_scoped
+        secret_file: %s
+  - id: rule-b-public
+    principal: worker-test
+    effect: allow
+    hosts: [scoped.example.com]
+    ports: [443]
+    methods: [GET]
+    paths: ["/public/**"]
+`, secFile),
+	})
+
+	if _, err := gw.Store.AddGrant("worker-test", "scoped.example.com", 443, []string{"GET"}, []string{"/debug/**"}, 5*time.Minute, false); err != nil {
+		t.Fatalf("AddGrant: %v", err)
+	}
+
+	doReq := func(method, path string) (body, gotKey, gotAE string) {
+		t.Helper()
+		req, err := http.NewRequest(method, "https://scoped.example.com"+path, nil)
+		if err != nil {
+			t.Fatalf("NewRequest %s %s: %v", method, path, err)
+		}
+		req.Header.Set("X-Api-Key", "mf_ph_scoped")
+		req.Header.Set("Accept-Encoding", "gzip")
+		resp, err := gw.H1Client(t, "scoped.example.com").Do(req)
+		if err != nil {
+			t.Fatalf("Do %s %s: %v", method, path, err)
+		}
+		raw, rErr := io.ReadAll(resp.Body)
+		if cErr := resp.Body.Close(); cErr != nil {
+			t.Fatalf("close body: %v", cErr)
+		}
+		if rErr != nil {
+			t.Fatalf("read body: %v", rErr)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s %s status = %d, want 200", method, path, resp.StatusCode)
+		}
+		mu.Lock()
+		k, ae := lastKey, lastAcceptEnc
+		mu.Unlock()
+		return string(raw), k, ae
+	}
+
+	// 1. Owning rule A (POST /api/x): substituted + identity + redacted.
+	bodyA, keyA, aeA := doReq(http.MethodPost, "/api/x")
+	if keyA != secScoped {
+		t.Fatalf("rule A upstream X-Api-Key = %q, want substituted secret", keyA)
+	}
+	if aeA != "identity" || bodyA != "echo=mf_ph_scoped" {
+		t.Fatalf("rule A identity/redaction failed: ae=%q body=%q", aeA, bodyA)
+	}
+
+	// 2. Unrelated rule B (GET /public/x): NOT substituted (placeholder swept), still host-redacted + identity.
+	bodyB, keyB, aeB := doReq(http.MethodGet, "/public/x")
+	if keyB != "" {
+		t.Fatalf("rule B escalated secret or leaked placeholder: X-Api-Key = %q", keyB)
+	}
+	if aeB != "identity" || bodyB != "echo=mf_ph_scoped" {
+		t.Fatalf("rule B host-scoped identity/redaction failed: ae=%q body=%q", aeB, bodyB)
+	}
+
+	// 3. Ephemeral grant (GET /debug/x): NOT substituted (placeholder swept), still host-redacted + identity.
+	bodyG, keyG, aeG := doReq(http.MethodGet, "/debug/x")
+	if keyG != "" {
+		t.Fatalf("ephemeral grant escalated secret or leaked placeholder: X-Api-Key = %q", keyG)
+	}
+	if aeG != "identity" || bodyG != "echo=mf_ph_scoped" {
+		t.Fatalf("grant host-scoped identity/redaction failed: ae=%q body=%q", aeG, bodyG)
+	}
+	gw.AssertAuditNotContains(t, secScoped)
+}
+
+func TestSingleSnapshotRedactionOnReloadToggle(t *testing.T) {
+	secDir := t.TempDir()
+	secRace := "race_secret_" + randHex(t)
+	raceSecFile := writeSecretFile(t, secDir, "race.secret", secRace+"\n")
+	baseRules := `
+  - id: allow-race
+    principal: worker-test
+    effect: allow
+    hosts: [race-bind.example.com]
+    ports: [443]
+    methods: [GET]
+    paths: ["/**"]
+`
+	boundRules := baseRules + fmt.Sprintf(`    bindings:
+      - name: race-key
+        host: race-bind.example.com
+        header: X-Api-Key
+        scheme: raw
+        placeholder: mf_ph_race
+        secret_file: %s
+`, raceSecFile)
+
+	gwRace := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"race-bind.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Seen-AE", r.Header.Get("Accept-Encoding"))
+			w.Header().Set("X-Was-Sub", fmt.Sprintf("%v", r.Header.Get("X-Api-Key") == secRace))
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.WriteString(w, "val="+r.Header.Get("X-Api-Key")); err != nil {
+				return
+			}
+		}),
+		RulesYAML: baseRules,
+	})
+	idx := strings.Index(gwRace.BaseYAML, "rules:\n")
+	if idx < 0 {
+		t.Fatal("missing rules block in BaseYAML")
+	}
+	prefixYAML := gwRace.BaseYAML[:idx] + "rules:\n"
+
+	stopReload := make(chan struct{})
+	var reloadWG sync.WaitGroup
+	reloadWG.Add(1)
+	go func() {
+		defer reloadWG.Done()
+		toggle := false
+		for {
+			select {
+			case <-stopReload:
+				return
+			default:
+			}
+			toggle = !toggle
+			rules := baseRules
+			if toggle {
+				rules = boundRules
+			}
+			if err := os.WriteFile(gwRace.CfgPath, []byte(prefixYAML+rules), 0o600); err != nil {
+				return
+			}
+			if _, _, err := gwRace.Store.Reload(); err != nil {
+				return
+			}
+		}
+	}()
+
+	client := gwRace.H1Client(t, "race-bind.example.com")
+	var subCount int
+	for i := 0; i < 60; i++ {
+		req, err := http.NewRequest(http.MethodGet, "https://race-bind.example.com/check", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("X-Api-Key", "mf_ph_race")
+		req.Header.Set("Accept-Encoding", "gzip")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		raw, rErr := io.ReadAll(resp.Body)
+		if cErr := resp.Body.Close(); cErr != nil {
+			t.Fatalf("close race resp: %v", cErr)
+		}
+		if rErr != nil {
+			continue
+		}
+		if resp.Header.Get("X-Was-Sub") == "true" {
+			subCount++
+			if resp.Header.Get("X-Seen-AE") != "identity" {
+				t.Fatalf("TOCTOU: secret substituted without Accept-Encoding: identity (got %q)", resp.Header.Get("X-Seen-AE"))
+			}
+			if strings.Contains(string(raw), secRace) {
+				t.Fatalf("TOCTOU: substituted secret leaked unredacted in response: %q", string(raw))
+			}
+		}
+	}
+	close(stopReload)
+	reloadWG.Wait()
+	if subCount == 0 {
+		if err := os.WriteFile(gwRace.CfgPath, []byte(prefixYAML+boundRules), 0o600); err != nil {
+			t.Fatalf("write bound config: %v", err)
+		}
+		if _, _, err := gwRace.Store.Reload(); err != nil {
+			t.Fatalf("Reload bound config: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodGet, "https://race-bind.example.com/check", nil)
+		if err != nil {
+			t.Fatalf("NewRequest final: %v", err)
+		}
+		req.Header.Set("X-Api-Key", "mf_ph_race")
+		req.Header.Set("Accept-Encoding", "gzip")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("Do final: %v", err)
+		}
+		raw, rErr := io.ReadAll(resp.Body)
+		if cErr := resp.Body.Close(); cErr != nil {
+			t.Fatalf("close final resp: %v", cErr)
+		}
+		if rErr != nil {
+			t.Fatalf("read final resp: %v", rErr)
+		}
+		if resp.Header.Get("X-Was-Sub") != "true" || resp.Header.Get("X-Seen-AE") != "identity" || strings.Contains(string(raw), secRace) {
+			t.Fatalf("bound final check failed: sub=%q ae=%q body=%q", resp.Header.Get("X-Was-Sub"), resp.Header.Get("X-Seen-AE"), string(raw))
+		}
+	}
+	gwRace.AssertAuditNotContains(t, secRace)
 }
