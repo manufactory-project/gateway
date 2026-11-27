@@ -158,6 +158,11 @@ Loki.
   HTTP/H2/SSE requests, teardown calls `reqCancel()` + `guestConn.Close()` instead of poking into
   `http.Transport`'s connection pool to close upstream sockets directly. Direct `upConn.Close()` is
   used only for WebSockets, where `gateway` owns the raw socket.
+- **`proxy.Options.DialContext` test hook (`NOW.md:102` deviation):** Retained as the one deliberate
+  test hook in shipped code. Wire tests bind mock upstreams on ephemeral local ports while `gateway`
+  dials the guest's target port (`443` or `80`) and static `records` map a hostname to an IP only.
+  Production always uses `netguard.Dialer.DialContext`; tests still dial through `netguard.Dialer`
+  so SSRF and `records` enforcement remain exercised.
 
 ## 8. Deploying
 

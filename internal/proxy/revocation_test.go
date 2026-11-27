@@ -477,7 +477,7 @@ func TestWebSocketRevokedDuringHandshake(t *testing.T) {
 
 		tlsLn = tls.NewListener(rawLn, &tls.Config{
 			MinVersion:   tls.VersionTLS12,
-			Certificates: []tls.Certificate{makeSignedServerCert(t, gw.UpCA, []string{host})},
+			Certificates: []tls.Certificate{makeSignedServerCert(t, testUpstreamCA, []string{host})},
 		})
 		upWG.Add(1)
 		go func() {

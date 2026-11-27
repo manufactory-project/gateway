@@ -6,7 +6,6 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -37,25 +36,23 @@ type Options struct {
 	Evaluator     *policy.Evaluator
 	Audit         *audit.Writer
 	Leaves        *ca.LeafCache
-	Dialer        *netguard.Dialer
-	DialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
-	UpstreamRoots *x509.CertPool
-	Flows         *FlowRegistry
-	OnRequest     func(principal, effect string, status int)
+	Dialer      *netguard.Dialer
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	Flows       *FlowRegistry
+	OnRequest   func(principal, effect string, status int)
 }
 
 // Server owns the explicit-bind HTTPS (:443 semantics) and HTTP (:80 semantics)
 // listeners for a single sandbox link.
 type Server struct {
-	link          config.LinkConfig
-	store         *config.Store
-	eval          *policy.Evaluator
-	audit         *audit.Writer
-	leaves        *ca.LeafCache
-	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
-	upstreamRoots *x509.CertPool
-	flows         *FlowRegistry
-	onRequest     func(principal, effect string, status int)
+	link        config.LinkConfig
+	store       *config.Store
+	eval        *policy.Evaluator
+	audit       *audit.Writer
+	leaves      *ca.LeafCache
+	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	flows       *FlowRegistry
+	onRequest   func(principal, effect string, status int)
 
 	transport *http.Transport
 
@@ -90,8 +87,7 @@ func NewServer(opts Options) (*Server, error) {
 	tr := &http.Transport{
 		DialContext: dialFn,
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			RootCAs:    opts.UpstreamRoots, // nil uses system roots; never InsecureSkipVerify
+			MinVersion: tls.VersionTLS12, // uses system roots; never InsecureSkipVerify
 		},
 		ForceAttemptHTTP2:      true,
 		DisableCompression:     true,
@@ -103,16 +99,15 @@ func NewServer(opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		link:          opts.Link,
-		store:         opts.Store,
-		eval:          opts.Evaluator,
-		audit:         opts.Audit,
-		leaves:        opts.Leaves,
-		dialContext:   dialFn,
-		upstreamRoots: opts.UpstreamRoots,
-		flows:         flows,
-		onRequest:     opts.OnRequest,
-		transport:     tr,
+		link:        opts.Link,
+		store:       opts.Store,
+		eval:        opts.Evaluator,
+		audit:       opts.Audit,
+		leaves:      opts.Leaves,
+		dialContext: dialFn,
+		flows:       flows,
+		onRequest:   opts.OnRequest,
+		transport:   tr,
 	}
 
 	opts.Store.OnReload(s.onConfigReload)

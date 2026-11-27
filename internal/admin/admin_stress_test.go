@@ -35,8 +35,46 @@ import (
 	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
+var testUpstreamCA ca.CA
+
+type cleanupTestingM struct {
+	*testing.M
+	cleanup func()
+}
+
+func (c cleanupTestingM) Run() int {
+	defer c.cleanup()
+	return c.M.Run()
+}
+
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	dir, err := os.MkdirTemp("", "gateway-admin-upca-*")
+	if err != nil {
+		panic(fmt.Sprintf("admin TestMain mkdir: %v", err))
+	}
+	certPath := filepath.Join(dir, "up-ca.crt")
+	keyPath := filepath.Join(dir, "up-ca.key")
+	testUpstreamCA, err = ca.Init(certPath, keyPath)
+	if err != nil {
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			panic(fmt.Sprintf("admin TestMain ca.Init: %v (cleanup: %v)", err, rmErr))
+		}
+		panic(fmt.Sprintf("admin TestMain ca.Init: %v", err))
+	}
+	if err := os.Setenv("SSL_CERT_FILE", certPath); err != nil {
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			panic(fmt.Sprintf("admin TestMain setenv: %v (cleanup: %v)", err, rmErr))
+		}
+		panic(fmt.Sprintf("admin TestMain setenv: %v", err))
+	}
+	goleak.VerifyTestMain(cleanupTestingM{
+		M: m,
+		cleanup: func() {
+			if rmErr := os.RemoveAll(dir); rmErr != nil {
+				panic(fmt.Sprintf("admin TestMain cleanup: %v", rmErr))
+			}
+		},
+	})
 }
 
 type testFlowAdapter struct {
@@ -264,14 +302,6 @@ func TestStressReloadRevokeH1H2SSEAndSlowlorisBounds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ca.Init MITM: %v", err)
 	}
-	upCA, err := ca.Init(filepath.Join(dir, "up.crt"), filepath.Join(dir, "up.key"))
-	if err != nil {
-		t.Fatalf("ca.Init upstream: %v", err)
-	}
-	upRoots := x509.NewCertPool()
-	if !upRoots.AppendCertsFromPEM(upCA.CertPEM) {
-		t.Fatal("append upstream CA")
-	}
 	mitmRoots := x509.NewCertPool()
 	if !mitmRoots.AppendCertsFromPEM(mitmCA.CertPEM) {
 		t.Fatal("append MITM CA")
@@ -313,7 +343,7 @@ func TestStressReloadRevokeH1H2SSEAndSlowlorisBounds(t *testing.T) {
 	upSrv.EnableHTTP2 = true
 	upSrv.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{signLeaf(t, upCA, []string{"stress.example.com", "ephemeral.example.com"})},
+		Certificates: []tls.Certificate{signLeaf(t, testUpstreamCA, []string{"stress.example.com", "ephemeral.example.com"})},
 	}
 	upSrv.StartTLS()
 	t.Cleanup(upSrv.Close)
@@ -393,15 +423,14 @@ rules:
 	}
 
 	pSrv, err := proxy.NewServer(proxy.Options{
-		Link:          store.Current().Config.Links[0],
-		Store:         store,
-		Evaluator:     policy.NewEvaluator(store),
-		Audit:         aw,
-		Leaves:        ca.NewLeafCache(mitmCA),
-		DialContext:   dialUp,
-		UpstreamRoots: upRoots,
-		Flows:         flows,
-		OnRequest:     col.ObserveRequest,
+		Link:        store.Current().Config.Links[0],
+		Store:       store,
+		Evaluator:   policy.NewEvaluator(store),
+		Audit:       aw,
+		Leaves:      ca.NewLeafCache(mitmCA),
+		DialContext: dialUp,
+		Flows:       flows,
+		OnRequest:   col.ObserveRequest,
 	})
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)

@@ -93,7 +93,6 @@ func (s *Server) dialWebSocketUpstream(ctx context.Context, host string, dstPort
 	tlsConn := tls.Client(rawUpstream, &tls.Config{
 		ServerName: host,
 		MinVersion: tls.VersionTLS12,
-		RootCAs:    s.upstreamRoots,
 		NextProtos: []string{"http/1.1"},
 	})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
