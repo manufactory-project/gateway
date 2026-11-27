@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/audit"
@@ -560,7 +561,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 			deny(http.StatusRequestEntityTooLarge, "body-too-large", dec.RuleID, host, secretNames)
 			return
 		}
-		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n, 0, err.Error())
+		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, err.Error())
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
@@ -572,7 +573,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 
 	// Refuse unexpected 101 Switching Protocols on non-WebSocket flows.
 	if resp.StatusCode == http.StatusSwitchingProtocols {
-		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n, 0, "unexpected-101")
+		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "unexpected-101")
 		http.Error(w, "unexpected protocol upgrade", http.StatusBadGateway)
 		return
 	}
@@ -583,7 +584,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	if dec.HasBindings {
 		ce := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
 		if ce != "" && !strings.EqualFold(ce, "identity") {
-			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n, 0, "compressed-response-on-bound-host")
+			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "compressed-response-on-bound-host")
 			http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
 			return
 		}
@@ -627,7 +628,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	if copyErr != nil {
 		errText = copyErr.Error()
 	}
-	s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, resp.StatusCode, countingBody.n, bytesIn, errText)
+	s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, resp.StatusCode, countingBody.n.Load(), bytesIn, errText)
 }
 
 func (s *Server) auditCompleted(srcIP string, r *http.Request, dstPort uint16, host string, dec policy.Decision, flowID string, secretNames []string, status int, bytesOut, bytesIn int64, errText string) {
@@ -867,12 +868,12 @@ func copyStreamingRedacted(w http.ResponseWriter, src io.Reader, redactor *secre
 
 type countingReadCloser struct {
 	rc io.ReadCloser
-	n  int64
+	n  atomic.Int64
 }
 
 func (c *countingReadCloser) Read(p []byte) (int, error) {
 	n, err := c.rc.Read(p)
-	c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }
 
