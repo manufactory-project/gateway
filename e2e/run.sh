@@ -91,6 +91,10 @@ fi
 
 RPREFIX=""
 if [[ -n "$REMOTE" ]]; then
+  if [[ "$UPSTREAM_EXPLICIT" -eq 0 ]]; then
+    echo "error: --remote requires --upstream-host (local e2e/upstream.py cannot bind a remote host's address)" >&2
+    exit 2
+  fi
   RPREFIX="${REMOTE}:"
 fi
 
@@ -330,12 +334,24 @@ if [[ "$UPSTREAM_EXPLICIT" -eq 0 ]]; then
     sudo python3 "$REPO_ROOT/e2e/upstream.py" "$GW_UPSTREAM_GW" 443 "$TMPDIR_WORK/up-srv.crt" "$TMPDIR_WORK/up-srv.key" &
   fi
   UPSTREAM_PID=$!
+  up_cmd=(kill -0 "$UPSTREAM_PID")
+  [[ "$(id -u)" -eq 0 ]] || up_cmd=(sudo "${up_cmd[@]}")
+  up_ready=0
   for _ in $(seq 1 20); do
+    if ! "${up_cmd[@]}" 2>/dev/null; then
+      echo "error: local upstream (pid ${UPSTREAM_PID}) exited before listening on ${GW_UPSTREAM_GW}:443" >&2
+      exit 1
+    fi
     if gw_exec bash -ceu "timeout 2s bash -c 'exec 3<>/dev/tcp/${GW_UPSTREAM_GW}/443'" 2>/dev/null; then
+      up_ready=1
       break
     fi
     sleep 0.25
   done
+  if [[ "$up_ready" -ne 1 ]]; then
+    echo "error: local upstream did not become reachable on ${GW_UPSTREAM_GW}:443 within timeout" >&2
+    exit 1
+  fi
   incus file push "$TMPDIR_WORK/up-ca.crt" "${GW_INST}/usr/local/share/ca-certificates/e2e-upstream-ca.crt" --project "$PROJECT" --mode 0644
   gw_exec update-ca-certificates >/dev/null
   printf '\nrecords:\n  %s: %s\n' "$UPSTREAM_HOST" "$GW_UPSTREAM_GW" >> "$TMPDIR_WORK/gateway.yaml"
