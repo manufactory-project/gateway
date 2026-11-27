@@ -347,8 +347,10 @@ type reqContext struct {
 	proto       string
 	host        string
 	dstPort     uint16
-	dec         policy.Decision
-	wantWS      bool
+	dec           policy.Decision
+	admitSnap     *config.Snapshot
+	admitGrantGen uint64
+	wantWS        bool
 	maxBody     int64
 	flowID      string
 	secretNames []string
@@ -472,6 +474,7 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request, dstPort uint16) (
 	rc.wantWS = wantWS
 
 	// 4. Evaluate policy live per HTTP request (never snapshotted at SYN).
+	rc.admitSnap, rc.admitGrantGen = s.store.StateToken()
 	rc.dec = s.eval.DecideRequest(s.link.Principal, host, dstPort, r.Method, r.URL.Path)
 	if !rc.dec.Allow {
 		rc.deny(w, http.StatusForbidden, rc.dec.Reason)
@@ -542,6 +545,11 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 	defer s.flows.unregister(af.info.ID)
 	rc.flowID = af.info.ID
 
+	// Re-verify admission after flow registration if config or grants changed since admit().
+	if !s.recheckAdmissionAfterRegister(w, rc) {
+		return
+	}
+
 	// Fail-closed admission audit BEFORE dialing upstream.
 	if err := rc.auditAdmitted(); err != nil {
 		http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
@@ -599,6 +607,35 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 	if copyErr != nil {
 		panic(http.ErrAbortHandler)
 	}
+}
+
+func (s *Server) recheckAdmissionAfterRegister(w http.ResponseWriter, rc *reqContext) bool {
+	curSnap, curGrantGen := s.store.StateToken()
+	if curSnap == rc.admitSnap && curGrantGen == rc.admitGrantGen {
+		return true
+	}
+	reDec := s.eval.DecideRequest(s.link.Principal, rc.host, rc.dstPort, rc.r.Method, rc.r.URL.Path)
+	if !reDec.Allow {
+		rc.dec = reDec
+		rc.deny(w, http.StatusForbidden, reDec.Reason)
+		return false
+	}
+	if rc.wantWS && !reDec.AllowWebSocket {
+		rc.dec = reDec
+		rc.deny(w, http.StatusForbidden, "websocket-not-allowed")
+		return false
+	}
+	if rc.dec.GrantID != "" && reDec.GrantID != rc.dec.GrantID && reDec.RuleID == "" {
+		rc.dec = reDec
+		rc.deny(w, http.StatusForbidden, "grant-revoked")
+		return false
+	}
+	if len(rc.subPairs) > 0 && reDec.RuleID != rc.dec.RuleID {
+		rc.dec = reDec
+		rc.deny(w, http.StatusForbidden, "binding-rule-changed")
+		return false
+	}
+	return true
 }
 
 func buildOutboundRequest(ctx context.Context, rc *reqContext, body io.Reader) (*http.Request, error) {

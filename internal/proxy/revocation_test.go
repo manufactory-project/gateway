@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -715,5 +717,113 @@ func TestReloadWithUnprunedExpiredGrantDoesNotDeadlock(t *testing.T) {
 	}
 	if cnt := gw.Flows.Count(); cnt != 0 {
 		t.Fatalf("flow remained in registry after reload teardown: count=%d", cnt)
+	}
+}
+
+func TestAdmissionRecheckAfterFlowRegistrationBlocksRevokedRule(t *testing.T) {
+	fifoPath := filepath.Join(t.TempDir(), "secret.fifo")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+
+	var upHits atomic.Int32
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"recheck.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}),
+		RulesYAML: fmt.Sprintf(`
+  - id: allow-recheck
+    principal: worker-test
+    effect: allow
+    hosts: [recheck.example.com]
+    ports: [443]
+    bindings:
+      - name: fifo-sec
+        host: recheck.example.com
+        header: X-Tok
+        scheme: raw
+        placeholder: mf_ph_fifo
+        secret_file: %s
+`, fifoPath),
+	})
+
+	req, err := http.NewRequest(http.MethodGet, "https://recheck.example.com/race", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("X-Tok", "mf_ph_fifo")
+
+	type reqRes struct {
+		status int
+		err    error
+	}
+	resCh := make(chan reqRes, 1)
+	client := gw.H1Client(t, "recheck.example.com")
+	go func() {
+		resp, rErr := client.Do(req)
+		if rErr != nil {
+			resCh <- reqRes{err: rErr}
+			return
+		}
+		st := resp.StatusCode
+		if cErr := resp.Body.Close(); cErr != nil {
+			resCh <- reqRes{status: st, err: cErr}
+			return
+		}
+		resCh <- reqRes{status: st}
+	}()
+
+	// Opening the FIFO for write rendezvous blocks until prepare() opens it for read,
+	// guaranteeing the request is paused strictly between admit() and flows.register().
+	wf, err := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open FIFO writer: %v", err)
+	}
+
+	// Remove the allow rule and reload while the request is between admit() and register().
+	idx := strings.Index(gw.BaseYAML, "rules:\n")
+	if idx < 0 {
+		t.Fatal("missing rules block in BaseYAML")
+	}
+	if err := os.WriteFile(gw.CfgPath, []byte(gw.BaseYAML[:idx]), 0o600); err != nil {
+		t.Fatalf("write empty-rules config: %v", err)
+	}
+	if _, _, err := gw.Store.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	// Unblock prepare() so the request proceeds to flows.register() and post-registration recheck.
+	if _, err := wf.WriteString("fifo_secret_value\n"); err != nil {
+		t.Fatalf("write FIFO: %v", err)
+	}
+	if err := wf.Close(); err != nil {
+		t.Fatalf("close FIFO: %v", err)
+	}
+
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			t.Fatalf("client Do error: %v", res.err)
+		}
+		if res.status != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 after rule revoked between admit and register", res.status)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for request response")
+	}
+
+	if upHits.Load() != 0 {
+		t.Fatalf("revoked request reached upstream: hits=%d, want 0", upHits.Load())
+	}
+	var sawDeny bool
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Kind == "request" && ev.Path == "/race" && ev.Effect == "deny" && ev.Status == http.StatusForbidden {
+			sawDeny = true
+		}
+	}
+	if !sawDeny {
+		t.Fatal("missing audited 403 deny for post-registration recheck")
 	}
 }

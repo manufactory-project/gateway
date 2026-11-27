@@ -47,6 +47,7 @@ type Store struct {
 
 	mu        sync.RWMutex
 	gen       uint64
+	grantGen  uint64
 	grants    map[string]Grant
 	onReload  []func(prev, next *Snapshot, wipedGrantIDs []string)
 	onExpired []func(grant Grant)
@@ -82,6 +83,16 @@ func NewStoreWithClock(path string, now func() time.Time) (*Store, error) {
 // Current returns the currently active configuration Snapshot.
 func (s *Store) Current() *Snapshot {
 	return s.snap.Load()
+}
+
+// StateToken returns the current config snapshot pointer and grant-set generation
+// so callers can detect any config reload or grant mutation since an earlier check.
+func (s *Store) StateToken() (*Snapshot, uint64) {
+	s.mu.RLock()
+	snap := s.snap.Load()
+	gg := s.grantGen
+	s.mu.RUnlock()
+	return snap, gg
 }
 
 // OnReload registers a callback invoked after every successful reload.
@@ -129,6 +140,7 @@ func (s *Store) Reload() (*Snapshot, []string, error) {
 	}
 	prev := s.snap.Swap(next)
 	s.gen++
+	s.grantGen++
 	wiped := make([]string, 0, len(s.grants))
 	for id := range s.grants {
 		wiped = append(wiped, id)
@@ -284,6 +296,7 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 		ExpiresAt:      now.Add(ttl),
 	}
 	s.grants[g.ID] = g
+	s.grantGen++
 	s.mu.Unlock()
 	return g, nil
 }
@@ -296,6 +309,7 @@ func (s *Store) RevokeGrant(id string) bool {
 		return false
 	}
 	delete(s.grants, id)
+	s.grantGen++
 	return true
 }
 
@@ -324,6 +338,9 @@ func (s *Store) PruneExpiredGrants() []string {
 			delete(s.grants, id)
 			expired = append(expired, g)
 		}
+	}
+	if len(expired) > 0 {
+		s.grantGen++
 	}
 	cbs := slices.Clone(s.onExpired)
 	s.mu.Unlock()
