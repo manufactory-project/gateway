@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -190,8 +191,9 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 		t.Fatalf("write initial yaml: %v", err)
 	}
 
-	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
-	store, err := config.NewStoreWithClock(cfgPath, func() time.Time { return now })
+	var nowNano atomic.Int64
+	nowNano.Store(time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC).UnixNano())
+	store, err := config.NewStoreWithClock(cfgPath, func() time.Time { return time.Unix(0, nowNano.Load()).UTC() })
 	if err != nil {
 		t.Fatalf("NewStoreWithClock: %v", err)
 	}
@@ -276,7 +278,7 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AddGrant g2: %v", err)
 	}
-	now = now.Add(2 * time.Minute)
+	nowNano.Add(int64(2 * time.Minute))
 	if got := store.ActiveGrants(); len(got) != 0 {
 		t.Fatalf("expected expired grant to be pruned, got %+v", got)
 	}
@@ -292,8 +294,9 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		t.Fatalf("write validYAML: %v", err)
 	}
 
-	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
-	store, err := config.NewStoreWithClock(cfgPath, func() time.Time { return now })
+	var nowNano atomic.Int64
+	nowNano.Store(time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC).UnixNano())
+	store, err := config.NewStoreWithClock(cfgPath, func() time.Time { return time.Unix(0, nowNano.Load()).UTC() })
 	if err != nil {
 		t.Fatalf("NewStoreWithClock: %v", err)
 	}
@@ -348,19 +351,48 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		t.Fatalf("rule reload = (wiped=%v, err=%v), want 1 wiped grant and nil err", wiped, err)
 	}
 
-	// Item 11: Multiple SetOnGrantExpired callbacks must ALL fire on expiry.
-	var cb1, cb2 string
-	store.SetOnGrantExpired(func(id string) { cb1 = id })
-	store.SetOnGrantExpired(func(id string) { cb2 = id })
+	// Item 11: Multiple SetOnGrantExpired callbacks (e.g. across links) must ALL fire on expiry via a single RunGrantPruner loop.
+	cb1Ch := make(chan string, 2)
+	cb2Ch := make(chan string, 2)
+	store.SetOnGrantExpired(func(id string) { cb1Ch <- id })
+	store.SetOnGrantExpired(func(id string) { cb2Ch <- id })
 	gExp, err := store.AddGrant("worker-claude", "exp.example.com", 443, nil, nil, time.Minute)
 	if err != nil {
 		t.Fatalf("AddGrant exp: %v", err)
 	}
-	now = now.Add(2 * time.Minute)
-	store.PruneExpiredGrants()
-	if cb1 != gExp.ID || cb2 != gExp.ID {
-		t.Fatalf("expected both expiry callbacks to fire with %s, got cb1=%q cb2=%q", gExp.ID, cb1, cb2)
+	pruneCtx, pruneCancel := context.WithCancel(context.Background())
+	pruneDone := make(chan struct{})
+	go func() {
+		defer close(pruneDone)
+		store.RunGrantPruner(pruneCtx, 10*time.Millisecond)
+	}()
+	nowNano.Add(int64(2 * time.Minute))
+	select {
+	case got := <-cb1Ch:
+		if got != gExp.ID {
+			pruneCancel()
+			<-pruneDone
+			t.Fatalf("cb1 got %q, want %q", got, gExp.ID)
+		}
+	case <-time.After(2 * time.Second):
+		pruneCancel()
+		<-pruneDone
+		t.Fatal("timed out waiting for cb1 from RunGrantPruner")
 	}
+	select {
+	case got := <-cb2Ch:
+		if got != gExp.ID {
+			pruneCancel()
+			<-pruneDone
+			t.Fatalf("cb2 got %q, want %q", got, gExp.ID)
+		}
+	case <-time.After(2 * time.Second):
+		pruneCancel()
+		<-pruneDone
+		t.Fatal("timed out waiting for cb2 from RunGrantPruner")
+	}
+	pruneCancel()
+	<-pruneDone
 
 	// Item 10: Concurrent AddGrant vs Reload must be race-free and never leave stale grants after a final Reload.
 	done := make(chan struct{})

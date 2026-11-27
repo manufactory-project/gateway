@@ -273,15 +273,14 @@ rules:
 	flows := proxy.NewFlowRegistry()
 	httpsAddr := fmt.Sprintf("127.0.13.1:%d", httpsPort)
 	srv, err := proxy.NewServer(proxy.Options{
-		Link:               store.Current().Config.Links[0],
-		Store:              store,
-		Evaluator:          policy.NewEvaluator(store),
-		Audit:              aw,
-		Leaves:             ca.NewLeafCache(mitmCA),
-		DialContext:        dialUpstream,
-		UpstreamRoots:      upstreamRoots,
-		Flows:              flows,
-		GrantPruneInterval: 20 * time.Millisecond,
+		Link:          store.Current().Config.Links[0],
+		Store:         store,
+		Evaluator:     policy.NewEvaluator(store),
+		Audit:         aw,
+		Leaves:        ca.NewLeafCache(mitmCA),
+		DialContext:   dialUpstream,
+		UpstreamRoots: upstreamRoots,
+		Flows:         flows,
 	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
@@ -289,7 +288,15 @@ rules:
 	if err := srv.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	pruneCtx, pruneCancel := context.WithCancel(context.Background())
+	pruneDone := make(chan struct{})
+	go func() {
+		defer close(pruneDone)
+		store.RunGrantPruner(pruneCtx, 20*time.Millisecond)
+	}()
 	t.Cleanup(func() {
+		pruneCancel()
+		<-pruneDone
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {

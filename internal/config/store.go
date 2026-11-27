@@ -325,6 +325,23 @@ func (s *Store) PruneExpiredGrants() []string {
 	return expired
 }
 
+// RunGrantPruner periodically prunes expired grants until ctx is cancelled.
+func (s *Store) RunGrantPruner(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 50 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.PruneExpiredGrants()
+		}
+	}
+}
+
 func randomGrantID() (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {

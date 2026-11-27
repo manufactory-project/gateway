@@ -40,10 +40,9 @@ type Options struct {
 	Dialer             *netguard.Dialer
 	DialContext        func(ctx context.Context, network, addr string) (net.Conn, error)
 	UpstreamRoots      *x509.CertPool
-	Secrets            secret.Resolver
-	Flows              *FlowRegistry
-	GrantPruneInterval time.Duration
-	OnRequest          func(principal, effect string, status int)
+	Secrets       secret.Resolver
+	Flows         *FlowRegistry
+	OnRequest     func(principal, effect string, status int)
 }
 
 // Server owns the explicit-bind HTTPS (:443 semantics) and HTTP (:80 semantics)
@@ -58,7 +57,6 @@ type Server struct {
 	upstreamRoots *x509.CertPool
 	secrets       secret.Resolver
 	flows         *FlowRegistry
-	pruneInterval time.Duration
 	onRequest     func(principal, effect string, status int)
 
 	transport *http.Transport
@@ -67,8 +65,6 @@ type Server struct {
 	httpLn   net.Listener
 	httpsSrv *http.Server
 	httpSrv  *http.Server
-	stopCh   chan struct{}
-	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
 
@@ -94,10 +90,6 @@ func NewServer(opts Options) (*Server, error) {
 	flows := opts.Flows
 	if flows == nil {
 		flows = NewFlowRegistry()
-	}
-	pruneInt := opts.GrantPruneInterval
-	if pruneInt <= 0 {
-		pruneInt = 50 * time.Millisecond
 	}
 
 	hCfg := opts.Store.Current().Config.HTTP
@@ -126,10 +118,8 @@ func NewServer(opts Options) (*Server, error) {
 		upstreamRoots: opts.UpstreamRoots,
 		secrets:       secrets,
 		flows:         flows,
-		pruneInterval: pruneInt,
 		onRequest:     opts.OnRequest,
 		transport:     tr,
-		stopCh:        make(chan struct{}),
 	}
 
 	opts.Store.OnReload(s.onConfigReload)
@@ -220,7 +210,7 @@ func (s *Server) Start() error {
 	s.httpsLn = httpsLn
 	s.httpLn = httpLn
 
-	s.wg.Add(3)
+	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
 		if err := s.httpsSrv.Serve(httpsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -233,31 +223,11 @@ func (s *Server) Start() error {
 			return
 		}
 	}()
-	go func() {
-		defer s.wg.Done()
-		s.pruneGrantLoop()
-	}()
 	return nil
-}
-
-func (s *Server) pruneGrantLoop() {
-	ticker := time.NewTicker(s.pruneInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.stopCh:
-			return
-		case <-ticker.C:
-			s.store.PruneExpiredGrants()
-		}
-	}
 }
 
 // Shutdown drains listeners, tears down remaining link flows, closes idle upstream connections, and waits for goroutines.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.stopOnce.Do(func() {
-		close(s.stopCh)
-	})
 	s.flows.drainLink(s.link.Name)
 
 	var errs error

@@ -170,14 +170,13 @@ rules:
 	var raceWSConn atomic.Pointer[closeTrackingConn]
 
 	srv, err := proxy.NewServer(proxy.Options{
-		Link:               store.Current().Config.Links[0],
-		Store:              store,
-		Evaluator:          policy.NewEvaluator(store),
-		Audit:              aw,
-		Leaves:             ca.NewLeafCache(mitmCA),
-		Flows:              flows,
-		UpstreamRoots:      upRoots,
-		GrantPruneInterval: 20 * time.Millisecond,
+		Link:          store.Current().Config.Links[0],
+		Store:         store,
+		Evaluator:     policy.NewEvaluator(store),
+		Audit:         aw,
+		Leaves:        ca.NewLeafCache(mitmCA),
+		Flows:         flows,
+		UpstreamRoots: upRoots,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -208,7 +207,15 @@ rules:
 	if err := srv.Start(); err != nil {
 		t.Fatalf("proxy.Start: %v", err)
 	}
+	pruneCtx, pruneCancel := context.WithCancel(context.Background())
+	pruneDone := make(chan struct{})
+	go func() {
+		defer close(pruneDone)
+		store.RunGrantPruner(pruneCtx, 20*time.Millisecond)
+	}()
 	t.Cleanup(func() {
+		pruneCancel()
+		<-pruneDone
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {

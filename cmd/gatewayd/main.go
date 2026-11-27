@@ -277,10 +277,14 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		return errors.Join(err, shutdownAll())
 	}
 
-	var sighupWG sync.WaitGroup
-	sighupWG.Add(1)
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
 	go func() {
-		defer sighupWG.Done()
+		defer bgWG.Done()
+		store.RunGrantPruner(ctx, 50*time.Millisecond)
+	}()
+	go func() {
+		defer bgWG.Done()
 		store.WatchSIGHUP(ctx, func(snap *config.Snapshot, _ []string, reloadErr error) {
 			if reloadErr != nil {
 				collector.ObserveReload(false)
@@ -311,7 +315,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	}()
 
 	<-ctx.Done()
-	sighupWG.Wait()
+	bgWG.Wait()
 
 	if aErr := auditWriter.WriteSync(audit.Event{
 		Kind:   audit.KindLifecycle,
