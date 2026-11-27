@@ -422,7 +422,9 @@ func TestDirectHTTPSNoSNIBypassFails(t *testing.T) {
 }
 
 func TestTCPBlockedRefusedFails(t *testing.T) {
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	// Bind on 127.0.0.2 (not 127.0.0.1) so parallel package tests binding 127.0.0.1:0
+	// cannot reclaim the closed port and Linux cannot TCP self-connect.
+	ln, err := net.Listen("tcp4", "127.0.0.2:0")
 	if err != nil {
 		t.Fatalf("listen tcp: %v", err)
 	}
