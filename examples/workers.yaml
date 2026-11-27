@@ -24,11 +24,11 @@ metrics:
 
 dataplane:
   verify_sysctls: true
-  ready_file: /run/gateway/dataplane.ready
+  ready_file: /run/gateway-dataplane/dataplane.ready
   dhcp:
     user: dnsmasq
     lease_file: /var/lib/gateway/dnsmasq.leases
-    config_path: /run/gateway/dnsmasq.conf
+    config_path: /run/gateway-dataplane/dnsmasq.conf
     lease_time: 12h
 
 dns:

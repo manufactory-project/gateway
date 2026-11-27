@@ -97,8 +97,8 @@ func TestGatewayNetsetupDryRunAndStartupGuards(t *testing.T) {
 		t.Fatalf("ca.Init: %v", err)
 	}
 	auditDir := filepath.Join(dir, "audit")
-	sockPath := filepath.Join(dir, "admin.sock")
-	readyFile := filepath.Join(dir, "dataplane.ready")
+	sockPath := filepath.Join(dir, "admin", "admin.sock")
+	readyFile := filepath.Join(dir, "dataplane", "dataplane.ready")
 
 	linkPorts := freePorts(t, "127.0.26.1", 3)
 	httpsPort, httpPort, dnsPort := linkPorts[0], linkPorts[1], linkPorts[2]
@@ -142,6 +142,9 @@ rules:
 	}
 
 	// Positive control: once ready_file exists, daemon starts, answers /v1/status, and shuts down cleanly.
+	if err := os.MkdirAll(filepath.Dir(readyFile), 0o755); err != nil {
+		t.Fatalf("mkdir readyFile dir: %v", err)
+	}
 	if err := os.WriteFile(readyFile, []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write readyFile: %v", err)
 	}
@@ -305,8 +308,11 @@ func TestGrantLifecycleAudit(t *testing.T) {
 		t.Fatalf("ca.Init: %v", err)
 	}
 	auditDir := filepath.Join(dir, "audit")
-	sockPath := filepath.Join(dir, "admin.sock")
-	readyFile := filepath.Join(dir, "dataplane.ready")
+	sockPath := filepath.Join(dir, "admin", "admin.sock")
+	readyFile := filepath.Join(dir, "dataplane", "dataplane.ready")
+	if err := os.MkdirAll(filepath.Dir(readyFile), 0o755); err != nil {
+		t.Fatalf("mkdir readyFile dir: %v", err)
+	}
 	if err := os.WriteFile(readyFile, []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write readyFile: %v", err)
 	}

@@ -28,11 +28,11 @@ audit:
 metrics:
   listen: 127.0.0.1:9102
 dataplane:
-  ready_file: /run/gateway/dataplane.ready
+  ready_file: /run/gateway-dataplane/dataplane.ready
   dhcp:
     user: dnsmasq
     lease_file: /var/lib/gateway/dnsmasq.leases
-    config_path: /run/gateway/dnsmasq.conf
+    config_path: /run/gateway-dataplane/dnsmasq.conf
 records:
   forge.internal.example: 10.10.20.5
 links:
@@ -158,8 +158,18 @@ func TestConfigValidationInvariants(t *testing.T) {
 		},
 		{
 			name:      "reject missing ready_file when Linux link exists",
-			yaml:      strings.Replace(validYAML, "  ready_file: /run/gateway/dataplane.ready\n", "", 1),
+			yaml:      strings.Replace(validYAML, "  ready_file: /run/gateway-dataplane/dataplane.ready\n", "", 1),
 			wantError: "dataplane.ready_file",
+		},
+		{
+			name:      "reject ready_file inside admin.socket directory",
+			yaml:      strings.Replace(validYAML, "  ready_file: /run/gateway-dataplane/dataplane.ready", "  ready_file: /run/gateway/dataplane.ready", 1) + "\nadmin:\n  socket: /run/gateway/admin.sock\n",
+			wantError: "must not be inside admin.socket directory",
+		},
+		{
+			name:      "reject dhcp.config_path inside admin.socket directory",
+			yaml:      strings.Replace(validYAML, "    config_path: /run/gateway-dataplane/dnsmasq.conf", "    config_path: /run/gateway/dnsmasq.conf", 1) + "\nadmin:\n  socket: /run/gateway/admin.sock\n",
+			wantError: "must not be inside admin.socket directory",
 		},
 		{
 			name:      "reject v4-mapped wildcard metrics listener",
@@ -328,7 +338,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		{"fake_cidr", validYAML + "\ndns:\n  fake_cidr: 198.19.0.0/16\n"},
 		{"links_gateway_ip", strings.Replace(validYAML, "gateway_ip: 10.200.0.1", "gateway_ip: 10.200.0.2", 1)},
 		{"principals", strings.ReplaceAll(validYAML, "worker-codex", "worker-renamed")},
-		{"dataplane_ready_file", strings.Replace(validYAML, "/run/gateway/dataplane.ready", "/run/gateway/other.ready", 1)},
+		{"dataplane_ready_file", strings.Replace(validYAML, "/run/gateway-dataplane/dataplane.ready", "/run/gateway-dataplane/other.ready", 1)},
 		{"dataplane_dhcp", strings.Replace(validYAML, "user: dnsmasq", "user: nobody", 1)},
 		{"dataplane_verify_sysctls", strings.Replace(validYAML, "dataplane:\n", "dataplane:\n  verify_sysctls: false\n", 1)},
 		{"http_max_header_bytes", validYAML + "\nhttp:\n  max_header_bytes: 65536\n"},

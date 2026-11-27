@@ -18,6 +18,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 RuntimeDirectory=gateway
+RuntimeDirectoryMode=0750
 LogsDirectory=gateway/audit
 
 [Install]

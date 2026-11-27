@@ -428,7 +428,7 @@ start_gateway_service() {
 echo "==> Step 2.1: Fail-closed startup"
 gw_exec bash -ceu '
   nft delete table inet gw 2>/dev/null || true
-  rm -f /run/gateway/dataplane.ready
+  rm -f /run/gateway-dataplane/dataplane.ready
 '
 gw_exec bash -eu <<'EOF'
   set +e
@@ -455,7 +455,7 @@ EOF
 gw_exec bash -eu <<'EOF'
   /usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml
   nft delete table inet gw
-  rm -f /run/gateway/dataplane.ready
+  rm -f /run/gateway-dataplane/dataplane.ready
   set +e
   timeout 5s sudo -u gateway /usr/local/bin/gateway run --config /etc/gateway/gateway.yaml >/tmp/fc-ready.out 2>/tmp/fc-ready.err
   rc=$?
@@ -489,16 +489,16 @@ echo "    PASS: gateway dataplane check failed without table inet gw"
 
 echo "    Recording direct gateway start with stale ready_file (without netsetup)..."
 gw_exec bash -ceu '
-  cp /run/gateway/dataplane.ready /tmp/stale.ready
+  cp /run/gateway-dataplane/dataplane.ready /tmp/stale.ready
   systemctl stop gateway.service
-  install -d -o gateway -g gateway -m 0755 /run/gateway
-  mv /tmp/stale.ready /run/gateway/dataplane.ready
+  install -d -o root -g root -m 0755 /run/gateway-dataplane
+  mv /tmp/stale.ready /run/gateway-dataplane/dataplane.ready
   set +e
   timeout 2s sudo -u gateway /usr/local/bin/gateway run --config /etc/gateway/gateway.yaml >/tmp/stale-start.out 2>/tmp/stale-start.err
   rc=$?
   echo "    stale-ready-file direct start exit code: $rc (124 = stayed running until timeout)"
   head -n 5 /tmp/stale-start.err || true
-  rm -f /run/gateway/dataplane.ready /tmp/stale-start.out /tmp/stale-start.err
+  rm -f /run/gateway-dataplane/dataplane.ready /tmp/stale-start.out /tmp/stale-start.err
 '
 
 echo "==> Starting gateway.service and gateway-dhcp.service"
@@ -511,6 +511,15 @@ gw_exec systemctl is-active --quiet gateway-dhcp.service
 echo "==> Step 2.2: Data plane and privileges"
 gw_exec nft list table inet gw >/dev/null
 gw_exec /usr/local/bin/gateway dataplane check --config /etc/gateway/gateway.yaml
+gw_exec bash -ceu '
+  stat -c "%a %U:%G %n" /run/gateway /run/gateway-dataplane /run/gateway-dataplane/dnsmasq.conf /run/gateway-dataplane/dataplane.ready
+  [[ "$(stat -c "%a %U:%G" /run/gateway-dataplane)" == "755 root:root" ]]
+  sudo -u gateway cat /run/gateway-dataplane/dataplane.ready >/dev/null
+  ! sudo -u gateway touch /run/gateway-dataplane/probe-write 2>/dev/null
+  ! sudo -u gateway sh -c "echo x > /run/gateway-dataplane/dnsmasq.conf" 2>/dev/null
+  ! sudo -u gateway rm -f /run/gateway-dataplane/dnsmasq.conf /run/gateway-dataplane/dataplane.ready 2>/dev/null
+  echo "    PASS: gateway user has read-only access to /run/gateway-dataplane/"
+'
 
 gw_exec bash -eu <<'EOF'
   check_sysctl() {

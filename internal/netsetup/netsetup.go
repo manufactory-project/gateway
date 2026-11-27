@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/manufactory-project/gateway/internal/config"
 )
@@ -293,10 +294,7 @@ func Apply(ctx context.Context, cfg *config.Config) error {
 	}
 
 	if cfg.Dataplane.DHCP.ConfigPath != "" {
-		if err := os.MkdirAll(filepath.Dir(cfg.Dataplane.DHCP.ConfigPath), 0o755); err != nil {
-			return fmt.Errorf("netsetup: mkdir dnsmasq config dir: %w", err)
-		}
-		if err := os.WriteFile(cfg.Dataplane.DHCP.ConfigPath, []byte(dnsmasqConf), 0o644); err != nil {
+		if err := writeOwnedFile(cfg.Dataplane.DHCP.ConfigPath, []byte(dnsmasqConf), 0); err != nil {
 			return fmt.Errorf("netsetup: write dnsmasq config %s: %w", cfg.Dataplane.DHCP.ConfigPath, err)
 		}
 	}
@@ -312,12 +310,78 @@ func Apply(ctx context.Context, cfg *config.Config) error {
 	}
 
 	if cfg.Dataplane.ReadyFile != "" {
-		if err := os.MkdirAll(filepath.Dir(cfg.Dataplane.ReadyFile), 0o755); err != nil {
-			return fmt.Errorf("netsetup: mkdir ready_file dir: %w", err)
-		}
-		if err := os.WriteFile(cfg.Dataplane.ReadyFile, []byte("ok\n"), 0o644); err != nil {
+		if err := writeOwnedFile(cfg.Dataplane.ReadyFile, []byte("ok\n"), 0); err != nil {
 			return fmt.Errorf("netsetup: write ready_file %s: %w", cfg.Dataplane.ReadyFile, err)
 		}
+	}
+	return nil
+}
+
+// writeOwnedFile ensures path's parent directory is a real (non-symlink) directory
+// owned by expectedUID with no group/other write permissions (creating it 0755 if
+// missing), refuses a symlink destination, and atomically replaces path via temp file + rename.
+func writeOwnedFile(path string, data []byte, expectedUID uint32) error {
+	dir := filepath.Dir(path)
+	dirInfo, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, mkErr)
+		}
+		if chErr := os.Chmod(dir, 0o755); chErr != nil {
+			return fmt.Errorf("chmod %s: %w", dir, chErr)
+		}
+		dirInfo, err = os.Lstat(dir)
+	}
+	if err != nil {
+		return fmt.Errorf("lstat dir %s: %w", dir, err)
+	}
+	if dirInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlink parent directory %s", dir)
+	}
+	if !dirInfo.IsDir() {
+		return fmt.Errorf("parent %s is not a directory", dir)
+	}
+	st, ok := dirInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot inspect owner of %s", dir)
+	}
+	if st.Uid != expectedUID {
+		return fmt.Errorf("directory %s owned by uid %d, want %d", dir, st.Uid, expectedUID)
+	}
+	if dirInfo.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("directory %s has unsafe mode %04o (group/other writable)", dir, dirInfo.Mode().Perm())
+	}
+
+	if destInfo, lErr := os.Lstat(path); lErr == nil {
+		if destInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink destination %s", path)
+		}
+		if destInfo.IsDir() {
+			return fmt.Errorf("destination %s is a directory", path)
+		}
+	} else if !errors.Is(lErr, os.ErrNotExist) {
+		return fmt.Errorf("lstat destination %s: %w", path, lErr)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".gateway-tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	cleanupTmp := func(cause error) error {
+		return errors.Join(cause, os.Remove(tmpName))
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return cleanupTmp(errors.Join(fmt.Errorf("write temp %s: %w", tmpName, err), tmp.Close()))
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		return cleanupTmp(errors.Join(fmt.Errorf("chmod temp %s: %w", tmpName, err), tmp.Close()))
+	}
+	if err := tmp.Close(); err != nil {
+		return cleanupTmp(fmt.Errorf("close temp %s: %w", tmpName, err))
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return cleanupTmp(fmt.Errorf("rename %s -> %s: %w", tmpName, path, err))
 	}
 	return nil
 }

@@ -293,10 +293,38 @@ func validate(cfg *Config) error {
 			return err
 		}
 	}
+	if err := validateDataplaneAdminSeparation(cfg); err != nil {
+		return err
+	}
 	if err := validateRules(cfg, declaredPrincipals); err != nil {
 		return err
 	}
 	return nil
+}
+
+func validateDataplaneAdminSeparation(cfg *Config) error {
+	if cfg.Admin.Socket == "" {
+		return nil
+	}
+	adminDir := filepath.Clean(filepath.Dir(cfg.Admin.Socket))
+	if isPathInsideDir(cfg.Dataplane.ReadyFile, adminDir) {
+		return fmt.Errorf("dataplane.ready_file %q must not be inside admin.socket directory %q", cfg.Dataplane.ReadyFile, adminDir)
+	}
+	if isPathInsideDir(cfg.Dataplane.DHCP.ConfigPath, adminDir) {
+		return fmt.Errorf("dataplane.dhcp.config_path %q must not be inside admin.socket directory %q", cfg.Dataplane.DHCP.ConfigPath, adminDir)
+	}
+	return nil
+}
+
+func isPathInsideDir(p, dir string) bool {
+	if p == "" || dir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(p))
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func validateExplicitListenAddr(addr string) error {

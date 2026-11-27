@@ -176,13 +176,14 @@ Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
   `ExecStartPre=+/usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml` (privileged
   one-shot setup), `CapabilityBoundingSet=` and `AmbientCapabilities=` both empty,
   `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
-  `RuntimeDirectory=gateway` (admin socket, `dataplane.ready`, and generated `dnsmasq.conf`), and
+  `RuntimeDirectory=gateway` with `RuntimeDirectoryMode=0750` (admin socket only), and
   `LogsDirectory=gateway/audit` (creating and granting write access to `/var/log/gateway/audit`
-  only). When `gateway.service` stops, `RuntimeDirectory=gateway` deletes `/run/gateway`,
-  including `dataplane.ready`.
+  only). Root-written dataplane files (`dnsmasq.conf` and `dataplane.ready`) live in root-owned
+  `0755` `/run/gateway-dataplane/` (mode `0644`), so unprivileged `gateway` has read-only access
+  and cannot tamper with `dnsmasq.conf` or `dataplane.ready`.
 - **`deploy/gateway-dhcp.service`:** Ordered `After=gateway.service` and
   `Requires=gateway.service`. Runs
-  `/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gateway/dnsmasq.conf` with no flags
+  `/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gateway-dataplane/dnsmasq.conf` with no flags
   duplicated from the config `netsetup` generates. Starts as root (no `User=`, no empty
   `CapabilityBoundingSet=`) so `dnsmasq` can bind UDP `:67` and then drop privileges itself via
   `user=`.
@@ -198,6 +199,6 @@ Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
   under `timeout`), whereas root `gateway dataplane check` inspects `table inet gw` directly and
   fails. In normal deployment, the guards against a stale ready file are systemd always re-running
   `ExecStartPre=+ gateway netsetup` (which deletes any stale ready file first and reloads
-  `table inet gw`), `RuntimeDirectory=gateway` deleting `/run/gateway` on service stop, and
+  `table inet gw`), root-only ownership on `/run/gateway-dataplane/`, and
   `net.ipv4.ip_forward=0` keeping forwarding disabled. `gateway dataplane check` is strictly
   read-only; only `gateway netsetup` writes `dataplane.ready`.
