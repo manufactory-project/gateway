@@ -316,6 +316,10 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		{"fake_cidr", validYAML + "\ndns:\n  fake_cidr: 198.19.0.0/16\n"},
 		{"links_gateway_ip", strings.Replace(validYAML, "gateway_ip: 10.200.0.1", "gateway_ip: 10.200.0.2", 1)},
 		{"principals", strings.ReplaceAll(validYAML, "worker-codex", "worker-renamed")},
+		{"dataplane_ready_file", strings.Replace(validYAML, "/run/gatewayd/dataplane.ready", "/run/gatewayd/other.ready", 1)},
+		{"dataplane_dhcp", strings.Replace(validYAML, "user: dnsmasq", "user: nobody", 1)},
+		{"dataplane_verify_sysctls", strings.Replace(validYAML, "dataplane:\n", "dataplane:\n  verify_sysctls: false\n", 1)},
+		{"http_max_header_bytes", validYAML + "\nhttp:\n  max_header_bytes: 65536\n"},
 	}
 	for _, tc := range immutableChanges {
 		t.Run("refuse_"+tc.name, func(t *testing.T) {
@@ -335,8 +339,8 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		})
 	}
 
-	// Positive control: hot-reloading rules/records succeeds and wipes grants.
-	ruleUpdated := strings.Replace(validYAML, "deb.debian.org", "security.debian.org", 1)
+	// Positive control: hot-reloading rules/records and per-request HTTP limits succeeds and wipes grants.
+	ruleUpdated := strings.Replace(validYAML, "deb.debian.org", "security.debian.org", 1) + "\nhttp:\n  max_request_body_bytes: 1048576\n  ws_max_egress_bytes: 2097152\n"
 	if err := os.WriteFile(cfgPath, []byte(ruleUpdated), 0o600); err != nil {
 		t.Fatalf("write ruleUpdated: %v", err)
 	}

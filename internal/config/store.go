@@ -103,9 +103,10 @@ func (s *Store) SetOnGrantExpired(fn func(grantID string)) {
 
 // Reload re-reads and validates the YAML file from disk. If validation fails or
 // any restart-only section changed (links, principals, fake_cidr, ca, audit,
-// admin, metrics), the previous snapshot and grants remain intact and an error
-// is returned. On success, the snapshot is atomically replaced and all in-memory
-// TTL grants are wiped before reload callbacks run.
+// admin, metrics, dataplane, http.max_header_bytes), the previous snapshot and
+// grants remain intact and an error is returned. On success, the snapshot is
+// atomically replaced and all in-memory TTL grants are wiped before reload
+// callbacks run.
 func (s *Store) Reload() (*Snapshot, []string, error) {
 	cfg, hash, err := LoadFile(s.path)
 	if err != nil {
@@ -156,6 +157,14 @@ func checkReloadImmutable(prev, next *Config) error {
 	}
 	if prev.FakePrefix != next.FakePrefix {
 		return errors.New("reload refused: dns.fake_cidr changed (restart required)")
+	}
+	if prev.ShouldVerifySysctls() != next.ShouldVerifySysctls() ||
+		prev.Dataplane.ReadyFile != next.Dataplane.ReadyFile ||
+		prev.Dataplane.DHCP != next.Dataplane.DHCP {
+		return errors.New("reload refused: dataplane configuration changed (restart required)")
+	}
+	if prev.HTTP.MaxHeaderBytes != next.HTTP.MaxHeaderBytes {
+		return errors.New("reload refused: http.max_header_bytes changed (restart required)")
 	}
 	if !slices.Equal(prev.Links, next.Links) {
 		return errors.New("reload refused: links or principals changed (restart required)")

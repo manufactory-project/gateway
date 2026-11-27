@@ -84,5 +84,5 @@ the locked plain-Go wire suite is the living verification inventory.
   flows that are no longer allowed (by host, port, method, or path) are torn down immediately via
   `cancel()` + `conn.Close()`, and open WebSockets are torn down if a `Binding` is added to their
   host. Changes to `ws_max_egress_bytes`, `records`, or `bindings` otherwise apply only to new
-  flows. Changes to `links`, principals, `dns.fake_cidr`, `ca`, `audit`, `admin`, or `metrics`
-  require a daemon restart and are refused on reload.
+  flows. Changes to `links`, principals, `dns.fake_cidr`, `ca`, `audit`, `admin`, `metrics`,
+  `dataplane`, or `http.max_header_bytes` require a daemon restart and are refused on reload.
