@@ -1,11 +1,12 @@
 version: '3'
 
 env:
+  # Pin Go 1.26.2 to match go.mod (go 1.26) and WSL golangci-lint built with Go 1.26.
   GOTOOLCHAIN: go1.26.2
 
 tasks:
   lint:
-    desc: Run golangci-lint (errcheck with check-blank, unused, govet, staticcheck)
+    desc: Run golangci-lint (errcheck, govet, ineffassign, nolintlint, staticcheck, unused)
     cmds:
       - golangci-lint run ./...
 
@@ -16,4 +17,6 @@ tasks:
 
   check:
     desc: Run lint and race-checked tests
-    deps: [lint, test]
+    cmds:
+      - task: lint
+      - task: test

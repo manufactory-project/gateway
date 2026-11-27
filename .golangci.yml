@@ -9,12 +9,16 @@ linters:
     - errcheck
     - govet
     - ineffassign
+    - nolintlint
     - staticcheck
     - unused
   settings:
     errcheck:
       check-type-assertions: true
       check-blank: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
 
 issues:
   max-issues-per-linter: 0
