@@ -13,8 +13,26 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+type writeCounterConn struct {
+	net.Conn
+	written atomic.Int64
+}
+
+func (w *writeCounterConn) Write(p []byte) (int, error) {
+	n, err := w.Conn.Write(p)
+	if n > 0 {
+		w.written.Add(int64(n))
+	}
+	return n, err
+}
+
+func (w *writeCounterConn) BytesWritten() int64 {
+	return w.written.Load()
+}
 
 // Result is emitted as one JSON line per probe check.
 type Result struct {
@@ -178,15 +196,16 @@ func runSameIPChecks(ctx context.Context, cfg probeConfig) []Result {
 }
 
 func checkDirectHTTPSNoSNI(ctx context.Context, cfg probeConfig) Result {
+	const expect = "remote TLS handshake failure after sending no-SNI ClientHello"
 	target := net.JoinHostPort(cfg.DirectHTTPSIP, strconv.Itoa(cfg.httpsTargetPort()))
 	d := net.Dialer{Timeout: cfg.Timeout}
 	rawConn, err := d.DialContext(ctx, "tcp4", target)
 	if err != nil {
 		return Result{
 			Check:  "direct_https_ip_literal",
-			Expect: "tls handshake error (no allowed SNI)",
-			Got:    fmt.Sprintf("dial error: %v", err),
-			Pass:   true,
+			Expect: expect,
+			Got:    fmt.Sprintf("local dial error before sending ClientHello: %v", err),
+			Pass:   false,
 		}
 	}
 	defer closeQuietly(rawConn)
@@ -194,29 +213,39 @@ func checkDirectHTTPSNoSNI(ctx context.Context, cfg probeConfig) Result {
 	if err := rawConn.SetDeadline(time.Now().Add(cfg.Timeout)); err != nil {
 		return Result{
 			Check:  "direct_https_ip_literal",
-			Expect: "tls handshake error (no allowed SNI)",
+			Expect: expect,
 			Got:    fmt.Sprintf("set deadline: %v", err),
 			Pass:   false,
 		}
 	}
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		RootCAs:    cfg.RootCAs,
+	wc := &writeCounterConn{Conn: rawConn}
+	tlsConn := tls.Client(wc, &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true,
 	})
 	defer closeQuietly(tlsConn)
 
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		sent := wc.BytesWritten()
+		if sent == 0 {
+			return Result{
+				Check:  "direct_https_ip_literal",
+				Expect: expect,
+				Got:    fmt.Sprintf("local error before sending ClientHello: %v", err),
+				Pass:   false,
+			}
+		}
 		return Result{
 			Check:  "direct_https_ip_literal",
-			Expect: "tls handshake error (no allowed SNI)",
-			Got:    fmt.Sprintf("tls error: %v", err),
+			Expect: expect,
+			Got:    fmt.Sprintf("remote rejected no-SNI ClientHello (%d bytes sent): %v", sent, err),
 			Pass:   true,
 		}
 	}
 	return Result{
 		Check:  "direct_https_ip_literal",
-		Expect: "tls handshake error (no allowed SNI)",
-		Got:    "tls handshake unexpectedly succeeded",
+		Expect: expect,
+		Got:    "tls handshake unexpectedly succeeded without SNI",
 		Pass:   false,
 	}
 }

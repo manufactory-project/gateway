@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,9 +97,18 @@ func TestMockChecksAndSameIPMode(t *testing.T) {
 	pool.AddCert(caCert)
 
 	// Start mock HTTPS server enforcing SNI == allow.example.test and Host == allow.example.test.
+	var (
+		sniMu        sync.Mutex
+		sawEmptySNI  bool
+	)
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hello.ServerName == "" {
+				sniMu.Lock()
+				sawEmptySNI = true
+				sniMu.Unlock()
+			}
 			if hello.ServerName != "allow.example.test" {
 				return nil, io.EOF
 			}
@@ -242,6 +252,12 @@ func TestMockChecksAndSameIPMode(t *testing.T) {
 			t.Errorf("check %s failed: expect=%q got=%q", r.Check, r.Expect, r.Got)
 		}
 	}
+	sniMu.Lock()
+	gotEmptySNI := sawEmptySNI
+	sniMu.Unlock()
+	if !gotEmptySNI {
+		t.Fatal("expected direct_https_ip_literal to send a real ClientHello with ServerName == \"\"")
+	}
 
 	// Verify same-IP mode binds fixed source IP and port on both UDP and TCP.
 	sameCfg := cfg
@@ -339,5 +355,67 @@ func mustSelfSignedCert(t *testing.T, dnsName string) (*x509.Certificate, tls.Ce
 	return cert, tls.Certificate{
 		Certificate: [][]byte{der},
 		PrivateKey:  key,
+	}
+}
+
+func TestDirectHTTPSNoSNIBypassFails(t *testing.T) {
+	_, srvCert := mustSelfSignedCert(t, "bypass.example.test")
+	var (
+		mu       sync.Mutex
+		seenSNIs []string
+	)
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			mu.Lock()
+			seenSNIs = append(seenSNIs, hello.ServerName)
+			mu.Unlock()
+			return &srvCert, nil
+		},
+	}
+	rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	tlsLn := tls.NewListener(rawLn, tlsCfg)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, aErr := tlsLn.Accept()
+		if aErr != nil {
+			return
+		}
+		defer closeQuietly(conn)
+		if tConn, ok := conn.(*tls.Conn); ok {
+			if hErr := tConn.Handshake(); hErr != nil {
+				return
+			}
+		}
+	}()
+	defer func() {
+		if cErr := tlsLn.Close(); cErr != nil {
+			t.Errorf("close tlsLn: %v", cErr)
+		}
+		<-done
+	}()
+
+	tcpAddr, ok := rawLn.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", rawLn.Addr())
+	}
+	res := checkDirectHTTPSNoSNI(context.Background(), probeConfig{
+		DirectHTTPSIP:  "127.0.0.1",
+		AllowHTTPSPort: tcpAddr.Port,
+		Timeout:        2 * time.Second,
+	})
+	if res.Pass {
+		t.Fatalf("expected direct_https_ip_literal to FAIL against permissive TLS server, got pass: %+v", res)
+	}
+
+	mu.Lock()
+	snis := append([]string(nil), seenSNIs...)
+	mu.Unlock()
+	if len(snis) != 1 || snis[0] != "" {
+		t.Fatalf("expected GetCertificate to record exactly one ClientHello with ServerName == \"\", got %#v", snis)
 	}
 }
