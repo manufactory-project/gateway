@@ -156,8 +156,8 @@ func runAllChecks(ctx context.Context, cfg probeConfig) []Result {
 		checkUploadGT64K(ctx, cfg),
 		checkDownloadGT64K(ctx, cfg),
 	)
-	// 8. IPv6 egress dropped.
-	results = append(results, checkIPv6Dropped(ctx, cfg.IPv6Target, cfg.Timeout))
+	// 8. Guest has no IPv6 path.
+	results = append(results, checkIPv6NoPath(ctx, cfg.IPv6Target, cfg.Timeout))
 	// 9. Direct connection to guest's own <link_IP>:<https_port> dropped.
 	results = append(results, checkTCPBlocked(
 		ctx,
@@ -614,22 +614,23 @@ func checkDownloadGT64K(ctx context.Context, cfg probeConfig) Result {
 	}
 }
 
-func checkIPv6Dropped(ctx context.Context, target string, timeout time.Duration) Result {
+func checkIPv6NoPath(ctx context.Context, target string, timeout time.Duration) Result {
+	const expect = "guest has no IPv6 path (disable_ipv6 set on link)"
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp6", target)
 	if err != nil {
 		class := classifyDialError(err)
 		return Result{
-			Check:  "ipv6_egress_dropped",
-			Expect: "ipv6 egress dropped",
+			Check:  "ipv6_no_path",
+			Expect: expect,
 			Got:    fmt.Sprintf("%s: %v", class, err),
 			Pass:   true,
 		}
 	}
 	closeQuietly(conn)
 	return Result{
-		Check:  "ipv6_egress_dropped",
-		Expect: "ipv6 egress dropped",
+		Check:  "ipv6_no_path",
+		Expect: expect,
 		Got:    fmt.Sprintf("connected over IPv6 to %s", target),
 		Pass:   false,
 	}

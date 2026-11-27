@@ -163,6 +163,10 @@ Loki.
   dials the guest's target port (`443` or `80`) and static `records` map a hostname to an IP only.
   Production always uses `netguard.Dialer.DialContext`; tests still dial through `netguard.Dialer`
   so SSRF and `records` enforcement remain exercised.
+- **Probe checks without positive controls:** `gateway-probe`'s `ipv6_no_path` check (confirming
+  the guest has no IPv6 path because `disable_ipv6=1` is set on the sandbox link) and
+  `blocked_udp_443_quic` check have no in-probe positive control; both rely on `nftables` / sysctl
+  verification and host-side inspection rather than an allowed IPv6 or QUIC peer.
 
 ## 8. Deploying
 
