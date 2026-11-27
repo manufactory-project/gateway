@@ -408,6 +408,7 @@ func TestDirectHTTPSNoSNIBypassFails(t *testing.T) {
 		AllowHTTPSPort: tcpAddr.Port,
 		Timeout:        2 * time.Second,
 	})
+	t.Logf("bypass result: %+v", res)
 	if res.Pass {
 		t.Fatalf("expected direct_https_ip_literal to FAIL against permissive TLS server, got pass: %+v", res)
 	}
@@ -431,10 +432,278 @@ func TestTCPBlockedRefusedFails(t *testing.T) {
 	}
 
 	res := checkTCPBlocked(context.Background(), "blocked_tcp_22", closedAddr, 2*time.Second)
+	t.Logf("bypass result: %+v", res)
 	if res.Pass {
 		t.Fatalf("expected closed loopback port (refused/reset) to FAIL checkTCPBlocked, got pass: %+v", res)
 	}
 	if !strings.HasPrefix(res.Got, "refused:") && !strings.HasPrefix(res.Got, "reset:") {
 		t.Fatalf("expected got to report refused/reset class, got %q", res.Got)
+	}
+}
+
+func TestBypassSNIHostSpoof200(t *testing.T) {
+	caCert, srvCert := mustSelfSignedCert(t, "allow.example.test")
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+
+	rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	tlsLn := tls.NewListener(rawLn, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{srvCert},
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, wErr := io.WriteString(w, "spoofed ok"); wErr != nil {
+			return
+		}
+	})
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if sErr := srv.Serve(tlsLn); sErr != nil && sErr != http.ErrServerClosed {
+			return
+		}
+	}()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if sErr := srv.Shutdown(shutCtx); sErr != nil {
+			t.Errorf("shutdown https: %v", sErr)
+		}
+	}()
+
+	tcpAddr, ok := rawLn.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", rawLn.Addr())
+	}
+	res := checkSNIHostSpoof(context.Background(), probeConfig{
+		AllowHost:      "allow.example.test",
+		DenyHost:       "spoof.example.test",
+		WrongIP:        "127.0.0.1",
+		AllowHTTPSPort: tcpAddr.Port,
+		RootCAs:        pool,
+		Timeout:        2 * time.Second,
+	})
+	t.Logf("bypass result: %+v", res)
+	if res.Pass {
+		t.Fatalf("expected sni_host_spoof to FAIL on HTTP 200, got pass: %+v", res)
+	}
+	if res.Got != "HTTP 200" {
+		t.Fatalf("expected Got == HTTP 200, got %q", res.Got)
+	}
+
+	// Also verify connection/TLS errors fail the spoof check (must be 403).
+	closedLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen closed: %v", err)
+	}
+	closedTCP, ok := closedLn.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", closedLn.Addr())
+	}
+	if err := closedLn.Close(); err != nil {
+		t.Fatalf("close closedLn: %v", err)
+	}
+	errRes := checkSNIHostSpoof(context.Background(), probeConfig{
+		AllowHost:      "allow.example.test",
+		DenyHost:       "spoof.example.test",
+		WrongIP:        "127.0.0.1",
+		AllowHTTPSPort: closedTCP.Port,
+		RootCAs:        pool,
+		Timeout:        2 * time.Second,
+	})
+	t.Logf("error-bypass result: %+v", errRes)
+	if errRes.Pass {
+		t.Fatalf("expected sni_host_spoof to FAIL on connection error, got pass: %+v", errRes)
+	}
+}
+
+func TestBypassDNSRefusedAnswered(t *testing.T) {
+	udpPC, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		servePermissiveMockDNS(udpPC, [4]byte{198, 18, 0, 55})
+	}()
+	defer func() {
+		if cErr := udpPC.Close(); cErr != nil {
+			t.Errorf("close udp: %v", cErr)
+		}
+		<-done
+	}()
+
+	cfg := probeConfig{
+		AllowHost:  "allow.example.test",
+		DenyHost:   "denied.example.test",
+		FakePrefix: netip.MustParsePrefix("198.18.0.0/15"),
+		DNSServer:  udpPC.LocalAddr().String(),
+		Timeout:    2 * time.Second,
+	}
+	ctx := context.Background()
+	cases := []struct {
+		name  string
+		qname string
+		qtype uint16
+	}{
+		{"dns_refused_txt", cfg.AllowHost, qtypeTXT},
+		{"dns_refused_mx", cfg.AllowHost, qtypeMX},
+		{"dns_refused_ns", cfg.AllowHost, qtypeNS},
+		{"dns_refused_srv", cfg.AllowHost, qtypeSRV},
+		{"dns_refused_cname", cfg.AllowHost, qtypeCNAME},
+		{"dns_refused_non_allowlisted", cfg.DenyHost, qtypeA},
+	}
+	for _, tc := range cases {
+		res := checkDNSRefused(ctx, tc.name, cfg.DNSServer, tc.qname, tc.qtype, cfg.Timeout)
+		t.Logf("bypass result: %+v", res)
+		if res.Pass {
+			t.Errorf("expected %s to FAIL when mock answers NOERROR+answer, got pass: %+v", tc.name, res)
+		}
+	}
+}
+
+func TestBypassDNSAllowNonFakeIP(t *testing.T) {
+	udpPC, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		servePermissiveMockDNS(udpPC, [4]byte{93, 184, 216, 34})
+	}()
+	defer func() {
+		if cErr := udpPC.Close(); cErr != nil {
+			t.Errorf("close udp: %v", cErr)
+		}
+		<-done
+	}()
+
+	res := checkDNSFakeIP(
+		context.Background(),
+		"dns_allow_a_control",
+		"udp",
+		udpPC.LocalAddr().String(),
+		"allow.example.test",
+		netip.MustParsePrefix("198.18.0.0/15"),
+		nil,
+		2*time.Second,
+	)
+	t.Logf("bypass result: %+v", res)
+	if res.Pass {
+		t.Fatalf("expected dns_allow_a_control to FAIL for non-fake IP 93.184.216.34, got pass: %+v", res)
+	}
+	if !strings.Contains(res.Got, "93.184.216.34") {
+		t.Fatalf("expected got to include returned IP, got %q", res.Got)
+	}
+}
+
+func TestBypassPort80Returns200(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, wErr := io.WriteString(w, "metadata leaked"); wErr != nil {
+			return
+		}
+	})
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if sErr := srv.Serve(ln); sErr != nil && sErr != http.ErrServerClosed {
+			return
+		}
+	}()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if sErr := srv.Shutdown(shutCtx); sErr != nil {
+			t.Errorf("shutdown http: %v", sErr)
+		}
+	}()
+
+	res := checkUnreachableHTTP(context.Background(), "unreachable_metadata", ln.Addr().String(), "169.254.169.254", 2*time.Second)
+	t.Logf("bypass result: %+v", res)
+	if res.Pass {
+		t.Fatalf("expected port-80 check to FAIL on HTTP 200, got pass: %+v", res)
+	}
+	if res.Got != "HTTP 200" {
+		t.Fatalf("expected Got == HTTP 200, got %q", res.Got)
+	}
+
+	// Positive control: a mock returning gatewayd's 403 passes.
+	denyLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen deny tcp: %v", err)
+	}
+	denyMux := http.NewServeMux()
+	denyMux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "egress denied: ip-literal-host", http.StatusForbidden)
+	})
+	denySrv := &http.Server{Handler: denyMux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if sErr := denySrv.Serve(denyLn); sErr != nil && sErr != http.ErrServerClosed {
+			return
+		}
+	}()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if sErr := denySrv.Shutdown(shutCtx); sErr != nil {
+			t.Errorf("shutdown deny http: %v", sErr)
+		}
+	}()
+
+	okRes := checkUnreachableHTTP(context.Background(), "unreachable_metadata", denyLn.Addr().String(), "169.254.169.254", 2*time.Second)
+	if !okRes.Pass {
+		t.Fatalf("expected gatewayd 403 to PASS port-80 unreachable check, got: %+v", okRes)
+	}
+}
+
+func servePermissiveMockDNS(pc net.PacketConn, aIP [4]byte) {
+	buf := make([]byte, 2048)
+	for {
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if n < 12 {
+			continue
+		}
+		pkt := buf[:n]
+		_, next, err := decodeMockQName(pkt, 12)
+		if err != nil || next+4 > len(pkt) {
+			continue
+		}
+		qtype := binary.BigEndian.Uint16(pkt[next : next+2])
+		resp := make([]byte, len(pkt))
+		copy(resp, pkt)
+		binary.BigEndian.PutUint16(resp[2:4], 0x8180) // QR=1, NOERROR
+		binary.BigEndian.PutUint16(resp[6:8], 1)      // ANCOUNT=1
+		var rdata []byte
+		if qtype == qtypeA {
+			rdata = aIP[:]
+		} else {
+			rdata = []byte{0x04, 'b', 'y', 'p', 's'}
+		}
+		rr := []byte{
+			0xc0, 0x0c,
+			byte(qtype >> 8), byte(qtype),
+			0x00, 0x01,
+			0x00, 0x00, 0x00, 0x3c,
+			byte(len(rdata) >> 8), byte(len(rdata)),
+		}
+		resp = append(resp, rr...)
+		resp = append(resp, rdata...)
+		if _, wErr := pc.WriteTo(resp, addr); wErr != nil {
+			return
+		}
 	}
 }
