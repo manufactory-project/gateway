@@ -40,6 +40,21 @@ the locked plain-Go wire suite is the living verification inventory.
   APIs accept any credential the guest presents, so data can leave to an account the operator does
   not own. Subscription OAuth tokens (`claude`, `agy`, `codex`) live inside the guest by design so
   workers can use personal subscriptions under unmodified vendor CLIs.
+- **Vendor account content pulled over allowed API hosts:** Any content a vendor serves on an
+  allowlisted API host—such as `claude`'s organization skills and plugins on `api.anthropic.com`—can
+  be fetched into the guest unless blocked by path rules. Path-scoped allow rules (as in
+  `examples/workers.yaml`) are the control.
+- **Vendor telemetry over allowed API hosts:** Telemetry endpoints hosted on the same allowlisted
+  API domain (such as `claude`'s `/api/event_logging/v2/batch` on `api.anthropic.com`) can leave
+  unless excluded by path-scoped rules, even when dedicated third-party telemetry hosts are denied.
+- **Steady-state token refresh vs. interactive login grants:** Interactive login hostnames are
+  granted only ephemerally (`gateway grant --ttl 5m`) and stay out of steady-state policy; OAuth
+  token-refresh endpoints instead receive permanent exact-host, exact-path `POST` rules so workers
+  can refresh tokens without keeping interactive login surfaces open.
+- **CLI CA trust without env vars (unverified):** Phase 3 verified `claude`, `codex`, and `agy`
+  through MITM with `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` pointing at `/etc/ssl/certs/ca-certificates.crt`;
+  whether each CLI trusts the system CA store with those environment variables unset is still
+  unverified.
 - **Exfiltration within a credential's scope and through allowed destinations:** A placeholder
   prevents the guest from reading the raw secret, but an agent can still exfiltrate any data the
   credential legitimately reaches (for example, pushing to a repository the token can write) or
