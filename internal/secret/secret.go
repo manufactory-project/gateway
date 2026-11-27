@@ -222,7 +222,12 @@ func substituteByScheme(val, scheme, placeholder, realVal string) string {
 	return strings.ReplaceAll(val, placeholder, realVal)
 }
 
+func trimOWS(v string) string {
+	return strings.Trim(v, " \t")
+}
+
 func hasAuthSchemePrefix(v, scheme string) bool {
+	v = trimOWS(v)
 	n := len(scheme)
 	if len(v) <= n {
 		return false
@@ -231,6 +236,7 @@ func hasAuthSchemePrefix(v, scheme string) bool {
 }
 
 func decodeBasicPayload(v string) (prefix string, decoded []byte, ok bool) {
+	v = trimOWS(v)
 	if len(v) < 6 || !strings.EqualFold(v[:5], "basic") || (v[5] != ' ' && v[5] != '\t') {
 		return "", nil, false
 	}
@@ -251,6 +257,7 @@ func decodeBasicPayload(v string) (prefix string, decoded []byte, ok bool) {
 }
 
 func containsAnyPlaceholder(v, prefix string) bool {
+	v = trimOWS(v)
 	if strings.Contains(v, prefix) {
 		return true
 	}

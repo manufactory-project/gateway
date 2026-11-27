@@ -439,6 +439,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 		deny(http.StatusForbidden, "websocket-not-allowed", dec.RuleID, host, nil)
 		return
 	}
+	if wantWS && (r.ContentLength != 0 || len(r.TransferEncoding) > 0) {
+		deny(http.StatusBadRequest, "websocket-upgrade-with-body", dec.RuleID, host, nil)
+		return
+	}
 
 	// 7. Check Content-Length against streaming body cap before dialing upstream.
 	maxBody := s.store.Current().Config.HTTP.MaxRequestBodyBytes
@@ -689,10 +693,26 @@ func validateOriginForm(r *http.Request) string {
 			return "path-traversal"
 		}
 	}
-	if !strings.HasPrefix(path.Clean(r.URL.Path), "/") {
-		return "non-origin-form-target"
+	if !isCanonicalPath(r.URL.Path) {
+		return "non-canonical-path"
 	}
 	return ""
+}
+
+func isCanonicalPath(p string) bool {
+	if !strings.HasPrefix(p, "/") {
+		return false
+	}
+	cleaned := path.Clean(p)
+	if cleaned == p {
+		return true
+	}
+	// Allow a single trailing slash on a non-root canonical path (e.g. "/a/"),
+	// but reject "//", "/./", "/a/.", "/a//", "/v1/./admin", "/v1//admin".
+	if cleaned != "/" && cleaned+"/" == p {
+		return true
+	}
+	return false
 }
 
 func validateHostAndSNI(r *http.Request, dstPort uint16) (string, string) {

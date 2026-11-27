@@ -171,14 +171,19 @@ func (s *Server) Start() error {
 	udpReady := make(chan struct{})
 	tcpReady := make(chan struct{})
 
+	acceptAll := func(_ mdns.Header) mdns.MsgAcceptAction {
+		return mdns.MsgAccept
+	}
 	s.udpSrv = &mdns.Server{
 		PacketConn:        pc,
 		Handler:           handler,
+		MsgAcceptFunc:     acceptAll,
 		NotifyStartedFunc: func() { close(udpReady) },
 	}
 	s.tcpSrv = &mdns.Server{
 		Listener:          ln,
 		Handler:           handler,
+		MsgAcceptFunc:     acceptAll,
 		NotifyStartedFunc: func() { close(tcpReady) },
 	}
 
@@ -252,9 +257,44 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 		proto = "tcp"
 	}
 
+	if r.Opcode != mdns.OpcodeQuery {
+		qname := ""
+		qtypeName := ""
+		if len(r.Question) > 0 {
+			qname = strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
+			qtypeName = mdns.TypeToString[r.Question[0].Qtype]
+		}
+		s.auditAndReply(w, resp, mdns.RcodeNotImplemented, audit.Event{
+			Kind:      audit.KindDNS,
+			Principal: s.link.Principal,
+			Link:      s.link.Name,
+			SrcIP:     srcIP,
+			Protocol:  proto,
+			Host:      qname,
+			Port:      53,
+			QType:     qtypeName,
+			Effect:    audit.EffectDeny,
+			Reason:    "opcode-not-implemented",
+		})
+		return
+	}
+
 	if len(r.Question) != 1 {
-		resp.Rcode = mdns.RcodeRefused
-		s.writeResponse(w, resp)
+		qname := ""
+		if len(r.Question) > 0 {
+			qname = strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
+		}
+		s.auditAndReply(w, resp, mdns.RcodeRefused, audit.Event{
+			Kind:      audit.KindDNS,
+			Principal: s.link.Principal,
+			Link:      s.link.Name,
+			SrcIP:     srcIP,
+			Protocol:  proto,
+			Host:      qname,
+			Port:      53,
+			Effect:    audit.EffectDeny,
+			Reason:    "invalid-question-count",
+		})
 		return
 	}
 
@@ -263,6 +303,22 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 	qtypeName := mdns.TypeToString[q.Qtype]
 	if qtypeName == "" {
 		qtypeName = fmt.Sprintf("TYPE%d", q.Qtype)
+	}
+
+	if q.Qclass != mdns.ClassINET {
+		s.auditAndReply(w, resp, mdns.RcodeRefused, audit.Event{
+			Kind:      audit.KindDNS,
+			Principal: s.link.Principal,
+			Link:      s.link.Name,
+			SrcIP:     srcIP,
+			Protocol:  proto,
+			Host:      qname,
+			Port:      53,
+			QType:     qtypeName,
+			Effect:    audit.EffectDeny,
+			Reason:    "qclass-refused",
+		})
+		return
 	}
 
 	dec := s.eval.DecideDNS(s.link.Principal, qname)
@@ -322,6 +378,10 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 		GrantID:   dec.GrantID,
 	}
 
+	s.auditAndReply(w, resp, rcode, ev)
+}
+
+func (s *Server) auditAndReply(w mdns.ResponseWriter, resp *mdns.Msg, rcode int, ev audit.Event) {
 	// Fail closed if audit sink is unwritable: never answer with an A record.
 	if err := s.audit.WriteSync(ev); err != nil {
 		resp.Answer = nil
@@ -335,7 +395,7 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 
 	resp.Rcode = rcode
 	if s.onQuery != nil {
-		s.onQuery(s.link.Principal, string(effect))
+		s.onQuery(s.link.Principal, string(ev.Effect))
 	}
 	s.writeResponse(w, resp)
 }

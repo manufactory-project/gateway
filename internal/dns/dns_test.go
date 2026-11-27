@@ -183,14 +183,56 @@ rules:
 		}
 	}
 
-	// Audit completeness check: every query above produced an audit record.
+	// Containment (Item 4): len(Question) != 1 (0 and 2 questions) -> REFUSED and audited;
+	// non-QUERY Opcode -> NOTIMP and audited; non-IN Class (CHAOS) -> REFUSED and audited.
+	rawClient := &mdns.Client{Net: "udp", Timeout: 2 * time.Second}
+
+	mZero := new(mdns.Msg)
+	mZero.Id = mdns.Id()
+	mZero.Opcode = mdns.OpcodeQuery
+	rZero, _, err := rawClient.Exchange(mZero, srv.UDPAddr())
+	if err != nil || rZero.Rcode != mdns.RcodeRefused {
+		t.Fatalf("0-question query: rcode=%v err=%v, want REFUSED", rZero, err)
+	}
+
+	mTwo := new(mdns.Msg)
+	mTwo.Id = mdns.Id()
+	mTwo.Opcode = mdns.OpcodeQuery
+	mTwo.Question = []mdns.Question{
+		{Name: "api.anthropic.com.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET},
+		{Name: "api.anthropic.com.", Qtype: mdns.TypeAAAA, Qclass: mdns.ClassINET},
+	}
+	rTwo, _, err := rawClient.Exchange(mTwo, srv.UDPAddr())
+	if err != nil || rTwo.Rcode != mdns.RcodeRefused {
+		t.Fatalf("2-question query: rcode=%v err=%v, want REFUSED", rTwo, err)
+	}
+
+	mUpdate := new(mdns.Msg)
+	mUpdate.Id = mdns.Id()
+	mUpdate.Opcode = mdns.OpcodeUpdate
+	mUpdate.Question = []mdns.Question{{Name: "api.anthropic.com.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET}}
+	rUpd, _, err := rawClient.Exchange(mUpdate, srv.UDPAddr())
+	if err != nil || rUpd.Rcode != mdns.RcodeNotImplemented {
+		t.Fatalf("OpcodeUpdate query: rcode=%v err=%v, want NOTIMP", rUpd, err)
+	}
+
+	mChaos := new(mdns.Msg)
+	mChaos.Id = mdns.Id()
+	mChaos.Opcode = mdns.OpcodeQuery
+	mChaos.Question = []mdns.Question{{Name: "api.anthropic.com.", Qtype: mdns.TypeA, Qclass: mdns.ClassCHAOS}}
+	rChaos, _, err := rawClient.Exchange(mChaos, srv.UDPAddr())
+	if err != nil || rChaos.Rcode != mdns.RcodeRefused {
+		t.Fatalf("ClassCHAOS query: rcode=%v err=%v, want REFUSED", rChaos, err)
+	}
+
+	// Audit completeness check: every query above (incl. malformed/opcode/class) produced an audit record.
 	events, err := audit.Query(auditDir, audit.QueryOptions{})
 	if err != nil {
 		t.Fatalf("audit.Query: %v", err)
 	}
-	// 2 (A udp+tcp) + 3 (AAAA/HTTPS/SVCB) + 15 (5 qtypes * 3 hosts) + 2 (blocked A/AAAA) = 22.
-	if len(events) != 22 {
-		t.Fatalf("expected 22 audited DNS events, got %d", len(events))
+	// 2 (A udp+tcp) + 3 (AAAA/HTTPS/SVCB) + 15 (5 qtypes * 3 hosts) + 2 (blocked A/AAAA) + 4 (0q, 2q, update, chaos) = 26.
+	if len(events) != 26 {
+		t.Fatalf("expected 26 audited DNS events, got %d", len(events))
 	}
 
 	// Containment: fail closed when audit sink becomes unwritable (must NOT return an A answer).

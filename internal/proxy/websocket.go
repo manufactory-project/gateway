@@ -48,13 +48,16 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 	af.setUpstreamConn(upConn)
 	defer closeQuietly(upConn)
 
-	// Rebuild clean HTTP/1.1 WebSocket upgrade request.
+	// Rebuild clean HTTP/1.1 WebSocket upgrade request with no body.
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
 	outReq.Proto = "HTTP/1.1"
 	outReq.ProtoMajor = 1
 	outReq.ProtoMinor = 1
 	outReq.Host = host
+	outReq.Body = http.NoBody
+	outReq.ContentLength = 0
+	outReq.TransferEncoding = nil
 	outReq.Header = outHeaders
 	outReq.Header.Set("Connection", "Upgrade")
 	outReq.Header.Set("Upgrade", "websocket")
