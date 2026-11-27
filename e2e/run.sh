@@ -11,6 +11,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PROJECT=""
 REMOTE=""
+TARGET=""
 IMAGE="images:ubuntu/24.04"
 MGMT_NET="incusbr0"
 STORAGE_POOL="default"
@@ -32,6 +33,7 @@ Required:
 
 Options:
   --remote <name>           Incus remote prefix (empty = local default)
+  --target <member>         Incus cluster member for all bridges and instances (required on clusters)
   --image <image>           Container image (default: images:ubuntu/24.04)
   --mgmt-network <name>     Management/upstream bridge for gw eth0 (default: incusbr0)
   --storage-pool <name>     Storage pool for project default profile (default: default)
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) PROJECT="${2:?missing value for --project}"; shift 2 ;;
     --remote) REMOTE="${2:?missing value for --remote}"; shift 2 ;;
+    --target) TARGET="${2:?missing value for --target}"; shift 2 ;;
     --image) IMAGE="${2:?missing value for --image}"; shift 2 ;;
     --mgmt-network) MGMT_NET="${2:?missing value for --mgmt-network}"; shift 2 ;;
     --storage-pool) STORAGE_POOL="${2:?missing value for --storage-pool}"; shift 2 ;;
@@ -89,6 +92,13 @@ if [[ -n "$REMOTE" ]]; then
   RPREFIX="${REMOTE}:"
 fi
 
+TARGET_ARGS=()
+TARGET_FLAG=""
+if [[ -n "$TARGET" ]]; then
+  TARGET_ARGS=(--target "$TARGET")
+  TARGET_FLAG=" --target ${TARGET}"
+fi
+
 # Derive <=15-char Linux bridge names deterministic per project.
 PROJ_TAG="$(printf '%s' "$PROJECT" | sha256sum | cut -c1-6)"
 NET0="sbx0-${PROJ_TAG}"
@@ -101,20 +111,20 @@ G1_INST="${RPREFIX}guest1"
 # Exact Incus provisioning commands printed before confirmation.
 print_plan() {
   cat <<EOF
-Planned Incus commands (throwaway project '${PROJECT}', remote '${REMOTE:-local}'):
+Planned Incus commands (throwaway project '${PROJECT}', remote '${REMOTE:-local}', target '${TARGET:-none (standalone)}'):
   incus project create ${RPREFIX}${PROJECT} -c features.images=false -c features.profiles=true -c features.networks=false -c features.storage.volumes=false
   incus profile device add ${RPREFIX}default root disk path=/ pool=${STORAGE_POOL} --project ${PROJECT}
-  incus network create ${RPREFIX}${NET0} --type=bridge ipv4.address=none ipv6.address=none
-  incus network create ${RPREFIX}${NET1} --type=bridge ipv4.address=none ipv6.address=none
-  incus init ${IMAGE} ${GW_INST} --project ${PROJECT}
+  incus network create ${RPREFIX}${NET0} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}
+  incus network create ${RPREFIX}${NET1} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}
+  incus init ${IMAGE} ${GW_INST} --project ${PROJECT}${TARGET_FLAG}
   incus config device add ${GW_INST} eth0 nic network=${MGMT_NET} name=eth0 --project ${PROJECT}
   incus config device add ${GW_INST} sbx0 nic network=${NET0} name=sbx0 --project ${PROJECT}
   incus config device add ${GW_INST} sbx1 nic network=${NET1} name=sbx1 --project ${PROJECT}
   incus start ${GW_INST} --project ${PROJECT}
-  incus init ${IMAGE} ${G0_INST} --project ${PROJECT}
+  incus init ${IMAGE} ${G0_INST} --project ${PROJECT}${TARGET_FLAG}
   incus config device add ${G0_INST} eth0 nic network=${NET0} name=eth0 --project ${PROJECT}
   incus start ${G0_INST} --project ${PROJECT}
-  incus init ${IMAGE} ${G1_INST} --project ${PROJECT}
+  incus init ${IMAGE} ${G1_INST} --project ${PROJECT}${TARGET_FLAG}
   incus config device add ${G1_INST} eth0 nic network=${NET1} name=eth0 --project ${PROJECT}
   incus start ${G1_INST} --project ${PROJECT}
 
@@ -129,6 +139,18 @@ EOF
 print_plan
 if [[ "$PLAN_ONLY" -eq 1 ]]; then
   exit 0
+fi
+
+# Refuse to run on an Incus cluster unless --target <member> is explicitly passed.
+CLUSTER_LIST_CMD=(incus cluster list --format csv)
+if [[ -n "$RPREFIX" ]]; then
+  CLUSTER_LIST_CMD=(incus cluster list "$RPREFIX" --format csv)
+fi
+if cluster_members="$("${CLUSTER_LIST_CMD[@]}" 2>/dev/null)" && [[ -n "$cluster_members" ]]; then
+  if [[ -z "$TARGET" ]]; then
+    echo "error: Incus cluster detected; pass --target <member> to pin bridges and instances" >&2
+    exit 1
+  fi
 fi
 
 # Refuse if the project or either bridge network already exists.
@@ -216,22 +238,22 @@ CREATED_PROJECT=1
 
 incus profile device add "${RPREFIX}default" root disk path=/ "pool=${STORAGE_POOL}" --project "$PROJECT"
 
-incus network create "${RPREFIX}${NET0}" --type=bridge ipv4.address=none ipv6.address=none
+incus network create "${RPREFIX}${NET0}" --type=bridge ipv4.address=none ipv6.address=none "${TARGET_ARGS[@]}"
 CREATED_NET0=1
-incus network create "${RPREFIX}${NET1}" --type=bridge ipv4.address=none ipv6.address=none
+incus network create "${RPREFIX}${NET1}" --type=bridge ipv4.address=none ipv6.address=none "${TARGET_ARGS[@]}"
 CREATED_NET1=1
 
-incus init "$IMAGE" "$GW_INST" --project "$PROJECT"
+incus init "$IMAGE" "$GW_INST" --project "$PROJECT" "${TARGET_ARGS[@]}"
 incus config device add "$GW_INST" eth0 nic "network=${MGMT_NET}" name=eth0 --project "$PROJECT"
 incus config device add "$GW_INST" sbx0 nic "network=${NET0}" name=sbx0 --project "$PROJECT"
 incus config device add "$GW_INST" sbx1 nic "network=${NET1}" name=sbx1 --project "$PROJECT"
 incus start "$GW_INST" --project "$PROJECT"
 
-incus init "$IMAGE" "$G0_INST" --project "$PROJECT"
+incus init "$IMAGE" "$G0_INST" --project "$PROJECT" "${TARGET_ARGS[@]}"
 incus config device add "$G0_INST" eth0 nic "network=${NET0}" name=eth0 --project "$PROJECT"
 incus start "$G0_INST" --project "$PROJECT"
 
-incus init "$IMAGE" "$G1_INST" --project "$PROJECT"
+incus init "$IMAGE" "$G1_INST" --project "$PROJECT" "${TARGET_ARGS[@]}"
 incus config device add "$G1_INST" eth0 nic "network=${NET1}" name=eth0 --project "$PROJECT"
 incus start "$G1_INST" --project "$PROJECT"
 
@@ -289,20 +311,69 @@ if [[ -z "$LAN_ADDR" ]]; then
 fi
 echo "    gw mgmt IP: ${GW_MGMT_IP}, LAN test target: ${LAN_ADDR}"
 
+start_gatewayd_service() {
+  if ! gw_exec systemctl start gatewayd.service; then
+    gw_exec bash -ceu '
+      status="$(systemctl show -p ExecMainStatus --value gatewayd.service || true)"
+      result="$(systemctl show -p Result --value gatewayd.service || true)"
+      journal="$(journalctl -u gatewayd.service -n 40 --no-pager || true)"
+      if [[ "$status" == "226" ]] || echo "$journal" | grep -q "226/NAMESPACE"; then
+        echo "FAIL: gatewayd.service failed with status=226/NAMESPACE (result=${result})" >&2
+        echo "--- journalctl -u gatewayd.service ---" >&2
+        echo "$journal" >&2
+        echo "--- systemd-resolved state in gateway container ---" >&2
+        systemctl is-active systemd-resolved 2>&1 || true
+        exit 1
+      fi
+      echo "FAIL: gatewayd.service failed to start (ExecMainStatus=${status}, Result=${result})" >&2
+      echo "$journal" >&2
+      exit 1
+    '
+    exit 1
+  fi
+  sleep 1
+  if ! gw_exec systemctl is-active --quiet gatewayd.service; then
+    gw_exec bash -ceu '
+      status="$(systemctl show -p ExecMainStatus --value gatewayd.service || true)"
+      journal="$(journalctl -u gatewayd.service -n 40 --no-pager || true)"
+      if [[ "$status" == "226" ]] || echo "$journal" | grep -q "226/NAMESPACE"; then
+        echo "FAIL: gatewayd.service exited with status=226/NAMESPACE" >&2
+        echo "--- journalctl -u gatewayd.service ---" >&2
+        echo "$journal" >&2
+        echo "--- systemd-resolved state in gateway container ---" >&2
+        systemctl is-active systemd-resolved 2>&1 || true
+        exit 1
+      fi
+      echo "FAIL: gatewayd.service is not active (ExecMainStatus=${status})" >&2
+      echo "$journal" >&2
+      exit 1
+    '
+    exit 1
+  fi
+}
+
 echo "==> Step 2.1: Fail-closed startup"
 gw_exec bash -ceu '
   nft delete table inet gw 2>/dev/null || true
   rm -f /run/gatewayd/dataplane.ready
 '
-if gw_exec sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/dev/null 2>&1; then
-  echo "FAIL: gatewayd started without table inet gw or ready_file" >&2
-  exit 1
-fi
-echo "    PASS: gatewayd exited non-zero without table inet gw or ready_file"
+gw_exec bash -ceu '
+  set +e
+  timeout 5s sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/tmp/fc.out 2>/tmp/fc.err
+  rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: gatewayd exited 0 without table inet gw or ready_file" >&2
+    exit 1
+  fi
+  if [[ "$rc" -eq 124 ]]; then
+    echo "FAIL: gatewayd stayed running (timeout 5s) without table inet gw or ready_file" >&2
+    exit 1
+  fi
+  echo "    PASS: gatewayd exited non-zero (rc=${rc}) without table inet gw or ready_file: $(head -n 1 /tmp/fc.err)"
+  rm -f /tmp/fc.out /tmp/fc.err
+'
 
-gw_exec systemctl start gatewayd.service
-sleep 1
-gw_exec systemctl is-active --quiet gatewayd.service
+start_gatewayd_service
 
 echo "    Deleting table inet gw while keeping ready_file..."
 gw_exec nft delete table inet gw
@@ -327,7 +398,8 @@ gw_exec bash -ceu '
 '
 
 echo "==> Starting gatewayd.service and gatewayd-dhcp.service"
-gw_exec systemctl start gatewayd.service gatewayd-dhcp.service
+start_gatewayd_service
+gw_exec systemctl start gatewayd-dhcp.service
 sleep 1
 gw_exec systemctl is-active --quiet gatewayd.service
 gw_exec systemctl is-active --quiet gatewayd-dhcp.service
@@ -365,21 +437,38 @@ gw_exec bash -ceu '
 
   ss_out="$(ss -ltnup)"
   echo "$ss_out"
-  if echo "$ss_out" | grep gatewayd | grep -E "(\*|0\.0\.0\.0|\[::\]):"; then
+  gw_socks="$(echo "$ss_out" | grep "\"gatewayd\"" || true)"
+  if [[ -z "$gw_socks" ]]; then
+    echo "FAIL: gatewayd has zero listeners in ss -ltnup" >&2
+    exit 1
+  fi
+  if echo "$gw_socks" | grep -E "(\*|0\.0\.0\.0|\[::\]|::):"; then
     echo "FAIL: gatewayd has a wildcard listener" >&2
     exit 1
   fi
-  if echo "$ss_out" | grep dnsmasq | grep -E ":53\b"; then
+  dm_socks="$(echo "$ss_out" | grep "\"dnsmasq\"" || true)"
+  if [[ -z "$dm_socks" ]]; then
+    echo "FAIL: dnsmasq has zero listeners in ss -ltnup" >&2
+    exit 1
+  fi
+  if echo "$dm_socks" | grep -E ":53\b"; then
     echo "FAIL: dnsmasq is listening on :53" >&2
     exit 1
   fi
-  echo "$ss_out" | grep dnsmasq | grep -qE ":67\b" || { echo "FAIL: dnsmasq not listening on :67" >&2; exit 1; }
+  non_dhcp="$(echo "$dm_socks" | grep -vE "^udp[[:space:]].*:67\b" || true)"
+  if [[ -n "$non_dhcp" ]]; then
+    echo "FAIL: dnsmasq has socket(s) other than UDP :67:" >&2
+    echo "$non_dhcp" >&2
+    exit 1
+  fi
 '
 
 echo "==> Step 2.3: DHCPv4 leases and dnsmasq privilege drop"
 configure_guest_dhcp() {
   local ginst="$1"
-  incus exec "$ginst" --project "$PROJECT" -- bash -ceu '
+  local want_gw="$2"
+  local want_cidr="$3"
+  incus exec "$ginst" --project "$PROJECT" -- bash -ceu "
     cat >/etc/systemd/network/10-eth0.network <<NET
 [Match]
 Name=eth0
@@ -391,21 +480,44 @@ IPv6AcceptRA=no
 NET
     systemctl enable --now systemd-networkd >/dev/null 2>&1 || true
     networkctl reconfigure eth0 >/dev/null 2>&1 || systemctl restart systemd-networkd
-    for _ in $(seq 1 30); do
-      if ip -4 addr show dev eth0 | grep -q "inet 10\.200\.0\."; then
+    got_ip=''
+    for _ in \$(seq 1 30); do
+      got_ip=\"\$(ip -4 -o addr show dev eth0 | awk '{print \$4}' | cut -d/ -f1 | head -n1)\"
+      if [[ -n \"\$got_ip\" ]]; then
         break
       fi
       sleep 1
     done
-    # Ensure /etc/resolv.conf points at the DHCP-provided gateway IP.
-    gw="$(ip -4 route show default dev eth0 | awk "{print \$3}" | head -n1)"
-    [[ -n "$gw" ]] || { echo "FAIL: no default route via DHCP" >&2; exit 1; }
-    printf "nameserver %s\n" "$gw" >/etc/resolv.conf
-  '
+    [[ -n \"\$got_ip\" ]] || { echo 'FAIL: no IPv4 address received via DHCP on ${ginst}' >&2; exit 1; }
+    python3 -c 'import ipaddress,sys; ip=ipaddress.ip_address(sys.argv[1]); net=ipaddress.ip_network(sys.argv[2]); assert ip in net, f\"{ip} not in {net}\"' \"\$got_ip\" '${want_cidr}'
+
+    gw=\"\$(ip -4 route show default dev eth0 | awk '{print \$3}' | head -n1)\"
+    [[ \"\$gw\" == '${want_gw}' ]] || { echo \"FAIL: ${ginst} default route gw=\${gw}, want ${want_gw}\" >&2; exit 1; }
+
+    # Assert DHCP handed out link_IP as DNS BEFORE touching any resolver config.
+    dhcp_dns=''
+    if command -v resolvectl >/dev/null 2>&1; then
+      dhcp_dns=\"\$(resolvectl dns eth0 2>/dev/null || true)\"
+    fi
+    lease_dns=\"\$(grep -h '^DNS=' /run/systemd/netif/leases/* 2>/dev/null || true)\"
+    if ! echo \"\${dhcp_dns} \${lease_dns}\" | grep -qw '${want_gw}'; then
+      echo \"FAIL: ${ginst} DHCP DNS did not hand out ${want_gw} (resolvectl='\${dhcp_dns}', lease='\${lease_dns}')\" >&2
+      exit 1
+    fi
+
+    # Leave systemd-resolved in place if it already forwards eth0 to link_IP.
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null && echo \"\$dhcp_dns\" | grep -qw '${want_gw}'; then
+      echo \"    PASS: ${ginst} systemd-resolved forwards DNS to DHCP server ${want_gw}\"
+    else
+      rm -f /etc/resolv.conf
+      printf 'nameserver %s\n' '${want_gw}' >/etc/resolv.conf
+      echo \"    PASS: ${ginst} wrote static /etc/resolv.conf with DHCP DNS ${want_gw}\"
+    fi
+  "
 }
 
-configure_guest_dhcp "$G0_INST"
-configure_guest_dhcp "$G1_INST"
+configure_guest_dhcp "$G0_INST" "10.200.0.1" "10.200.0.0/28"
+configure_guest_dhcp "$G1_INST" "10.200.0.17" "10.200.0.16/28"
 
 G0_IP="$(g0_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
 G1_IP="$(g1_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
@@ -543,8 +655,8 @@ run_same_ip_step() {
   fi
 
   # Restore DHCP on both guests and refresh guest IPs and :8080 controls.
-  configure_guest_dhcp "$G0_INST"
-  configure_guest_dhcp "$G1_INST"
+  configure_guest_dhcp "$G0_INST" "10.200.0.1" "10.200.0.0/28"
+  configure_guest_dhcp "$G1_INST" "10.200.0.17" "10.200.0.16/28"
   G0_IP="$(g0_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
   G1_IP="$(g1_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
   start_guest_peer_listener "$G0_INST" "$G0_IP"
@@ -600,16 +712,25 @@ restore_dataplane() {
 if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then
   echo "==> Step 2.6 (defect): remove fib daddr type local guard"
   gw_exec bash -ceu '
-    handle="$(nft -a list chain inet gw prerouting_guard | awk "/fib daddr type local drop/{print \$NF; exit}")"
-    [[ -n "$handle" ]] || { echo "failed to find fib daddr type local drop handle" >&2; exit 1; }
-    nft delete rule inet gw prerouting_guard handle "$handle"
+    deleted=0
+    for h in $(nft -a list chain inet gw prerouting_guard | awk "/fib daddr type local drop/{print \$NF}"); do
+      nft delete rule inet gw prerouting_guard handle "$h"
+      deleted=$((deleted + 1))
+    done
+    if [[ "$deleted" -lt 1 ]]; then
+      echo "FAIL: expected to delete >=1 fib daddr type local drop handle, deleted ${deleted}" >&2
+      exit 1
+    fi
+    echo "    deleted ${deleted} fib daddr type local drop handle(s)"
   '
-  if run_probe_guest0 >/dev/null 2>&1; then
+  fib_out="$TMPDIR_WORK/defect-fib.jsonl"
+  if run_probe_guest0 >"$fib_out" 2>&1; then
     restore_dataplane
     echo "FAIL: probe still passed after removing fib daddr type local guard" >&2
     exit 1
   fi
-  echo "    PASS: probe went red without fib daddr type local guard"
+  echo "    PASS: probe went red without fib daddr type local guard:"
+  grep '"pass":false' "$fib_out" || cat "$fib_out"
   restore_dataplane
 fi
 
@@ -641,16 +762,25 @@ fi
 if [[ "$DEFECT_DROP_DNS_DNAT" -eq 1 ]]; then
   echo "==> Step 2.6 (defect): remove :53 DNAT"
   gw_exec bash -ceu '
+    deleted=0
     for h in $(nft -a list chain inet gw prerouting_nat | awk "/dport 53 dnat/{print \$NF}"); do
       nft delete rule inet gw prerouting_nat handle "$h"
+      deleted=$((deleted + 1))
     done
+    if [[ "$deleted" -lt 1 ]]; then
+      echo "FAIL: expected to delete >=1 :53 DNAT handle, deleted ${deleted}" >&2
+      exit 1
+    fi
+    echo "    deleted ${deleted} :53 DNAT handle(s)"
   '
-  if run_probe_guest0 >/dev/null 2>&1; then
+  dns_out="$TMPDIR_WORK/defect-dns.jsonl"
+  if run_probe_guest0 >"$dns_out" 2>&1; then
     restore_dataplane
     echo "FAIL: probe still passed after removing :53 DNAT" >&2
     exit 1
   fi
-  echo "    PASS: probe went red without :53 DNAT"
+  echo "    PASS: probe went red without :53 DNAT:"
+  grep '"pass":false' "$dns_out" || cat "$dns_out"
   restore_dataplane
 fi
 
