@@ -110,7 +110,19 @@ func NewServer(opts Options) (*Server, error) {
 
 	hCfg := opts.Store.Current().Config.HTTP
 	tr := &http.Transport{
-		DialContext: dialFn,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := dialFn(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if af := activeFlowFromContext(ctx); af != nil {
+				af.setUpstreamConn(c)
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+			}
+			return c, nil
+		},
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    opts.UpstreamRoots, // nil uses system roots; never InsecureSkipVerify
@@ -288,9 +300,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
-	s.flows.RevokeWhere(func(info FlowInfo) bool {
-		return info.Link == s.link.Name
-	})
+	s.flows.drainLink(s.link.Name)
 
 	var errs error
 	if s.httpsSrv != nil {
@@ -543,7 +553,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	outURL.Scheme = scheme
 	outURL.Host = net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
 
-	traceCtx := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
+	flowCtx := withActiveFlow(reqCtx, af)
+	traceCtx := httptrace.WithClientTrace(flowCtx, &httptrace.ClientTrace{
 		GotConn: func(ci httptrace.GotConnInfo) {
 			af.setUpstreamConn(ci.Conn)
 		},

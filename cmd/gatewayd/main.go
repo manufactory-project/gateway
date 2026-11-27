@@ -153,6 +153,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		ActiveFlows:  flows.Count,
 		ActiveGrants: func() int { return len(store.ActiveGrants()) },
 	})
+	flows.SetOnRevoke(collector.AddRevocations)
 
 	var auditStdout io.Writer
 	if cfg.Audit.StdoutJSON {
@@ -285,6 +286,16 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		store.WatchSIGHUP(ctx, func(snap *config.Snapshot, _ []string, reloadErr error) {
 			if reloadErr != nil {
 				collector.ObserveReload(false)
+				if aErr := auditWriter.WriteSync(audit.Event{
+					Kind:   audit.KindLifecycle,
+					Reason: "sighup-reload-failed",
+					Error:  reloadErr.Error(),
+				}); aErr != nil {
+					if _, wErr := fmt.Fprintf(stderr, "gatewayd: SIGHUP reload failed (audit error: %v): %v\n", aErr, reloadErr); wErr != nil {
+						return
+					}
+					return
+				}
 				if _, wErr := fmt.Fprintf(stderr, "gatewayd: SIGHUP reload failed (keeping prior config): %v\n", reloadErr); wErr != nil {
 					return
 				}

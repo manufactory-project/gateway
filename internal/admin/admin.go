@@ -201,6 +201,14 @@ func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
 		if s.metrics != nil {
 			s.metrics.ObserveReload(false)
 		}
+		if aErr := s.audit.WriteSync(audit.Event{
+			Kind:   audit.KindLifecycle,
+			Reason: "reload-failed",
+			Error:  err.Error(),
+		}); aErr != nil {
+			writeError(w, http.StatusServiceUnavailable, "audit sink unavailable")
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -253,9 +261,6 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.metrics != nil {
-		s.metrics.AddRevocations(revokedFlows)
-	}
 	if err := s.audit.WriteSync(audit.Event{
 		Kind:      audit.KindRevoke,
 		Principal: req.Principal,
@@ -318,9 +323,6 @@ func (s *Server) handleDeleteGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	existed := s.store.RevokeGrant(id)
 	revokedFlows := s.flows.RevokeByGrant(id)
-	if s.metrics != nil {
-		s.metrics.AddRevocations(revokedFlows)
-	}
 	if err := s.audit.WriteSync(audit.Event{
 		Kind:    audit.KindRevoke,
 		GrantID: id,

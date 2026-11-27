@@ -48,6 +48,11 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 	af.setUpstreamConn(upConn)
 	defer closeQuietly(upConn)
 
+	if r.Context().Err() != nil {
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, r.Context().Err().Error())
+		return
+	}
+
 	// Rebuild clean HTTP/1.1 WebSocket upgrade request with no body.
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
@@ -92,6 +97,11 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 			errText = copyErr.Error()
 		}
 		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, resp.StatusCode, 0, bytesIn, errText)
+		return
+	}
+
+	if r.Context().Err() != nil {
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, r.Context().Err().Error())
 		return
 	}
 

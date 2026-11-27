@@ -72,7 +72,6 @@ func TestProxySecretsIdentityRedactionAndLiveTeardown(t *testing.T) {
 		seenHeadersMu    sync.Mutex
 		lastSeenHeaders  http.Header
 	)
-	t.Cleanup(func() { close(holdRelease) })
 
 	upSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upReceived.Add(1)
@@ -180,10 +179,10 @@ func TestProxySecretsIdentityRedactionAndLiveTeardown(t *testing.T) {
 	}
 	upSrv.StartTLS()
 	t.Cleanup(upSrv.Close)
+	t.Cleanup(func() { close(holdRelease) })
 
-	httpsPort := freePort(t, "127.0.13.1")
-	httpPort := freePort(t, "127.0.13.1")
-	dnsPort := freePort(t, "127.0.13.1")
+	ports := freePorts(t, "127.0.13.1", 3)
+	httpsPort, httpPort, dnsPort := ports[0], ports[1], ports[2]
 
 	baseYAML := fmt.Sprintf(`
 ca:

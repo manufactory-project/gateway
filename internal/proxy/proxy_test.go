@@ -49,17 +49,29 @@ func tcpPort(t *testing.T, addr net.Addr) uint16 {
 	return uint16(ta.Port)
 }
 
-func freePort(t *testing.T, ip string) uint16 {
+func freePorts(t *testing.T, ip string, n int) []uint16 {
 	t.Helper()
-	ln, err := net.Listen("tcp4", ip+":0")
-	if err != nil {
-		t.Fatalf("freePort %s: %v", ip, err)
+	lns := make([]net.Listener, 0, n)
+	ports := make([]uint16, 0, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp4", ip+":0")
+		if err != nil {
+			for _, prev := range lns {
+				if cErr := prev.Close(); cErr != nil {
+					t.Errorf("close prev listener: %v", cErr)
+				}
+			}
+			t.Fatalf("freePorts %s[%d]: %v", ip, i, err)
+		}
+		lns = append(lns, ln)
+		ports = append(ports, tcpPort(t, ln.Addr()))
 	}
-	port := tcpPort(t, ln.Addr())
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close freePort: %v", err)
+	for _, ln := range lns {
+		if err := ln.Close(); err != nil {
+			t.Fatalf("close freePorts listener: %v", err)
+		}
 	}
-	return port
+	return ports
 }
 
 func randHex(t *testing.T) string {
@@ -250,9 +262,8 @@ func TestProxyMITMHardeningH2SSEWSAndFalsePositives(t *testing.T) {
 	t.Cleanup(plainSrv.Close)
 
 	// 3. Configure and start proxy.Server on explicit 127.0.12.1 ports.
-	httpsPort := freePort(t, "127.0.12.1")
-	httpPort := freePort(t, "127.0.12.1")
-	dnsPort := freePort(t, "127.0.12.1")
+	ports := freePorts(t, "127.0.12.1", 3)
+	httpsPort, httpPort, dnsPort := ports[0], ports[1], ports[2]
 
 	cfgYAML := fmt.Sprintf(`
 ca:

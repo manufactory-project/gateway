@@ -129,6 +129,7 @@ rules:
 		ActiveFlows:  flows.Count,
 		ActiveGrants: func() int { return len(store.ActiveGrants()) },
 	})
+	flows.SetOnRevoke(col.AddRevocations)
 	srv, err := admin.NewServer(admin.Options{
 		SocketPath: sockPath,
 		Store:      store,
@@ -363,6 +364,7 @@ rules:
 		ActiveFlows:  flows.Count,
 		ActiveGrants: func() int { return len(store.ActiveGrants()) },
 	})
+	flows.SetOnRevoke(col.AddRevocations)
 	aw, err := audit.NewWriter(audit.Options{
 		Dir:          auditDir,
 		OnWriteError: col.IncAuditWriteError,

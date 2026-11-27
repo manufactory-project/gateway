@@ -274,3 +274,100 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 		t.Fatalf("expired callback id = %q, want %q", expiredID, g2.ID)
 	}
 }
+
+func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	if err := os.WriteFile(cfgPath, []byte(validYAML), 0o600); err != nil {
+		t.Fatalf("write validYAML: %v", err)
+	}
+
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	store, err := config.NewStoreWithClock(cfgPath, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("NewStoreWithClock: %v", err)
+	}
+	origHash := store.Current().Hash
+
+	// Item 9: Every restart-only section change must be refused and keep the old snapshot + grants.
+	gKeep, err := store.AddGrant("worker-claude", "keep.example.com", 443, nil, nil, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("AddGrant: %v", err)
+	}
+
+	immutableChanges := []struct {
+		name string
+		yaml string
+	}{
+		{"ca", strings.Replace(validYAML, "/etc/gatewayd/ca/ca.crt", "/etc/gatewayd/ca/new.crt", 1)},
+		{"audit", strings.Replace(validYAML, "/var/log/gatewayd/audit", "/var/log/gatewayd/audit2", 1)},
+		{"admin", validYAML + "\nadmin:\n  socket: /run/gatewayd/other.sock\n"},
+		{"metrics", strings.Replace(validYAML, "127.0.0.1:9102", "127.0.0.1:9103", 1)},
+		{"fake_cidr", validYAML + "\ndns:\n  fake_cidr: 198.19.0.0/16\n"},
+		{"links_gateway_ip", strings.Replace(validYAML, "gateway_ip: 10.200.0.1", "gateway_ip: 10.200.0.2", 1)},
+		{"principals", strings.ReplaceAll(validYAML, "worker-codex", "worker-renamed")},
+	}
+	for _, tc := range immutableChanges {
+		t.Run("refuse_"+tc.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatalf("write %s yaml: %v", tc.name, err)
+			}
+			if _, _, err := store.Reload(); err == nil {
+				t.Fatalf("expected Reload to refuse %s change", tc.name)
+			}
+			if store.Current().Hash != origHash {
+				t.Fatalf("refused %s reload mutated snapshot hash", tc.name)
+			}
+			grants := store.ActiveGrants()
+			if len(grants) != 1 || grants[0].ID != gKeep.ID {
+				t.Fatalf("refused %s reload altered grants: %+v", tc.name, grants)
+			}
+		})
+	}
+
+	// Positive control: hot-reloading rules/records succeeds and wipes grants.
+	ruleUpdated := strings.Replace(validYAML, "deb.debian.org", "security.debian.org", 1)
+	if err := os.WriteFile(cfgPath, []byte(ruleUpdated), 0o600); err != nil {
+		t.Fatalf("write ruleUpdated: %v", err)
+	}
+	if _, wiped, err := store.Reload(); err != nil || len(wiped) != 1 {
+		t.Fatalf("rule reload = (wiped=%v, err=%v), want 1 wiped grant and nil err", wiped, err)
+	}
+
+	// Item 11: Multiple SetOnGrantExpired callbacks must ALL fire on expiry.
+	var cb1, cb2 string
+	store.SetOnGrantExpired(func(id string) { cb1 = id })
+	store.SetOnGrantExpired(func(id string) { cb2 = id })
+	gExp, err := store.AddGrant("worker-claude", "exp.example.com", 443, nil, nil, time.Minute)
+	if err != nil {
+		t.Fatalf("AddGrant exp: %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+	store.PruneExpiredGrants()
+	if cb1 != gExp.ID || cb2 != gExp.ID {
+		t.Fatalf("expected both expiry callbacks to fire with %s, got cb1=%q cb2=%q", gExp.ID, cb1, cb2)
+	}
+
+	// Item 10: Concurrent AddGrant vs Reload must be race-free and never leave stale grants after a final Reload.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 40; i++ {
+			if _, gErr := store.AddGrant("worker-claude", "race.example.com", 443, nil, nil, time.Minute); gErr != nil {
+				continue
+			}
+		}
+	}()
+	for i := 0; i < 15; i++ {
+		if _, _, rErr := store.Reload(); rErr != nil {
+			t.Fatalf("concurrent Reload %d: %v", i, rErr)
+		}
+	}
+	<-done
+	if _, _, err := store.Reload(); err != nil {
+		t.Fatalf("final Reload: %v", err)
+	}
+	if rem := store.ActiveGrants(); len(rem) != 0 {
+		t.Fatalf("grants survived final Reload: %+v", rem)
+	}
+}

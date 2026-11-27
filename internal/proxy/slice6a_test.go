@@ -101,9 +101,8 @@ func TestSlice6ARequestGuards(t *testing.T) {
 	upSrv.StartTLS()
 	t.Cleanup(upSrv.Close)
 
-	httpsPort := freePort(t, "127.0.31.1")
-	httpPort := freePort(t, "127.0.31.1")
-	dnsPort := freePort(t, "127.0.31.1")
+	ports := freePorts(t, "127.0.31.1", 3)
+	httpsPort, httpPort, dnsPort := ports[0], ports[1], ports[2]
 
 	cfgYAML := fmt.Sprintf(`
 ca:

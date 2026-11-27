@@ -7,7 +7,6 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -30,37 +29,55 @@ type activeFlow struct {
 	info      FlowInfo
 	cancel    context.CancelFunc
 	guestConn net.Conn
-	upConn    atomic.Pointer[net.Conn]
-	closeOnce sync.Once
+
+	mu       sync.Mutex
+	upConn   net.Conn
+	tornDown bool
 }
 
+// setUpstreamConn attaches c to the flow, or closes c immediately if teardown already ran.
 func (f *activeFlow) setUpstreamConn(c net.Conn) {
 	if c == nil {
 		return
 	}
-	f.upConn.Store(&c)
+	f.mu.Lock()
+	if f.tornDown {
+		f.mu.Unlock()
+		closeQuietly(c)
+		return
+	}
+	f.upConn = c
+	f.mu.Unlock()
 }
 
 // teardown immediately invokes BOTH reqCancel() and conn.Close() on guest and upstream sockets (NOW.md:64).
 func (f *activeFlow) teardown() {
-	f.closeOnce.Do(func() {
-		if f.cancel != nil {
-			f.cancel()
-		}
-		if f.guestConn != nil {
-			closeQuietly(f.guestConn)
-		}
-		if up := f.upConn.Load(); up != nil && *up != nil {
-			closeQuietly(*up)
-		}
-	})
+	f.mu.Lock()
+	if f.tornDown {
+		f.mu.Unlock()
+		return
+	}
+	f.tornDown = true
+	up := f.upConn
+	f.mu.Unlock()
+
+	if f.cancel != nil {
+		f.cancel()
+	}
+	if f.guestConn != nil {
+		closeQuietly(f.guestConn)
+	}
+	if up != nil {
+		closeQuietly(up)
+	}
 }
 
 // FlowRegistry tracks every active per-request/per-stream flow independently so
 // HTTP/1.1 keep-alive and HTTP/2 multiplexing never overwrite grantID/ruleID per conn.
 type FlowRegistry struct {
-	mu    sync.RWMutex
-	flows map[string]*activeFlow
+	mu       sync.RWMutex
+	flows    map[string]*activeFlow
+	onRevoke func(int)
 }
 
 // NewFlowRegistry constructs an empty FlowRegistry.
@@ -68,6 +85,14 @@ func NewFlowRegistry() *FlowRegistry {
 	return &FlowRegistry{
 		flows: make(map[string]*activeFlow),
 	}
+}
+
+// SetOnRevoke registers an observer called with the number of flows torn down
+// by any revocation, grant expiry, or config reload.
+func (r *FlowRegistry) SetOnRevoke(fn func(int)) {
+	r.mu.Lock()
+	r.onRevoke = fn
+	r.mu.Unlock()
 }
 
 func (r *FlowRegistry) register(info FlowInfo, cancel context.CancelFunc, guestConn net.Conn) *activeFlow {
@@ -143,8 +168,28 @@ func (r *FlowRegistry) RevokeByPrincipal(principal, host string) int {
 	})
 }
 
-// RevokeWhere tears down every active flow matching pred and returns the terminated FlowInfos.
+// RevokeWhere tears down every active flow matching pred, fires onRevoke, and returns the terminated FlowInfos.
 func (r *FlowRegistry) RevokeWhere(pred func(FlowInfo) bool) []FlowInfo {
+	revoked := r.teardownWhere(pred)
+	if len(revoked) > 0 {
+		r.mu.RLock()
+		cb := r.onRevoke
+		r.mu.RUnlock()
+		if cb != nil {
+			cb(len(revoked))
+		}
+	}
+	return revoked
+}
+
+// drainLink tears down remaining flows on shutdown without incrementing revocation metrics.
+func (r *FlowRegistry) drainLink(linkName string) {
+	r.teardownWhere(func(info FlowInfo) bool {
+		return info.Link == linkName
+	})
+}
+
+func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool) []FlowInfo {
 	r.mu.Lock()
 	var targets []*activeFlow
 	for id, af := range r.flows {
@@ -183,4 +228,18 @@ func guestConnFromContext(ctx context.Context) net.Conn {
 		return nil
 	}
 	return c
+}
+
+type activeFlowCtxKey struct{}
+
+func withActiveFlow(ctx context.Context, af *activeFlow) context.Context {
+	return context.WithValue(ctx, activeFlowCtxKey{}, af)
+}
+
+func activeFlowFromContext(ctx context.Context) *activeFlow {
+	af, ok := ctx.Value(activeFlowCtxKey{}).(*activeFlow)
+	if !ok {
+		return nil
+	}
+	return af
 }

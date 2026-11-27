@@ -45,9 +45,10 @@ type Store struct {
 	snap atomic.Pointer[Snapshot]
 
 	mu        sync.RWMutex
+	gen       uint64
 	grants    map[string]Grant
 	onReload  []func(prev, next *Snapshot, wipedGrantIDs []string)
-	onExpired func(grantID string)
+	onExpired []func(grantID string)
 }
 
 // NewStore loads path once and returns a Store holding the initial snapshot.
@@ -89,17 +90,22 @@ func (s *Store) OnReload(fn func(prev, next *Snapshot, wipedGrantIDs []string)) 
 	s.onReload = append(s.onReload, fn)
 }
 
-// SetOnGrantExpired sets a callback invoked when a grant is pruned on TTL expiry.
+// SetOnGrantExpired registers a callback invoked when a grant is pruned on TTL expiry.
+// Multiple callbacks may be registered (e.g. one per link server).
 func (s *Store) SetOnGrantExpired(fn func(grantID string)) {
+	if fn == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.onExpired = fn
+	s.onExpired = append(s.onExpired, fn)
 }
 
-// Reload re-reads and validates the YAML file from disk. If validation fails,
-// the previous snapshot and grants remain intact and an error is returned.
-// On success, the snapshot is atomically replaced and all in-memory TTL grants
-// are wiped before reload callbacks run.
+// Reload re-reads and validates the YAML file from disk. If validation fails or
+// any restart-only section changed (links, principals, fake_cidr, ca, audit,
+// admin, metrics), the previous snapshot and grants remain intact and an error
+// is returned. On success, the snapshot is atomically replaced and all in-memory
+// TTL grants are wiped before reload callbacks run.
 func (s *Store) Reload() (*Snapshot, []string, error) {
 	cfg, hash, err := LoadFile(s.path)
 	if err != nil {
@@ -112,7 +118,15 @@ func (s *Store) Reload() (*Snapshot, []string, error) {
 	}
 
 	s.mu.Lock()
+	cur := s.snap.Load()
+	if cur != nil && cur.Config != nil {
+		if diffErr := checkReloadImmutable(cur.Config, cfg); diffErr != nil {
+			s.mu.Unlock()
+			return nil, nil, diffErr
+		}
+	}
 	prev := s.snap.Swap(next)
+	s.gen++
 	wiped := make([]string, 0, len(s.grants))
 	for id := range s.grants {
 		wiped = append(wiped, id)
@@ -125,6 +139,28 @@ func (s *Store) Reload() (*Snapshot, []string, error) {
 		fn(prev, next, wiped)
 	}
 	return next, wiped, nil
+}
+
+func checkReloadImmutable(prev, next *Config) error {
+	if prev.CA != next.CA {
+		return errors.New("reload refused: ca configuration changed (restart required)")
+	}
+	if prev.Audit != next.Audit {
+		return errors.New("reload refused: audit configuration changed (restart required)")
+	}
+	if prev.Admin != next.Admin {
+		return errors.New("reload refused: admin configuration changed (restart required)")
+	}
+	if prev.Metrics != next.Metrics {
+		return errors.New("reload refused: metrics configuration changed (restart required)")
+	}
+	if prev.FakePrefix != next.FakePrefix {
+		return errors.New("reload refused: dns.fake_cidr changed (restart required)")
+	}
+	if !slices.Equal(prev.Links, next.Links) {
+		return errors.New("reload refused: links or principals changed (restart required)")
+	}
+	return nil
 }
 
 // WatchSIGHUP listens for syscall.SIGHUP until ctx is cancelled, calling Reload
@@ -165,18 +201,6 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 		return Grant{}, fmt.Errorf("grant: host: %w", err)
 	}
 
-	snap := s.Current()
-	principalKnown := false
-	for _, l := range snap.Config.Links {
-		if l.Principal == principal {
-			principalKnown = true
-			break
-		}
-	}
-	if !principalKnown {
-		return Grant{}, fmt.Errorf("grant: principal %q does not match any declared link", principal)
-	}
-
 	normMethods := make([]string, len(methods))
 	for i, m := range methods {
 		if !isValidHTTPMethod(m) {
@@ -192,9 +216,31 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 		normPaths[i] = p
 	}
 
+	s.mu.RLock()
+	startGen := s.gen
+	s.mu.RUnlock()
+
 	id, err := randomGrantID()
 	if err != nil {
 		return Grant{}, fmt.Errorf("grant: generate id: %w", err)
+	}
+
+	s.mu.Lock()
+	if s.gen != startGen {
+		s.mu.Unlock()
+		return Grant{}, errors.New("grant: concurrent reload wiped grants; retry")
+	}
+	snap := s.snap.Load()
+	principalKnown := false
+	for _, l := range snap.Config.Links {
+		if l.Principal == principal {
+			principalKnown = true
+			break
+		}
+	}
+	if !principalKnown {
+		s.mu.Unlock()
+		return Grant{}, fmt.Errorf("grant: principal %q does not match any declared link", principal)
 	}
 	now := s.now().UTC()
 	g := Grant{
@@ -207,8 +253,6 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 		CreatedAt: now,
 		ExpiresAt: now.Add(ttl),
 	}
-
-	s.mu.Lock()
 	s.grants[g.ID] = g
 	s.mu.Unlock()
 	return g, nil
@@ -225,7 +269,7 @@ func (s *Store) RevokeGrant(id string) bool {
 	return true
 }
 
-// ActiveGrants returns all non-expired grants (pruning expired ones and firing onExpired).
+// ActiveGrants returns all non-expired grants (pruning expired ones and firing onExpired callbacks).
 func (s *Store) ActiveGrants() []Grant {
 	now := s.now().UTC()
 	s.mu.Lock()
@@ -239,11 +283,11 @@ func (s *Store) ActiveGrants() []Grant {
 		}
 		out = append(out, g)
 	}
-	cb := s.onExpired
+	cbs := slices.Clone(s.onExpired)
 	s.mu.Unlock()
 
-	if cb != nil {
-		for _, id := range expired {
+	for _, id := range expired {
+		for _, cb := range cbs {
 			cb(id)
 		}
 	}
@@ -261,11 +305,11 @@ func (s *Store) PruneExpiredGrants() []string {
 			expired = append(expired, id)
 		}
 	}
-	cb := s.onExpired
+	cbs := slices.Clone(s.onExpired)
 	s.mu.Unlock()
 
-	if cb != nil {
-		for _, id := range expired {
+	for _, id := range expired {
+		for _, cb := range cbs {
 			cb(id)
 		}
 	}
