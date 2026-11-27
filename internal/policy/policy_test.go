@@ -243,3 +243,22 @@ func TestGrantIsolationBetweenPrincipals(t *testing.T) {
 		t.Fatalf("worker-b must not be admitted at request scope by worker-a grant: %+v", d)
 	}
 }
+
+func TestWebSocketDeniedOnBoundHostPolicyDefenseInDepth(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	st := makeStore(t, policyYAML, func() time.Time { return now })
+	// Mutate loaded config in-memory to exercise policy.Evaluator's !hasBindings defense-in-depth.
+	for i := range st.Current().Config.Rules {
+		if st.Current().Config.Rules[i].ID == "allow-bound" {
+			st.Current().Config.Rules[i].AllowWebSocket = true
+		}
+	}
+	ev := policy.NewEvaluator(st)
+
+	if d := ev.DecideHost("worker-a", "code.lan.example", 443); !d.Allow || !d.HasBindings || d.AllowWebSocket {
+		t.Fatalf("DecideHost must set AllowWebSocket=false when HasBindings=true, got %+v", d)
+	}
+	if d := ev.DecideRequest("worker-a", "code.lan.example", 443, "GET", "/ws"); !d.Allow || !d.HasBindings || d.AllowWebSocket {
+		t.Fatalf("DecideRequest must set AllowWebSocket=false when HasBindings=true, got %+v", d)
+	}
+}

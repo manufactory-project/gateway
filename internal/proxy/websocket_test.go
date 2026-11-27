@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -341,5 +343,107 @@ func TestWebSocketGuestDisconnectDuringHandshakeClosesUpstreamAndUnregistersFlow
 	}
 	if cnt := gw.Flows.Count(); cnt != 0 {
 		t.Fatalf("flow remained in registry after guest disconnect during WS handshake: count=%d", cnt)
+	}
+}
+
+func TestWebSocketUpgradeRefusedOnBoundHostAndSweepsHeaders(t *testing.T) {
+	secFile := writeSecretFile(t, t.TempDir(), "ws.sec", "ws_secret_val\n")
+	var (
+		boundHits atomic.Int32
+		hdrMu     sync.Mutex
+		seenHdr   http.Header
+	)
+
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"bound-ws.example.com", "ws-sweep.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Host == "bound-ws.example.com" {
+				boundHits.Add(1)
+			}
+			hdrMu.Lock()
+			seenHdr = r.Header.Clone()
+			hdrMu.Unlock()
+			wsEchoHandler(w, r)
+		}),
+		RulesYAML: fmt.Sprintf(`
+  - id: allow-bound-host
+    principal: worker-test
+    effect: allow
+    hosts: [bound-ws.example.com]
+    ports: [443]
+    bindings:
+      - name: bound-tok
+        host: bound-ws.example.com
+        header: Authorization
+        scheme: bearer
+        placeholder: mf_ph_bound_ws
+        secret_file: %s
+  - id: allow-ws-sweep
+    principal: worker-test
+    effect: allow
+    hosts: [ws-sweep.example.com]
+    ports: [443]
+    allow_websocket: true
+`, secFile),
+	})
+
+	// 1. WebSocket upgrade on a bound host must be refused with 403 and never reach upstream.
+	connBound := gw.DialTLS(t, "bound-ws.example.com")
+	if _, err := io.WriteString(connBound, "GET /ws HTTP/1.1\r\nHost: bound-ws.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"); err != nil {
+		t.Fatalf("write bound WS upgrade: %v", err)
+	}
+	respBound, err := http.ReadResponse(bufio.NewReader(connBound), nil)
+	if err != nil {
+		t.Fatalf("read bound WS resp: %v", err)
+	}
+	if err := respBound.Body.Close(); err != nil {
+		t.Fatalf("close bound WS resp: %v", err)
+	}
+	if err := connBound.Close(); err != nil {
+		t.Fatalf("close connBound: %v", err)
+	}
+	if respBound.StatusCode != http.StatusForbidden {
+		t.Fatalf("bound host WS upgrade status = %d, want 403", respBound.StatusCode)
+	}
+	if boundHits.Load() != 0 {
+		t.Fatalf("bound host WS upgrade reached upstream: hits=%d", boundHits.Load())
+	}
+
+	// 2. Allowed WebSocket upgrade must strip Proxy-Authorization and all mf_ph_* placeholders.
+	connWS := gw.DialTLS(t, "ws-sweep.example.com")
+	basicPh := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:mf_ph_wsbasic"))
+	upgradeReq := "GET /ws HTTP/1.1\r\n" +
+		"Host: ws-sweep.example.com\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Proxy-Authorization: Bearer proxy_secret\r\n" +
+		"X-Leak: mf_ph_wsleak\r\n" +
+		"Authorization: " + basicPh + "\r\n\r\n"
+	if _, err := io.WriteString(connWS, upgradeReq); err != nil {
+		t.Fatalf("write sweep WS upgrade: %v", err)
+	}
+	respWS, err := http.ReadResponse(bufio.NewReader(connWS), nil)
+	if err != nil {
+		t.Fatalf("read sweep WS resp: %v", err)
+	}
+	if err := connWS.Close(); err != nil {
+		t.Fatalf("close connWS: %v", err)
+	}
+	if respWS.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("ws-sweep status = %d, want 101", respWS.StatusCode)
+	}
+	hdrMu.Lock()
+	h := seenHdr.Clone()
+	hdrMu.Unlock()
+	if h.Get("Proxy-Authorization") != "" {
+		t.Fatalf("Proxy-Authorization leaked on WebSocket upgrade: %q", h.Get("Proxy-Authorization"))
+	}
+	if h.Get("X-Leak") != "" {
+		t.Fatalf("mf_ph_* header leaked on WebSocket upgrade: %q", h.Get("X-Leak"))
+	}
+	if h.Get("Authorization") != "" {
+		t.Fatalf("Basic mf_ph_* Authorization leaked on WebSocket upgrade: %q", h.Get("Authorization"))
 	}
 }
