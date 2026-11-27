@@ -1,5 +1,5 @@
 // Package metrics exposes gatewayd's Prometheus /metrics endpoint on an explicit
-// non-wildcard IP:port listener (NOW.md:38, 66).
+// non-wildcard IP:port listener.
 package metrics
 
 import (

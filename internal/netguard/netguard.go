@@ -1,5 +1,5 @@
-// Package netguard enforces connect-time SSRF protection in net.Dialer.Control
-// (NOW.md:42-46): full IPv4 special/private deny list, IPv6 global unicast 2000::/3
+// Package netguard enforces connect-time SSRF protection in net.Dialer.Control:
+// full IPv4 special/private deny list, IPv6 global unicast 2000::/3
 // allowlist minus special ranges, Unmap() before prefix checks, dial-by-name only,
 // and private-IP exceptions strictly via static records (host -> exact IP).
 package netguard
@@ -23,7 +23,7 @@ var ErrBlockedAddress = errors.New("netguard: destination address blocked by SSR
 // ErrIPLiteralHost indicates that a caller attempted to dial an IP literal instead of a hostname.
 var ErrIPLiteralHost = errors.New("netguard: dial-by-name requires a hostname, not an IP literal")
 
-// IPv4 deny list per NOW.md:44 (IANA checked 2026-11-26).
+// IPv4 special-purpose and private ranges denied by default (IANA special-purpose registry).
 var ipv4DenyPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("10.0.0.0/8"),
@@ -42,7 +42,7 @@ var ipv4DenyPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("240.0.0.0/4"),
 }
 
-// IPv6 allowlist per NOW.md:45: only 2000::/3 minus these special ranges.
+// IPv6 allowlist: only global unicast 2000::/3 minus these special ranges.
 var (
 	ipv6GlobalUnicast = netip.MustParsePrefix("2000::/3")
 	ipv6SpecialDeny   = []netip.Prefix{

@@ -302,7 +302,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	}
 	origHash := store.Current().Hash
 
-	// Item 9: Every restart-only section change must be refused and keep the old snapshot + grants.
+	// Every restart-only section change must be refused and keep the old snapshot + grants.
 	gKeep, err := store.AddGrant("worker-claude", "keep.example.com", 443, nil, nil, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("AddGrant: %v", err)
@@ -351,7 +351,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		t.Fatalf("rule reload = (wiped=%v, err=%v), want 1 wiped grant and nil err", wiped, err)
 	}
 
-	// Item 11: Multiple SetOnGrantExpired callbacks (e.g. across links) must ALL fire on expiry via a single RunGrantPruner loop.
+	// Multiple SetOnGrantExpired callbacks (e.g. across links) must ALL fire on expiry via a single RunGrantPruner loop.
 	cb1Ch := make(chan string, 2)
 	cb2Ch := make(chan string, 2)
 	store.SetOnGrantExpired(func(id string) { cb1Ch <- id })
@@ -394,7 +394,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	pruneCancel()
 	<-pruneDone
 
-	// Item 10: Concurrent AddGrant vs Reload must be race-free and never leave stale grants after a final Reload.
+	// Concurrent AddGrant vs Reload must be race-free and never leave stale grants after a final Reload.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

@@ -200,7 +200,7 @@ rules:
 		}
 	}
 
-	// Containment (Item 4): len(Question) != 1 (0 and 2 questions) -> REFUSED and audited;
+	// Containment: len(Question) != 1 (0 and 2 questions) -> REFUSED and audited;
 	// non-QUERY Opcode -> NOTIMP and audited; non-IN Class (CHAOS) -> REFUSED and audited.
 	rawClient := &mdns.Client{Net: "udp", Timeout: 2 * time.Second}
 

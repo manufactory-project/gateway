@@ -39,6 +39,15 @@ tasks:
           echo "lint: cmd/gwctl must not depend on proxy, secret, policy, or netguard" >&2
           exit 1
         fi
+      - |
+        set -eu
+        if find . -path './.git' -prune -o -name '*.go' -exec grep -Hn 'NOW\.md:' {} + | grep .; then
+          echo "lint: NOW.md: reference is forbidden in .go files" >&2
+          exit 1
+        fi
+      - |
+        set -eu
+        go mod tidy -diff
 
   test:
     desc: Run Go tests with race detector (goleak enforced in tests)

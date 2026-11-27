@@ -1,6 +1,6 @@
 // Package secret implements gatewayd's file-only secret placeholder substitution,
-// unconditional post-substitution placeholder stripping (fixing agent-sandbox
-// secrets.go:46), and streaming sliding-window identity response redaction (NOW.md:58-61).
+// unconditional post-substitution placeholder stripping, and streaming
+// sliding-window identity response redaction.
 package secret
 
 import (
@@ -79,7 +79,7 @@ type Pair struct {
 // ApplyRequest performs substitution-only secret injection for matched bindings on
 // HTTPS (:443) ONLY, then unconditionally sweeps Proxy-Authorization and any
 // remaining mf_ph_* placeholders (literal or inside decoded Basic Auth) from EVERY
-// header on EVERY request — including bound hosts and cleartext port 80 (NOW.md:60).
+// header on EVERY request — including bound hosts and cleartext port 80.
 func ApplyRequest(hdr http.Header, bindings []config.BindingConfig, dstPort uint16, resolver Resolver) ([]string, []Pair, error) {
 	if resolver == nil {
 		resolver = FileResolver{}

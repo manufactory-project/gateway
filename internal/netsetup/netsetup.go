@@ -100,7 +100,7 @@ func RenderNftables(cfg *config.Config) (string, error) {
 	for _, l := range links {
 		qIf := strconv.Quote(l.Interface)
 		gw := l.ParsedGatewayIP.String()
-		// Redirect ALL guest :53 to any destination to gatewayd's DNS (NOW.md:39).
+		// Redirect ALL guest :53 to any destination to gatewayd's DNS.
 		writeLine(&b, "        iifname ", qIf, " udp dport 53 dnat ip to ", gw, ":", strconv.Itoa(int(l.DNSPort)))
 		writeLine(&b, "        iifname ", qIf, " tcp dport 53 dnat ip to ", gw, ":", strconv.Itoa(int(l.DNSPort)))
 		writeLine(&b, "        iifname ", qIf, " tcp dport 443 dnat ip to ", gw, ":", strconv.Itoa(int(l.HTTPSPort)))

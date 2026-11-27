@@ -1,4 +1,4 @@
-// Package dns implements gatewayd's built-in fake-IPv4 DNS server (NOW.md:41).
+// Package dns implements gatewayd's built-in fake-IPv4 DNS server.
 // No guest query is ever forwarded upstream: allowlisted names receive a synthetic
 // A record from dns.fake_cidr and empty NOERROR (NODATA) for AAAA/HTTPS/SVCB;
 // all other record types and all non-allowlisted names receive REFUSED.

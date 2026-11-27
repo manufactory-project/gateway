@@ -180,9 +180,9 @@ func TestStreamingRedactorAcrossChunkBoundariesAndEncodings(t *testing.T) {
 	}
 }
 
-// TestStreamingRedactorPrefixSecretAcrossChunkBoundary covers Item 15:
-// a shorter secret that is a prefix of a longer secret on the same host must NOT
-// match prematurely at a chunk boundary and leak the longer secret's suffix.
+// TestStreamingRedactorPrefixSecretAcrossChunkBoundary verifies that a shorter secret
+// that is a prefix of a longer secret on the same host does not match prematurely
+// at a chunk boundary and leak the longer secret's suffix.
 func TestStreamingRedactorPrefixSecretAcrossChunkBoundary(t *testing.T) {
 	shortSec := "tok_prefix_1234"
 	longSec := shortSec + "_SECRET_SUFFIX_9999"

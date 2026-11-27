@@ -1,6 +1,6 @@
 // Package proxy implements gatewayd's per-(link, dstPort) TLS MITM and HTTP/1.1,
 // HTTP/2, SSE, and opted-in WebSocket egress proxy with secret substitution,
-// identity response redaction, and live open-flow teardown (NOW.md:47-64).
+// identity response redaction, and live open-flow teardown.
 package proxy
 
 import (

@@ -250,9 +250,9 @@ rules:
 	}
 }
 
-// TestStressReloadRevokeH1H2SSEAndSlowlorisBounds is the NOW.md:105 concurrency & leak gate:
-// hammers SIGHUP + Admin Reload + Admin Revoke + Grant Delete while H1 keep-alive,
-// H2 multiplexed, and SSE streams are mid-flight, plus header-flood/slowloris bounds.
+// TestStressReloadRevokeH1H2SSEAndSlowlorisBounds hammers SIGHUP + Admin Reload +
+// Admin Revoke + Grant Delete while H1 keep-alive, H2 multiplexed, and SSE streams
+// are mid-flight, plus header-flood/slowloris bounds.
 func TestStressReloadRevokeH1H2SSEAndSlowlorisBounds(t *testing.T) {
 	dir := t.TempDir()
 	auditDir := filepath.Join(dir, "audit")

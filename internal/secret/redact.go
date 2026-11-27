@@ -17,7 +17,7 @@ type needle struct {
 
 // Redactor rewrites literal, URL-encoded, and JSON-escaped occurrences of bound
 // secrets back to their inert placeholders across headers, streaming bodies,
-// and trailers (NOW.md:61).
+// and trailers.
 type Redactor struct {
 	needles []needle
 	maxLen  int

@@ -51,7 +51,8 @@ func (f *activeFlow) setUpstreamConn(c net.Conn) {
 	f.mu.Unlock()
 }
 
-// teardown immediately invokes BOTH reqCancel() and conn.Close() on guest and upstream sockets (NOW.md:64).
+// teardown immediately cancels the request context, closes the guest connection,
+// and closes any gatewayd-owned WebSocket upstream socket.
 func (f *activeFlow) teardown() {
 	f.mu.Lock()
 	if f.tornDown {
