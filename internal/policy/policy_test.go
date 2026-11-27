@@ -262,3 +262,60 @@ func TestWebSocketDeniedOnBoundHostPolicyDefenseInDepth(t *testing.T) {
 		t.Fatalf("DecideRequest must set AllowWebSocket=false when HasBindings=true, got %+v", d)
 	}
 }
+
+func TestPathScopedAllowOverridesHostDenyAndDecideDNSPreservesRuleDeny(t *testing.T) {
+	yamlCfg := `
+ca:
+  cert_path: /tmp/ca.crt
+  key_path: /tmp/ca.key
+audit:
+  dir: /tmp/audit
+links:
+  - name: sbx0
+    principal: worker-a
+    subnet: 127.0.10.0/28
+    gateway_ip: 127.0.10.1
+rules:
+  - id: deny-example
+    principal: worker-a
+    effect: deny
+    hosts: ["example.com"]
+    ports: [443]
+  - id: allow-example-ok
+    principal: worker-a
+    effect: allow
+    hosts: ["example.com"]
+    ports: [443]
+    paths: ["/ok"]
+  - id: deny-blocked
+    principal: worker-a
+    effect: deny
+    hosts: ["blocked.example.com"]
+    ports: [443]
+`
+	st := makeStore(t, yamlCfg, time.Now)
+	ev := policy.NewEvaluator(st)
+
+	// Path-scoped allow on exact host beats host-wide deny at DNS and SNI scope,
+	// while request scope still enforces /ok vs /other.
+	if d := ev.DecideDNS("worker-a", "example.com"); !d.Allow || d.RuleID != "allow-example-ok" {
+		t.Fatalf("DecideDNS(example.com) = %+v, want allow by allow-example-ok", d)
+	}
+	if d := ev.DecideHost("worker-a", "example.com", 443); !d.Allow || d.RuleID != "allow-example-ok" {
+		t.Fatalf("DecideHost(example.com, 443) = %+v, want allow by allow-example-ok", d)
+	}
+	if d := ev.DecideRequest("worker-a", "example.com", 443, "GET", "/ok"); !d.Allow || d.RuleID != "allow-example-ok" {
+		t.Fatalf("DecideRequest(/ok) = %+v, want allow", d)
+	}
+	if d := ev.DecideRequest("worker-a", "example.com", 443, "GET", "/other"); d.Allow || d.Reason != "rule-deny" || d.RuleID != "deny-example" {
+		t.Fatalf("DecideRequest(/other) = %+v, want rule-deny by deny-example", d)
+	}
+
+	// Explicit rule-deny is preserved by DecideDNS instead of collapsing to default-deny.
+	if d := ev.DecideDNS("worker-a", "blocked.example.com"); d.Allow || d.Reason != "rule-deny" || d.RuleID != "deny-blocked" {
+		t.Fatalf("DecideDNS(blocked.example.com) = %+v, want reason=rule-deny rule_id=deny-blocked", d)
+	}
+	if d := ev.DecideDNS("worker-a", "unknown.example.com"); d.Allow || d.Reason != "default-deny" || d.RuleID != "" {
+		t.Fatalf("DecideDNS(unknown.example.com) = %+v, want reason=default-deny", d)
+	}
+}

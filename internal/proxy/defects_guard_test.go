@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -10,14 +11,20 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	mdns "github.com/miekg/dns"
+
 	"github.com/manufactory-project/gateway/internal/audit"
+	gwdns "github.com/manufactory-project/gateway/internal/dns"
+	"github.com/manufactory-project/gateway/internal/policy"
 )
 
 func TestDeclaredContentLengthOverCap413BeforeDial(t *testing.T) {
@@ -529,5 +536,88 @@ func TestWebSocketDefaultEgressCapAppliesWhenRuleOmitsCap(t *testing.T) {
 		rec := httptest.NewRecorder()
 		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 		t.Fatalf("missing ws-egress-cap-exceeded audit record for default WS egress cap (metrics:\n%s)", rec.Body.String())
+	}
+}
+
+func TestHostWideDenyWithPathScopedAllowEndToEnd(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.WriteString(w, "allowed-ok"); err != nil {
+				return
+			}
+		}),
+		RulesYAML: `
+  - id: deny-example
+    principal: worker-test
+    effect: deny
+    hosts: [example.com]
+    ports: [443]
+  - id: allow-example-ok
+    principal: worker-test
+    effect: allow
+    hosts: [example.com]
+    ports: [443]
+    paths: ["/ok"]
+`,
+	})
+
+	// 1. Real fake-IP DNS resolves example.com (NOERROR + A record).
+	link := gw.Store.Current().Config.Links[0]
+	alloc, err := gwdns.NewAllocator(netip.MustParsePrefix("198.18.0.0/15"))
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+	dnsSrv, err := gwdns.NewServer(gwdns.ServerOptions{
+		Link:      link,
+		Store:     gw.Store,
+		Evaluator: policy.NewEvaluator(gw.Store),
+		Audit:     gw.Audit,
+		Allocator: alloc,
+	})
+	if err != nil {
+		t.Fatalf("dns.NewServer: %v", err)
+	}
+	if err := dnsSrv.Start(); err != nil {
+		t.Fatalf("dns.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := dnsSrv.Shutdown(ctx); err != nil {
+			t.Errorf("dns.Shutdown: %v", err)
+		}
+	})
+	dnsAddr := net.JoinHostPort(link.ParsedGatewayIP.String(), strconv.Itoa(int(link.DNSPort)))
+	q := new(mdns.Msg)
+	q.SetQuestion("example.com.", mdns.TypeA)
+	ans, _, err := (&mdns.Client{Net: "udp", Timeout: 2 * time.Second}).Exchange(q, dnsAddr)
+	if err != nil || ans.Rcode != mdns.RcodeSuccess || len(ans.Answer) != 1 {
+		t.Fatalf("DNS query example.com = (ans=%+v, err=%v), want NOERROR with 1 A record", ans, err)
+	}
+
+	// 2. TLS handshake succeeds, GET /ok -> 200, GET /other -> 403.
+	client := gw.H1Client(t, "example.com")
+	rOK, err := client.Get("https://example.com/ok")
+	if err != nil {
+		t.Fatalf("GET /ok: %v", err)
+	}
+	if err := rOK.Body.Close(); err != nil {
+		t.Fatalf("close /ok: %v", err)
+	}
+	if rOK.StatusCode != http.StatusOK {
+		t.Fatalf("GET /ok status = %d, want 200", rOK.StatusCode)
+	}
+
+	rOther, err := client.Get("https://example.com/other")
+	if err != nil {
+		t.Fatalf("GET /other: %v", err)
+	}
+	if err := rOther.Body.Close(); err != nil {
+		t.Fatalf("close /other: %v", err)
+	}
+	if rOther.StatusCode != http.StatusForbidden {
+		t.Fatalf("GET /other status = %d, want 403", rOther.StatusCode)
 	}
 }

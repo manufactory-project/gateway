@@ -126,17 +126,25 @@ func compileConfig(cfg *config.Config) *compiledSet {
 }
 
 // DecideDNS reports whether principal is permitted to resolve rawHost on either
-// port 443 or port 80 (default-deny).
+// port 443 or port 80 (default-deny), preserving explicit rule-deny decisions.
 func (e *Evaluator) DecideDNS(principal, rawHost string) Decision {
 	host, ok := normalizeLookupHost(rawHost)
 	if !ok {
 		return Decision{Allow: false, Reason: "invalid-host"}
 	}
-	if d := e.DecideHost(principal, host, 443); d.Allow {
-		return d
+	d443 := e.DecideHost(principal, host, 443)
+	if d443.Allow {
+		return d443
 	}
-	if d := e.DecideHost(principal, host, 80); d.Allow {
-		return d
+	d80 := e.DecideHost(principal, host, 80)
+	if d80.Allow {
+		return d80
+	}
+	if d443.Reason == "rule-deny" {
+		return d443
+	}
+	if d80.Reason == "rule-deny" {
+		return d80
 	}
 	return Decision{Allow: false, Reason: "default-deny"}
 }
@@ -145,91 +153,15 @@ func (e *Evaluator) DecideDNS(principal, rawHost string) Decision {
 // Only port 80 and 443 are permitted; method/path-scoped allow rules still admit
 // the TLS handshake so request-level evaluation can run inside MITM.
 func (e *Evaluator) DecideHost(principal, rawHost string, port uint16) Decision {
-	if port != 80 && port != 443 {
-		return Decision{Allow: false, Reason: "port-denied"}
-	}
-	host, ok := normalizeLookupHost(rawHost)
-	if !ok {
-		return Decision{Allow: false, Reason: "invalid-host"}
-	}
-
-	cs := e.currentCompiled()
-	grants := e.store.ActiveGrants()
-	hasBindings := len(cs.boundHosts[principal][host]) > 0
-
-	var best candidate
-	hasBest := false
-
-	for _, r := range cs.byPrincipal[principal] {
-		if !slices.Contains(r.ports, port) {
-			continue
-		}
-		// At connection/SNI scope, a deny rule scoped to specific methods/paths
-		// must NOT block unrelated requests on the same host; it is evaluated at request scope.
-		if !r.allow && (len(r.methods) > 0 || len(r.paths) > 0) {
-			continue
-		}
-		hr, matched := matchHosts(r.hosts, host)
-		if !matched {
-			continue
-		}
-		wsCap := r.wsMaxEgressBytes
-		if wsCap == 0 {
-			wsCap = cs.wsDefault
-		}
-		c := candidate{
-			rank:             rankKey{hostRank: hr},
-			allow:            r.allow,
-			ruleID:           r.id,
-			allowWebSocket:   r.allowWebSocket,
-			wsMaxEgressBytes: wsCap,
-		}
-		if !hasBest || c.beats(best) {
-			best = c
-			hasBest = true
-		}
-	}
-
-	for _, g := range grants {
-		if g.Principal != principal || g.Port != port || g.Host != host {
-			continue
-		}
-		c := candidate{
-			rank:             rankKey{hostRank: exactHostRank},
-			allow:            true,
-			grantID:          g.ID,
-			allowWebSocket:   g.AllowWebSocket,
-			wsMaxEgressBytes: cs.wsDefault,
-		}
-		if !hasBest || c.beats(best) {
-			best = c
-			hasBest = true
-		}
-	}
-
-	if !hasBest {
-		return Decision{Allow: false, Reason: "default-deny", HasBindings: hasBindings}
-	}
-	if !best.allow {
-		return Decision{Allow: false, RuleID: best.ruleID, Reason: "rule-deny", HasBindings: hasBindings}
-	}
-	reason := "rule-allow"
-	if best.grantID != "" {
-		reason = "grant-allow"
-	}
-	return Decision{
-		Allow:            true,
-		RuleID:           best.ruleID,
-		GrantID:          best.grantID,
-		Reason:           reason,
-		AllowWebSocket:   best.allowWebSocket && !hasBindings,
-		WSMaxEgressBytes: best.wsMaxEgressBytes,
-		HasBindings:      hasBindings,
-	}
+	return e.decide(principal, rawHost, port, true, "", "")
 }
 
 // DecideRequest evaluates an HTTP request for (principal, rawHost, port, method, path).
 func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method, reqPath string) Decision {
+	return e.decide(principal, rawHost, port, false, method, reqPath)
+}
+
+func (e *Evaluator) decide(principal, rawHost string, port uint16, hostScope bool, method, reqPath string) Decision {
 	if port != 80 && port != 443 {
 		return Decision{Allow: false, Reason: "port-denied"}
 	}
@@ -237,88 +169,20 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 	if !ok {
 		return Decision{Allow: false, Reason: "invalid-host"}
 	}
-	if !strings.HasPrefix(reqPath, "/") {
-		return Decision{Allow: false, Reason: "invalid-path"}
+	methodUpper := ""
+	if !hostScope {
+		if !strings.HasPrefix(reqPath, "/") {
+			return Decision{Allow: false, Reason: "invalid-path"}
+		}
+		methodUpper = strings.ToUpper(method)
 	}
-	methodUpper := strings.ToUpper(method)
 
 	cs := e.currentCompiled()
 	grants := e.store.ActiveGrants()
 	hostBindings := slices.Clone(cs.boundHosts[principal][host])
 	hasBindings := len(hostBindings) > 0
 
-	var best candidate
-	hasBest := false
-
-	for _, r := range cs.byPrincipal[principal] {
-		if !slices.Contains(r.ports, port) {
-			continue
-		}
-		hr, matched := matchHosts(r.hosts, host)
-		if !matched {
-			continue
-		}
-		if len(r.methods) > 0 && !slices.Contains(r.methods, methodUpper) {
-			continue
-		}
-		pathSpec, pathMatched := matchPaths(r.paths, reqPath)
-		if !pathMatched {
-			continue
-		}
-		wsCap := r.wsMaxEgressBytes
-		if wsCap == 0 {
-			wsCap = cs.wsDefault
-		}
-		rk := rankKey{
-			hostRank:        hr,
-			methodSpecified: len(r.methods) > 0,
-			pathSpecified:   len(r.paths) > 0,
-			pathSpecificity: pathSpec,
-		}
-		c := candidate{
-			rank:             rk,
-			allow:            r.allow,
-			ruleID:           r.id,
-			allowWebSocket:   r.allowWebSocket,
-			wsMaxEgressBytes: wsCap,
-			bindings:         r.bindings,
-		}
-		if !hasBest || c.beats(best) {
-			best = c
-			hasBest = true
-		}
-	}
-
-	for _, g := range grants {
-		if g.Principal != principal || g.Port != port || g.Host != host {
-			continue
-		}
-		if len(g.Methods) > 0 && !slices.Contains(g.Methods, methodUpper) {
-			continue
-		}
-		pathSpec, pathMatched := matchPaths(g.Paths, reqPath)
-		if !pathMatched {
-			continue
-		}
-		rk := rankKey{
-			hostRank:        exactHostRank,
-			methodSpecified: len(g.Methods) > 0,
-			pathSpecified:   len(g.Paths) > 0,
-			pathSpecificity: pathSpec,
-		}
-		c := candidate{
-			rank:             rk,
-			allow:            true,
-			grantID:          g.ID,
-			allowWebSocket:   g.AllowWebSocket,
-			wsMaxEgressBytes: cs.wsDefault,
-		}
-		if !hasBest || c.beats(best) {
-			best = c
-			hasBest = true
-		}
-	}
-
+	best, hasBest := matchBestCandidate(cs, grants, principal, host, port, hostScope, methodUpper, reqPath)
 	if !hasBest {
 		return Decision{Allow: false, Reason: "default-deny", HasBindings: hasBindings, HostBindings: hostBindings}
 	}
@@ -330,7 +194,7 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 		reason = "grant-allow"
 	}
 	var matchedBindings []config.BindingConfig
-	if best.ruleID != "" {
+	if !hostScope && best.ruleID != "" {
 		matchedBindings = matchRuleBindings(best.bindings, host, port, methodUpper, reqPath)
 	}
 	return Decision{
@@ -344,6 +208,104 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 		MatchedBindings:  matchedBindings,
 		HostBindings:     hostBindings,
 	}
+}
+
+func matchBestCandidate(
+	cs *compiledSet,
+	grants []config.Grant,
+	principal, host string,
+	port uint16,
+	hostScope bool,
+	methodUpper, reqPath string,
+) (candidate, bool) {
+	var best candidate
+	hasBest := false
+
+	for _, r := range cs.byPrincipal[principal] {
+		c, ok := evalRuleCandidate(r, cs.wsDefault, host, port, hostScope, methodUpper, reqPath)
+		if ok && (!hasBest || c.beats(best)) {
+			best = c
+			hasBest = true
+		}
+	}
+	for _, g := range grants {
+		c, ok := evalGrantCandidate(g, cs.wsDefault, principal, host, port, hostScope, methodUpper, reqPath)
+		if ok && (!hasBest || c.beats(best)) {
+			best = c
+			hasBest = true
+		}
+	}
+	return best, hasBest
+}
+
+func evalRuleCandidate(r compiledRule, wsDefault int64, host string, port uint16, hostScope bool, methodUpper, reqPath string) (candidate, bool) {
+	if !slices.Contains(r.ports, port) {
+		return candidate{}, false
+	}
+	if hostScope && !r.allow && (len(r.methods) > 0 || len(r.paths) > 0) {
+		return candidate{}, false
+	}
+	hr, matched := matchHosts(r.hosts, host)
+	if !matched {
+		return candidate{}, false
+	}
+	pathSpec := 0
+	if !hostScope {
+		if len(r.methods) > 0 && !slices.Contains(r.methods, methodUpper) {
+			return candidate{}, false
+		}
+		var pathMatched bool
+		pathSpec, pathMatched = matchPaths(r.paths, reqPath)
+		if !pathMatched {
+			return candidate{}, false
+		}
+	}
+	wsCap := r.wsMaxEgressBytes
+	if wsCap == 0 {
+		wsCap = wsDefault
+	}
+	return candidate{
+		rank: rankKey{
+			hostRank:        hr,
+			methodSpecified: len(r.methods) > 0,
+			pathSpecified:   len(r.paths) > 0,
+			pathSpecificity: pathSpec,
+		},
+		allow:            r.allow,
+		ruleID:           r.id,
+		allowWebSocket:   r.allowWebSocket,
+		wsMaxEgressBytes: wsCap,
+		bindings:         r.bindings,
+	}, true
+}
+
+func evalGrantCandidate(g config.Grant, wsDefault int64, principal, host string, port uint16, hostScope bool, methodUpper, reqPath string) (candidate, bool) {
+	if g.Principal != principal || g.Port != port || g.Host != host {
+		return candidate{}, false
+	}
+	pathSpec := 0
+	if !hostScope {
+		if len(g.Methods) > 0 && !slices.Contains(g.Methods, methodUpper) {
+			return candidate{}, false
+		}
+		var pathMatched bool
+		pathSpec, pathMatched = matchPaths(g.Paths, reqPath)
+		if !pathMatched {
+			return candidate{}, false
+		}
+	}
+	return candidate{
+		rank: rankKey{
+			hostRank:        exactHostRank,
+			methodSpecified: len(g.Methods) > 0,
+			pathSpecified:   len(g.Paths) > 0,
+			pathSpecificity: pathSpec,
+		},
+		allow:            true,
+		grantID:          g.ID,
+		allowWebSocket:   g.AllowWebSocket,
+		wsMaxEgressBytes: wsDefault,
+	}, true
 }
 
 func matchRuleBindings(bindings []config.BindingConfig, host string, port uint16, methodUpper, reqPath string) []config.BindingConfig {
