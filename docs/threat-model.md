@@ -3,7 +3,7 @@
 `gatewayd` treats every connected guest as hostile. A guest may be steered by prompt injection,
 untrusted repository content, or malicious code it executes, up to and including root inside the
 guest. Containment does not depend on guest cooperation, agent discipline, or in-guest sandboxing;
-the locked plain-Go wire suite and `gatewayd-probe` are the living verification inventory.
+the locked plain-Go wire suite is the living verification inventory.
 
 ## Hardening Goals
 
@@ -20,14 +20,13 @@ the locked plain-Go wire suite and `gatewayd-probe` are the living verification 
 
 2. **Keep declared secrets out of the guest.**
    Declared API keys and credentials stay behind the host/gateway-container filesystem boundary
-   through a `file`-only secret provider. Guests hold only inert `mf_ph_*` placeholders. `gatewayd`
-   substitutes a secret only into the exact `(host, header, scheme)` declared by a Binding (with
-   `dstPort` enforced by per-port `dnat`), unconditionally strips `Proxy-Authorization` and any
-   remaining `mf_ph_*` (including decoded Basic Auth) from every outbound request, forces
-   `Accept-Encoding: identity` on bound hosts (failing closed `502` on compressed responses), and
-   scrubs literal, URL-encoded, and JSON-escaped echoes of bound secrets from response headers,
-   bodies, and trailers back to their placeholders. This goal carries the security weight because
-   Goal 3 is open by design.
+   through a `file`-only secret provider. Guests hold only inert `mf_ph_*` placeholders for
+   declared secrets. `gatewayd` substitutes a secret only into the exact `(host, header, scheme)`
+   declared by a Binding, unconditionally strips `Proxy-Authorization` and any remaining `mf_ph_*`
+   (including decoded Basic Auth) from every outbound request, forces `Accept-Encoding: identity`
+   on bound hosts (failing closed `502` on compressed responses), and scrubs literal, URL-encoded,
+   and JSON-escaped echoes of bound secrets from response headers, bodies, and trailers back to
+   their placeholders. This goal carries the security weight because Goal 3 is open by design.
 
 3. **Data leaving is bounded and attributable, not prevented.**
    Every DNS query and HTTP request is evaluated against an explicit default-deny allowlist per link
@@ -41,8 +40,7 @@ the locked plain-Go wire suite and `gatewayd-probe` are the living verification 
 - **Guest-held subscription OAuth tokens and arbitrary vendor credentials:** Allowlisted LLM vendor
   APIs accept any credential the guest presents, so data can leave to an account the operator does
   not own. Subscription OAuth tokens (`claude`, `agy`, `codex`) live inside the guest by design so
-  workers can use personal subscriptions under unmodified vendor CLIs; consequently, a compromised
-  guest can read or exfiltrate its own subscription OAuth token.
+  workers can use personal subscriptions under unmodified vendor CLIs.
 - **Exfiltration within a credential's scope and through allowed destinations:** A placeholder
   prevents the guest from reading the raw secret, but an agent can still exfiltrate any data the
   credential legitimately reaches (for example, pushing to a repository the token can write) or
@@ -67,5 +65,4 @@ the locked plain-Go wire suite and `gatewayd-probe` are the living verification 
   a network position between a guest and `gatewayd` can impersonate any TLS server to guests.
   `gatewayd` always verifies upstream TLS certificates against system roots, so `ca_key` alone
   confers no upstream interception. Because the CA carries no name constraints, guests cannot scope
-  what they trust `gatewayd` to intercept. Rotation requires generating a new CA (`gwctl ca init`),
-  updating guest trust stores, and restarting `gatewayd`.
+  what they trust `gatewayd` to intercept.

@@ -6,9 +6,25 @@ env:
 
 tasks:
   lint:
-    desc: Run golangci-lint (errcheck, govet, ineffassign, nolintlint, staticcheck, unused)
+    desc: Run golangci-lint and enforce goleak coverage and no-nolint:errcheck
     cmds:
       - golangci-lint run ./...
+      - |
+        set -eu
+        fail=0
+        for dir in $(find . -path './.git' -prune -o -name '*_test.go' -exec dirname {} + | sort -u); do
+          if ! sed 's|//.*||' "$dir"/*_test.go | grep -qE '\bgoleak\.VerifyTestMain[[:space:]]*\('; then
+            echo "lint: $dir has _test.go files but no goleak.VerifyTestMain call" >&2
+            fail=1
+          fi
+        done
+        exit "$fail"
+      - |
+        set -eu
+        if find . -path './.git' -prune -o -name '*.go' -exec grep -HnE '(//|/\*)[[:space:]]*nolint:[[:space:]]*([a-zA-Z0-9_-]+[[:space:]]*,[[:space:]]*)*errcheck\b' {} + | grep .; then
+          echo "lint: nolint directive naming errcheck is forbidden" >&2
+          exit 1
+        fi
 
   test:
     desc: Run Go tests with race detector (goleak enforced in tests)
