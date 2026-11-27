@@ -644,6 +644,70 @@ start_guest_peer_listener "$G1_INST" "$G1_IP"
 run_probe_guest0
 run_probe_guest1
 
+restore_guests_dhcp() {
+  configure_guest_dhcp "$G0_INST" "10.200.0.1" "10.200.0.0/28"
+  configure_guest_dhcp "$G1_INST" "10.200.0.17" "10.200.0.16/28"
+  G0_IP="$(g0_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  G1_IP="$(g1_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  start_guest_peer_listener "$G0_INST" "$G0_IP"
+  start_guest_peer_listener "$G1_INST" "$G1_IP"
+}
+
+assert_defect_checks() {
+  local jsonl_file="$1"
+  local required_any_csv="$2"
+  local allowed_fail_csv="$3"
+  python3 - "$jsonl_file" "$required_any_csv" "$allowed_fail_csv" <<'PY'
+import json, sys
+
+path, req_csv, allow_csv = sys.argv[1], sys.argv[2], sys.argv[3]
+required_any = {c for c in req_csv.split(",") if c}
+allowed_fail = {c for c in allow_csv.split(",") if c}
+
+rows = []
+with open(path, "r", encoding="utf-8") as fh:
+    for line in fh:
+        s = line.strip()
+        if not s:
+            continue
+        if not s.startswith("{"):
+            # Skip non-JSON stderr summary lines emitted by gatewayd-probe after JSONL output.
+            if s.startswith("gatewayd-probe:"):
+                continue
+            sys.stderr.write(f"FAIL: unexpected non-JSON line in probe output: {s}\n")
+            sys.exit(1)
+        obj = json.loads(s)
+        rows.append(obj)
+
+if not rows:
+    sys.stderr.write("FAIL: probe emitted zero JSONL check lines\n")
+    sys.exit(1)
+
+failed = [r["check"] for r in rows if not r.get("pass")]
+if not failed:
+    sys.stderr.write("FAIL: no checks failed during planted defect\n")
+    sys.exit(1)
+
+unexpected = [c for c in failed if c not in allowed_fail]
+if unexpected:
+    sys.stderr.write(f"FAIL: unexpected check(s) failed during defect: {unexpected} (failed={failed})\n")
+    sys.exit(1)
+
+matched = [c for c in failed if c in required_any]
+if not matched:
+    sys.stderr.write(f"FAIL: none of expected check(s) {sorted(required_any)} failed (failed={failed})\n")
+    sys.exit(1)
+
+print(f"    verified expected failure(s): {', '.join(failed)}")
+PY
+}
+
+# run_same_ip_step <src_port> <normal|defect>
+# Returns:
+#   0 = all checks passed
+#   1 = functional failure (probe exit non-zero, missing/wrong audit attribution, or missing zone in normal mode)
+#   2 = setup/harness error (never treated as a defect going red)
+# Caller must restore DHCP and dataplane at top level where set -e is active.
 run_same_ip_step() {
   local src_port="${1:?missing source port}"
   local mode="${2:-normal}"
@@ -655,19 +719,19 @@ run_same_ip_step() {
     ip addr add ${static_ip}/32 dev eth0
     ip route replace 10.200.0.1/32 dev eth0 scope link
     ip route replace default via 10.200.0.1 dev eth0
-  "
+  " || return 2
   g1_exec bash -ceu "
     systemctl stop systemd-networkd 2>/dev/null || true
     ip addr flush dev eth0
     ip addr add ${static_ip}/32 dev eth0
     ip route replace 10.200.0.17/32 dev eth0 scope link
     ip route replace default via 10.200.0.17 dev eth0
-  "
+  " || return 2
 
-  gw_exec conntrack -F >/dev/null 2>&1 || true
+  gw_exec conntrack -F >/dev/null 2>&1 || return 2
 
   local audit_before
-  audit_before="$(gw_exec bash -ceu 'cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | wc -l')"
+  audit_before="$(gw_exec bash -ceu 'cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | wc -l')" || return 2
 
   local out0="$TMPDIR_WORK/same0-${src_port}.jsonl"
   local out1="$TMPDIR_WORK/same1-${src_port}.jsonl"
@@ -677,16 +741,18 @@ run_same_ip_step() {
     --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 8s \
     --allow-host "$UPSTREAM_HOST" >"$out0" 2>&1 &
   local pid0=$!
+  [[ -n "$pid0" ]] || return 2
   sleep 1
   g1_exec /usr/local/bin/gatewayd-probe \
     --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 6s \
     --allow-host "$UPSTREAM_HOST" >"$out1" 2>&1 &
   local pid1=$!
+  [[ -n "$pid1" ]] || return 2
 
   local ct_out=""
   if [[ "$mode" == "normal" ]]; then
     sleep 2
-    ct_out="$(gw_exec conntrack -L 2>/dev/null | grep "src=${static_ip}" || true)"
+    ct_out="$(gw_exec conntrack -L 2>/dev/null | grep "src=${static_ip}" || true)" || return 2
     echo "$ct_out"
   fi
 
@@ -698,8 +764,14 @@ run_same_ip_step() {
   echo "    guest1 (sport=${src_port}) exit=${rc1}:"
   cat "$out1"
 
+  # Ensure both probes actually executed (emitted at least one JSON check line).
+  if ! grep -q '^\{' "$out0" || ! grep -q '^\{' "$out1"; then
+    echo "    setup error: probe did not emit JSONL output (rc0=${rc0}, rc1=${rc1})" >&2
+    return 2
+  fi
+
   local audit_delta
-  audit_delta="$(gw_exec bash -ceu "cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))")"
+  audit_delta="$(gw_exec bash -ceu "cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))")" || return 2
   local g0_audited=0 g1_audited=0
   if echo "$audit_delta" | grep -q "\"principal\":\"guest0\".*\"src_ip\":\"${static_ip}\""; then
     g0_audited=1
@@ -707,14 +779,6 @@ run_same_ip_step() {
   if echo "$audit_delta" | grep -q "\"principal\":\"guest1\".*\"src_ip\":\"${static_ip}\""; then
     g1_audited=1
   fi
-
-  # Restore DHCP on both guests and refresh guest IPs and :8080 controls.
-  configure_guest_dhcp "$G0_INST" "10.200.0.1" "10.200.0.0/28"
-  configure_guest_dhcp "$G1_INST" "10.200.0.17" "10.200.0.16/28"
-  G0_IP="$(g0_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-  G1_IP="$(g1_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-  start_guest_peer_listener "$G0_INST" "$G0_IP"
-  start_guest_peer_listener "$G1_INST" "$G1_IP"
 
   if [[ "$mode" == "defect" ]]; then
     # Defect mode must fail for a functional reason (probe non-zero exit or
@@ -758,6 +822,7 @@ run_same_ip_step() {
 
 echo "==> Step 2.5: Same IP, same source port (sport=45001)"
 run_same_ip_step 45001 normal
+restore_guests_dhcp
 
 restore_dataplane() {
   gw_exec /usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml
@@ -765,6 +830,9 @@ restore_dataplane() {
 
 if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then
   echo "==> Step 2.6 (defect): remove fib daddr type local guard"
+  echo "    running green baseline (guest0 probe)..."
+  run_probe_guest0 >/dev/null
+  echo "    PASS: baseline green"
   gw_exec bash -ceu '
     deleted=0
     for h in $(nft -a list chain inet gw prerouting_guard | awk "/fib daddr type local drop/{print \$NF}"); do
@@ -778,18 +846,28 @@ if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then
     echo "    deleted ${deleted} fib daddr type local drop handle(s)"
   '
   fib_out="$TMPDIR_WORK/defect-fib.jsonl"
-  if run_probe_guest0 >"$fib_out" 2>&1; then
-    restore_dataplane
+  fib_rc=0
+  run_probe_guest0 >"$fib_out" 2>&1 || fib_rc=$?
+  restore_dataplane
+  if [[ "$fib_rc" -eq 0 ]]; then
     echo "FAIL: probe still passed after removing fib daddr type local guard" >&2
     exit 1
   fi
-  echo "    PASS: probe went red without fib daddr type local guard:"
-  grep '"pass":false' "$fib_out" || cat "$fib_out"
-  restore_dataplane
+  assert_defect_checks \
+    "$fib_out" \
+    "unreachable_gateway_mgmt,peer_link_ip_unreachable" \
+    "unreachable_gateway_mgmt,peer_link_ip_unreachable"
+  echo "    verifying restore (guest0 probe)..."
+  run_probe_guest0 >/dev/null
+  echo "    PASS: fib-local defect detected and dataplane restored"
 fi
 
 if [[ "$DEFECT_DROP_CT_ZONE" -eq 1 ]]; then
-  echo "==> Step 2.6 (defect): put both links in one conntrack zone (sport=45002)"
+  echo "==> Step 2.6 (defect): put both links in one conntrack zone (baseline sport=45003, defect sport=45002)"
+  echo "    running green baseline (same-IP sport=45003)..."
+  run_same_ip_step 45003 normal
+  restore_guests_dhcp
+  echo "    PASS: baseline green"
   gw_exec bash -ceu '
     deleted=0
     for chain in raw_prerouting raw_output; do
@@ -804,17 +882,26 @@ if [[ "$DEFECT_DROP_CT_ZONE" -eq 1 ]]; then
     fi
     echo "    deleted ${deleted} conntrack zone handles (both links now share zone 0)"
   '
-  if run_same_ip_step 45002 defect; then
-    restore_dataplane
-    echo "FAIL: same-IP step still passed with both links sharing one conntrack zone" >&2
+  zone_rc=0
+  run_same_ip_step 45002 defect || zone_rc=$?
+  restore_dataplane
+  restore_guests_dhcp
+  if [[ "$zone_rc" -eq 2 ]]; then
+    echo "FAIL: harness setup error (rc=2) during conntrack-zone defect" >&2
     exit 1
   fi
-  echo "    PASS: same-IP step failed functionally when both links shared one conntrack zone"
-  restore_dataplane
+  if [[ "$zone_rc" -ne 1 ]]; then
+    echo "FAIL: conntrack-zone defect did not cause a functional failure (rc=${zone_rc})" >&2
+    exit 1
+  fi
+  echo "    PASS: conntrack-zone defect caused functional failure and dataplane restored"
 fi
 
 if [[ "$DEFECT_DROP_DNS_DNAT" -eq 1 ]]; then
   echo "==> Step 2.6 (defect): remove :53 DNAT"
+  echo "    running green baseline (guest0 probe)..."
+  run_probe_guest0 >/dev/null
+  echo "    PASS: baseline green"
   gw_exec bash -ceu '
     deleted=0
     for h in $(nft -a list chain inet gw prerouting_nat | awk "/dport 53 dnat/{print \$NF}"); do
@@ -828,14 +915,20 @@ if [[ "$DEFECT_DROP_DNS_DNAT" -eq 1 ]]; then
     echo "    deleted ${deleted} :53 DNAT handle(s)"
   '
   dns_out="$TMPDIR_WORK/defect-dns.jsonl"
-  if run_probe_guest0 >"$dns_out" 2>&1; then
-    restore_dataplane
+  dns_rc=0
+  run_probe_guest0 >"$dns_out" 2>&1 || dns_rc=$?
+  restore_dataplane
+  if [[ "$dns_rc" -eq 0 ]]; then
     echo "FAIL: probe still passed after removing :53 DNAT" >&2
     exit 1
   fi
-  echo "    PASS: probe went red without :53 DNAT:"
-  grep '"pass":false' "$dns_out" || cat "$dns_out"
-  restore_dataplane
+  assert_defect_checks \
+    "$dns_out" \
+    "dns_redirect_udp_53,dns_redirect_tcp_53,dns_allow_a_control" \
+    "dns_redirect_udp_53,dns_redirect_tcp_53,dns_allow_a_control,dns_refused_txt,dns_refused_mx,dns_refused_ns,dns_refused_srv,dns_refused_cname,dns_refused_non_allowlisted,dns_nodata_aaaa,dns_nodata_https,dns_nodata_svcb,allowed_tcp_443_by_name_control,transfer_upload_gt64k,transfer_download_gt64k"
+  echo "    verifying restore (guest0 probe)..."
+  run_probe_guest0 >/dev/null
+  echo "    PASS: DNS DNAT defect detected and dataplane restored"
 fi
 
 echo "==> E2E completed successfully"
