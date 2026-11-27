@@ -19,10 +19,10 @@ linters:
       check-type-assertions: true
       check-blank: true
     gocognit:
-      min-complexity: 80
+      min-complexity: 40
     funlen:
-      lines: 200
-      statements: 105
+      lines: 120
+      statements: 80
     nolintlint:
       require-explanation: true
       require-specific: true

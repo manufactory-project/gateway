@@ -372,6 +372,11 @@ func validateRecords(cfg *Config) error {
 	return nil
 }
 
+type linkSubnet struct {
+	name   string
+	prefix netip.Prefix
+}
+
 func validateLinks(cfg *Config) (map[string]bool, bool, error) {
 	if len(cfg.Links) == 0 {
 		return nil, false, errors.New("links: at least one link is required")
@@ -383,107 +388,128 @@ func validateLinks(cfg *Config) (map[string]bool, bool, error) {
 	seenIPs := make(map[netip.Addr]bool, len(cfg.Links))
 	seenZones := make(map[uint16]bool, len(cfg.Links))
 	seenTables := make(map[int]bool, len(cfg.Links))
-	var subnets []struct {
-		name   string
-		prefix netip.Prefix
-	}
+	var subnets []linkSubnet
 	hasLinuxIf := false
 
 	for i := range cfg.Links {
 		l := &cfg.Links[i]
-		if l.Name == "" || !isSafeIdentifier(l.Name) {
-			return nil, false, fmt.Errorf("links[%d].name %q is invalid", i, l.Name)
+		isLinux, err := validateLinkIdentity(i, l, seenNames, seenIfs, seenZones, seenTables)
+		if err != nil {
+			return nil, false, err
 		}
-		if seenNames[l.Name] {
-			return nil, false, fmt.Errorf("links: duplicate link name %q", l.Name)
-		}
-		seenNames[l.Name] = true
-
-		if l.Principal == "" || !isSafeIdentifier(l.Principal) {
-			return nil, false, fmt.Errorf("links[%s].principal %q is invalid", l.Name, l.Principal)
+		if isLinux {
+			hasLinuxIf = true
 		}
 		principals[l.Principal] = true
 
-		if l.Interface != "" {
-			hasLinuxIf = true
-			if !isValidIfName(l.Interface) {
-				return nil, false, fmt.Errorf("links[%s].interface %q is invalid", l.Name, l.Interface)
-			}
-			if seenIfs[l.Interface] {
-				return nil, false, fmt.Errorf("links: duplicate interface %q", l.Interface)
-			}
-			seenIfs[l.Interface] = true
-			if l.CTZone == 0 {
-				return nil, false, fmt.Errorf("links[%s].ct_zone must be > 0 when interface is set", l.Name)
-			}
-			if l.RouteTable <= 0 || l.RouteTable == 253 || l.RouteTable == 254 || l.RouteTable == 255 {
-				return nil, false, fmt.Errorf("links[%s].route_table %d is invalid (reserved or <= 0)", l.Name, l.RouteTable)
-			}
-		}
-		if l.CTZone > 0 {
-			if seenZones[l.CTZone] {
-				return nil, false, fmt.Errorf("links: duplicate ct_zone %d", l.CTZone)
-			}
-			seenZones[l.CTZone] = true
-		}
-		if l.RouteTable > 0 {
-			if seenTables[l.RouteTable] {
-				return nil, false, fmt.Errorf("links: duplicate route_table %d", l.RouteTable)
-			}
-			seenTables[l.RouteTable] = true
-		}
-
-		sub, err := netip.ParsePrefix(l.Subnet)
+		sub, err := validateLinkSubnetAndGateway(l, subnets, seenIPs)
 		if err != nil {
-			return nil, false, fmt.Errorf("links[%s].subnet %q: %w", l.Name, l.Subnet, err)
+			return nil, false, err
 		}
-		if !sub.Addr().Is4() {
-			return nil, false, fmt.Errorf("links[%s].subnet %q must be IPv4", l.Name, l.Subnet)
-		}
-		if sub.Bits() > 29 {
-			return nil, false, fmt.Errorf("links[%s].subnet %q must be /29 or larger for multi-address DHCP pool", l.Name, l.Subnet)
-		}
-		sub = sub.Masked()
-		l.ParsedSubnet = sub
+		subnets = append(subnets, linkSubnet{name: l.Name, prefix: sub})
 
-		for _, prev := range subnets {
-			if prev.prefix.Overlaps(sub) {
-				return nil, false, fmt.Errorf("links: subnet %s on %q overlaps subnet %s on %q", sub, l.Name, prev.prefix, prev.name)
-			}
-		}
-		subnets = append(subnets, struct {
-			name   string
-			prefix netip.Prefix
-		}{name: l.Name, prefix: sub})
-
-		gwIP, err := netip.ParseAddr(l.GatewayIP)
-		if err != nil {
-			return nil, false, fmt.Errorf("links[%s].gateway_ip %q: %w", l.Name, l.GatewayIP, err)
-		}
-		gwIP = gwIP.Unmap()
-		if !gwIP.Is4() || gwIP.IsUnspecified() || gwIP.IsMulticast() {
-			return nil, false, fmt.Errorf("links[%s].gateway_ip %q must be an explicit unicast IPv4 address", l.Name, l.GatewayIP)
-		}
-		if !sub.Contains(gwIP) {
-			return nil, false, fmt.Errorf("links[%s].gateway_ip %s must be inside subnet %s", l.Name, gwIP, sub)
-		}
-		if gwIP == sub.Addr() || gwIP == broadcastIPv4(sub) {
-			return nil, false, fmt.Errorf("links[%s].gateway_ip %s cannot be subnet network or broadcast address", l.Name, gwIP)
-		}
-		if seenIPs[gwIP] {
-			return nil, false, fmt.Errorf("links: duplicate gateway_ip %s", gwIP)
-		}
-		seenIPs[gwIP] = true
-		l.ParsedGatewayIP = gwIP
-
-		if l.HTTPSPort < 1024 || l.HTTPPort < 1024 || l.DNSPort < 1024 {
-			return nil, false, fmt.Errorf("links[%s]: listener ports must be >= 1024 (got https=%d http=%d dns=%d)", l.Name, l.HTTPSPort, l.HTTPPort, l.DNSPort)
-		}
-		if l.HTTPSPort == l.HTTPPort || l.HTTPSPort == l.DNSPort || l.HTTPPort == l.DNSPort {
-			return nil, false, fmt.Errorf("links[%s]: https_port, http_port, and dns_port must be distinct", l.Name)
+		if err := validateLinkPorts(l); err != nil {
+			return nil, false, err
 		}
 	}
 	return principals, hasLinuxIf, nil
+}
+
+func validateLinkIdentity(i int, l *LinkConfig, seenNames, seenIfs map[string]bool, seenZones map[uint16]bool, seenTables map[int]bool) (bool, error) {
+	if l.Name == "" || !isSafeIdentifier(l.Name) {
+		return false, fmt.Errorf("links[%d].name %q is invalid", i, l.Name)
+	}
+	if seenNames[l.Name] {
+		return false, fmt.Errorf("links: duplicate link name %q", l.Name)
+	}
+	seenNames[l.Name] = true
+
+	if l.Principal == "" || !isSafeIdentifier(l.Principal) {
+		return false, fmt.Errorf("links[%s].principal %q is invalid", l.Name, l.Principal)
+	}
+
+	hasLinuxIf := false
+	if l.Interface != "" {
+		hasLinuxIf = true
+		if !isValidIfName(l.Interface) {
+			return false, fmt.Errorf("links[%s].interface %q is invalid", l.Name, l.Interface)
+		}
+		if seenIfs[l.Interface] {
+			return false, fmt.Errorf("links: duplicate interface %q", l.Interface)
+		}
+		seenIfs[l.Interface] = true
+		if l.CTZone == 0 {
+			return false, fmt.Errorf("links[%s].ct_zone must be > 0 when interface is set", l.Name)
+		}
+		if l.RouteTable <= 0 || l.RouteTable == 253 || l.RouteTable == 254 || l.RouteTable == 255 {
+			return false, fmt.Errorf("links[%s].route_table %d is invalid (reserved or <= 0)", l.Name, l.RouteTable)
+		}
+	}
+	if l.CTZone > 0 {
+		if seenZones[l.CTZone] {
+			return false, fmt.Errorf("links: duplicate ct_zone %d", l.CTZone)
+		}
+		seenZones[l.CTZone] = true
+	}
+	if l.RouteTable > 0 {
+		if seenTables[l.RouteTable] {
+			return false, fmt.Errorf("links: duplicate route_table %d", l.RouteTable)
+		}
+		seenTables[l.RouteTable] = true
+	}
+	return hasLinuxIf, nil
+}
+
+func validateLinkSubnetAndGateway(l *LinkConfig, prevSubnets []linkSubnet, seenIPs map[netip.Addr]bool) (netip.Prefix, error) {
+	sub, err := netip.ParsePrefix(l.Subnet)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("links[%s].subnet %q: %w", l.Name, l.Subnet, err)
+	}
+	if !sub.Addr().Is4() {
+		return netip.Prefix{}, fmt.Errorf("links[%s].subnet %q must be IPv4", l.Name, l.Subnet)
+	}
+	if sub.Bits() > 29 {
+		return netip.Prefix{}, fmt.Errorf("links[%s].subnet %q must be /29 or larger for multi-address DHCP pool", l.Name, l.Subnet)
+	}
+	sub = sub.Masked()
+	l.ParsedSubnet = sub
+
+	for _, prev := range prevSubnets {
+		if prev.prefix.Overlaps(sub) {
+			return netip.Prefix{}, fmt.Errorf("links: subnet %s on %q overlaps subnet %s on %q", sub, l.Name, prev.prefix, prev.name)
+		}
+	}
+
+	gwIP, err := netip.ParseAddr(l.GatewayIP)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("links[%s].gateway_ip %q: %w", l.Name, l.GatewayIP, err)
+	}
+	gwIP = gwIP.Unmap()
+	if !gwIP.Is4() || gwIP.IsUnspecified() || gwIP.IsMulticast() {
+		return netip.Prefix{}, fmt.Errorf("links[%s].gateway_ip %q must be an explicit unicast IPv4 address", l.Name, l.GatewayIP)
+	}
+	if !sub.Contains(gwIP) {
+		return netip.Prefix{}, fmt.Errorf("links[%s].gateway_ip %s must be inside subnet %s", l.Name, gwIP, sub)
+	}
+	if gwIP == sub.Addr() || gwIP == broadcastIPv4(sub) {
+		return netip.Prefix{}, fmt.Errorf("links[%s].gateway_ip %s cannot be subnet network or broadcast address", l.Name, gwIP)
+	}
+	if seenIPs[gwIP] {
+		return netip.Prefix{}, fmt.Errorf("links: duplicate gateway_ip %s", gwIP)
+	}
+	seenIPs[gwIP] = true
+	l.ParsedGatewayIP = gwIP
+	return sub, nil
+}
+
+func validateLinkPorts(l *LinkConfig) error {
+	if l.HTTPSPort < 1024 || l.HTTPPort < 1024 || l.DNSPort < 1024 {
+		return fmt.Errorf("links[%s]: listener ports must be >= 1024 (got https=%d http=%d dns=%d)", l.Name, l.HTTPSPort, l.HTTPPort, l.DNSPort)
+	}
+	if l.HTTPSPort == l.HTTPPort || l.HTTPSPort == l.DNSPort || l.HTTPPort == l.DNSPort {
+		return fmt.Errorf("links[%s]: https_port, http_port, and dns_port must be distinct", l.Name)
+	}
+	return nil
 }
 
 func validateDHCP(d DHCPConfig) error {
@@ -504,116 +530,154 @@ func validateDHCP(d DHCPConfig) error {
 	return nil
 }
 
+type principalHost struct {
+	principal string
+	host      string
+}
+
 func validateRules(cfg *Config, declaredPrincipals map[string]bool) error {
 	seenIDs := make(map[string]bool, len(cfg.Rules))
 	seenPlaceholders := make(map[string]string)
-	type principalHost struct {
-		principal string
-		host      string
-	}
 	boundHosts := make(map[principalHost]string)
 	wsHosts := make(map[principalHost]string)
 
 	for i := range cfg.Rules {
 		r := &cfg.Rules[i]
-		if r.ID == "" || !isSafeIdentifier(r.ID) {
-			return fmt.Errorf("rules[%d].id %q is invalid", i, r.ID)
+		seenHosts, has443, err := validateRuleBasics(i, r, seenIDs, declaredPrincipals)
+		if err != nil {
+			return err
 		}
-		if seenIDs[r.ID] {
-			return fmt.Errorf("rules: duplicate rule id %q", r.ID)
+		if err := validateRuleFlags(r, has443); err != nil {
+			return err
 		}
-		seenIDs[r.ID] = true
-
-		if !declaredPrincipals[r.Principal] {
-			return fmt.Errorf("rules[%s].principal %q does not match any declared link", r.ID, r.Principal)
-		}
-		if r.Effect != "allow" && r.Effect != "deny" {
-			return fmt.Errorf("rules[%s].effect %q must be allow or deny", r.ID, r.Effect)
-		}
-		if len(r.Hosts) == 0 {
-			return fmt.Errorf("rules[%s].hosts must not be empty", r.ID)
-		}
-		normHosts := make([]string, len(r.Hosts))
-		seenHosts := make(map[string]bool, len(r.Hosts))
-		for hi, raw := range r.Hosts {
-			nh, err := NormalizeHostPattern(raw)
-			if err != nil {
-				return fmt.Errorf("rules[%s].hosts[%d]: %w", r.ID, hi, err)
-			}
-			if seenHosts[nh] {
-				return fmt.Errorf("rules[%s].hosts: duplicate host %q", r.ID, nh)
-			}
-			seenHosts[nh] = true
-			normHosts[hi] = nh
-		}
-		r.Hosts = normHosts
-
-		seenPorts := make(map[uint16]bool, len(r.Ports))
-		has443 := false
-		for _, p := range r.Ports {
-			if p != 80 && p != 443 {
-				return fmt.Errorf("rules[%s].ports: port %d is forbidden (only 80 and 443 are permitted)", r.ID, p)
-			}
-			if seenPorts[p] {
-				return fmt.Errorf("rules[%s].ports: duplicate port %d", r.ID, p)
-			}
-			seenPorts[p] = true
-			if p == 443 {
-				has443 = true
-			}
-		}
-
-		for mi, m := range r.Methods {
-			if !isValidHTTPMethod(m) {
-				return fmt.Errorf("rules[%s].methods[%d] %q is invalid", r.ID, mi, m)
-			}
-			r.Methods[mi] = strings.ToUpper(m)
-		}
-		for pi, p := range r.Paths {
-			if !strings.HasPrefix(p, "/") {
-				return fmt.Errorf("rules[%s].paths[%d] %q must start with '/'", r.ID, pi, p)
-			}
-		}
-
-		if r.WSMaxEgressBytes < 0 {
-			return fmt.Errorf("rules[%s].ws_max_egress_bytes must be >= 0", r.ID)
-		}
-		if len(r.Bindings) > 0 && r.AllowWebSocket {
-			return fmt.Errorf("rules[%s]: a rule with bindings cannot set allow_websocket", r.ID)
-		}
-		if len(r.Bindings) > 0 && r.Effect != "allow" {
-			return fmt.Errorf("rules[%s]: bindings are only valid on allow rules", r.ID)
-		}
-		if len(r.Bindings) > 0 && !has443 {
-			return fmt.Errorf("rules[%s]: bindings require port 443 (cleartext port 80 does not substitute secrets)", r.ID)
-		}
-
 		if r.AllowWebSocket {
 			for _, h := range r.Hosts {
 				wsHosts[principalHost{principal: r.Principal, host: h}] = r.ID
 			}
 		}
-
-		seenBindings := make(map[string]bool, len(r.Bindings))
-		for bi := range r.Bindings {
-			b := &r.Bindings[bi]
-			if err := validateBinding(r.ID, b, seenHosts); err != nil {
-				return err
-			}
-			if seenBindings[b.Name] {
-				return fmt.Errorf("rules[%s].bindings: duplicate binding name %q", r.ID, b.Name)
-			}
-			seenBindings[b.Name] = true
-			if prevRule, dup := seenPlaceholders[b.Placeholder]; dup {
-				return fmt.Errorf("rules[%s].bindings[%s]: duplicate placeholder %q (already used by rule %q)", r.ID, b.Name, b.Placeholder, prevRule)
-			}
-			seenPlaceholders[b.Placeholder] = r.ID
-			boundHosts[principalHost{principal: r.Principal, host: b.Host}] = r.ID
+		if err := validateRuleBindings(r, seenHosts, seenPlaceholders, boundHosts); err != nil {
+			return err
 		}
 	}
 
-	// Cross-rule safety check: a host with a binding for a principal must not also
-	// have allow_websocket enabled on another rule for the same principal.
+	return checkWebSocketBindingConflicts(boundHosts, wsHosts)
+}
+
+func validateRuleBasics(i int, r *RuleConfig, seenIDs, declaredPrincipals map[string]bool) (map[string]bool, bool, error) {
+	if r.ID == "" || !isSafeIdentifier(r.ID) {
+		return nil, false, fmt.Errorf("rules[%d].id %q is invalid", i, r.ID)
+	}
+	if seenIDs[r.ID] {
+		return nil, false, fmt.Errorf("rules: duplicate rule id %q", r.ID)
+	}
+	seenIDs[r.ID] = true
+
+	if !declaredPrincipals[r.Principal] {
+		return nil, false, fmt.Errorf("rules[%s].principal %q does not match any declared link", r.ID, r.Principal)
+	}
+	if r.Effect != "allow" && r.Effect != "deny" {
+		return nil, false, fmt.Errorf("rules[%s].effect %q must be allow or deny", r.ID, r.Effect)
+	}
+	seenHosts, err := normalizeRuleHosts(r)
+	if err != nil {
+		return nil, false, err
+	}
+	has443, err := validateRulePorts(r)
+	if err != nil {
+		return nil, false, err
+	}
+	for mi, m := range r.Methods {
+		if !isValidHTTPMethod(m) {
+			return nil, false, fmt.Errorf("rules[%s].methods[%d] %q is invalid", r.ID, mi, m)
+		}
+		r.Methods[mi] = strings.ToUpper(m)
+	}
+	for pi, p := range r.Paths {
+		if !strings.HasPrefix(p, "/") {
+			return nil, false, fmt.Errorf("rules[%s].paths[%d] %q must start with '/'", r.ID, pi, p)
+		}
+	}
+	return seenHosts, has443, nil
+}
+
+func normalizeRuleHosts(r *RuleConfig) (map[string]bool, error) {
+	if len(r.Hosts) == 0 {
+		return nil, fmt.Errorf("rules[%s].hosts must not be empty", r.ID)
+	}
+	normHosts := make([]string, len(r.Hosts))
+	seenHosts := make(map[string]bool, len(r.Hosts))
+	for hi, raw := range r.Hosts {
+		nh, err := NormalizeHostPattern(raw)
+		if err != nil {
+			return nil, fmt.Errorf("rules[%s].hosts[%d]: %w", r.ID, hi, err)
+		}
+		if seenHosts[nh] {
+			return nil, fmt.Errorf("rules[%s].hosts: duplicate host %q", r.ID, nh)
+		}
+		seenHosts[nh] = true
+		normHosts[hi] = nh
+	}
+	r.Hosts = normHosts
+	return seenHosts, nil
+}
+
+func validateRulePorts(r *RuleConfig) (bool, error) {
+	seenPorts := make(map[uint16]bool, len(r.Ports))
+	has443 := false
+	for _, p := range r.Ports {
+		if p != 80 && p != 443 {
+			return false, fmt.Errorf("rules[%s].ports: port %d is forbidden (only 80 and 443 are permitted)", r.ID, p)
+		}
+		if seenPorts[p] {
+			return false, fmt.Errorf("rules[%s].ports: duplicate port %d", r.ID, p)
+		}
+		seenPorts[p] = true
+		if p == 443 {
+			has443 = true
+		}
+	}
+	return has443, nil
+}
+
+func validateRuleFlags(r *RuleConfig, has443 bool) error {
+	if r.WSMaxEgressBytes < 0 {
+		return fmt.Errorf("rules[%s].ws_max_egress_bytes must be >= 0", r.ID)
+	}
+	if len(r.Bindings) > 0 && r.AllowWebSocket {
+		return fmt.Errorf("rules[%s]: a rule with bindings cannot set allow_websocket", r.ID)
+	}
+	if len(r.Bindings) > 0 && r.Effect != "allow" {
+		return fmt.Errorf("rules[%s]: bindings are only valid on allow rules", r.ID)
+	}
+	if len(r.Bindings) > 0 && !has443 {
+		return fmt.Errorf("rules[%s]: bindings require port 443 (cleartext port 80 does not substitute secrets)", r.ID)
+	}
+	return nil
+}
+
+func validateRuleBindings(r *RuleConfig, seenHosts map[string]bool, seenPlaceholders map[string]string, boundHosts map[principalHost]string) error {
+	seenBindings := make(map[string]bool, len(r.Bindings))
+	for bi := range r.Bindings {
+		b := &r.Bindings[bi]
+		if err := validateBinding(r.ID, b, seenHosts); err != nil {
+			return err
+		}
+		if seenBindings[b.Name] {
+			return fmt.Errorf("rules[%s].bindings: duplicate binding name %q", r.ID, b.Name)
+		}
+		seenBindings[b.Name] = true
+		if prevRule, dup := seenPlaceholders[b.Placeholder]; dup {
+			return fmt.Errorf("rules[%s].bindings[%s]: duplicate placeholder %q (already used by rule %q)", r.ID, b.Name, b.Placeholder, prevRule)
+		}
+		seenPlaceholders[b.Placeholder] = r.ID
+		boundHosts[principalHost{principal: r.Principal, host: b.Host}] = r.ID
+	}
+	return nil
+}
+
+// Cross-rule safety check: a host with a binding for a principal must not also
+// have allow_websocket enabled on another rule for the same principal.
+func checkWebSocketBindingConflicts(boundHosts, wsHosts map[principalHost]string) error {
 	for bh, bRuleID := range boundHosts {
 		for wh, wRuleID := range wsHosts {
 			if bh.principal != wh.principal {

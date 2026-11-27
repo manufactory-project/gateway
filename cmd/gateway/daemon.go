@@ -104,13 +104,37 @@ func runDaemon(args []string, stdout, stderr io.Writer) error {
 	return serveDaemon(ctx, *cfgPath, *procSysRoot, stdout, stderr)
 }
 
-func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stderr io.Writer) error {
-	store, err := config.NewStore(cfgPath)
-	if err != nil {
-		return err
-	}
-	cfg := store.Current().Config
+type daemonRuntime struct {
+	dnsServers   []*gwdns.Server
+	proxyServers []*proxy.Server
+	adminSrv     *admin.Server
+	metricsSrv   *metrics.Server
+	auditWriter  *audit.Writer
+}
 
+func (rt *daemonRuntime) shutdownAll() error {
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var errs error
+	if rt.adminSrv != nil {
+		errs = errors.Join(errs, rt.adminSrv.Shutdown(shutCtx))
+	}
+	if rt.metricsSrv != nil {
+		errs = errors.Join(errs, rt.metricsSrv.Shutdown(shutCtx))
+	}
+	for _, ps := range rt.proxyServers {
+		errs = errors.Join(errs, ps.Shutdown(shutCtx))
+	}
+	for _, ds := range rt.dnsServers {
+		errs = errors.Join(errs, ds.Shutdown(shutCtx))
+	}
+	if rt.auditWriter != nil {
+		errs = errors.Join(errs, rt.auditWriter.Close())
+	}
+	return errs
+}
+
+func verifyStartupDataplane(cfg *config.Config, procSysRoot string) error {
 	// Startup dataplane checks (unprivileged; zero CAP_NET_ADMIN required).
 	if cfg.ShouldVerifySysctls() {
 		if err := netsetup.VerifySysctls(procSysRoot, cfg); err != nil {
@@ -122,12 +146,130 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 			return fmt.Errorf("dataplane ready_file %s missing (run ExecStartPre=+ gateway netsetup first): %w", cfg.Dataplane.ReadyFile, err)
 		}
 	}
+	return nil
+}
 
-	// Strictly load operator-supplied MITM CA (fail closed if missing or mismatched).
+func (rt *daemonRuntime) startLinks(
+	cfg *config.Config,
+	store *config.Store,
+	eval *policy.Evaluator,
+	alloc *gwdns.Allocator,
+	leaves *ca.LeafCache,
+	dialer *netguard.Dialer,
+	flows *proxy.FlowRegistry,
+	collector *metrics.Collector,
+) error {
+	for _, link := range cfg.Links {
+		ds, err := gwdns.NewServer(gwdns.ServerOptions{
+			Link:      link,
+			Store:     store,
+			Evaluator: eval,
+			Audit:     rt.auditWriter,
+			Allocator: alloc,
+			OnQuery:   collector.ObserveDNSQuery,
+		})
+		if err != nil {
+			return err
+		}
+		if err := ds.Start(); err != nil {
+			return err
+		}
+		rt.dnsServers = append(rt.dnsServers, ds)
+
+		ps, err := proxy.NewServer(proxy.Options{
+			Link:      link,
+			Store:     store,
+			Evaluator: eval,
+			Audit:     rt.auditWriter,
+			Leaves:    leaves,
+			Dialer:    dialer,
+			Flows:     flows,
+			OnRequest: collector.ObserveRequest,
+		})
+		if err != nil {
+			return err
+		}
+		if err := ps.Start(); err != nil {
+			return err
+		}
+		rt.proxyServers = append(rt.proxyServers, ps)
+	}
+	return nil
+}
+
+func (rt *daemonRuntime) startControl(cfg *config.Config, store *config.Store, flows *proxy.FlowRegistry, collector *metrics.Collector) error {
+	if cfg.Admin.Socket != "" {
+		srv, err := admin.NewServer(admin.Options{
+			SocketPath:  cfg.Admin.Socket,
+			SocketGroup: cfg.Admin.SocketGroup,
+			Store:       store,
+			Flows:       adminFlowAdapter{flows: flows},
+			Audit:       rt.auditWriter,
+			Metrics:     collector,
+		})
+		if err != nil {
+			return err
+		}
+		if err := srv.Start(); err != nil {
+			return err
+		}
+		rt.adminSrv = srv
+	}
+	if cfg.Metrics.Listen != "" {
+		srv, err := metrics.NewServer(cfg.Metrics.Listen, collector)
+		if err != nil {
+			return err
+		}
+		if err := srv.Start(); err != nil {
+			return err
+		}
+		rt.metricsSrv = srv
+	}
+	return nil
+}
+
+func handleSIGHUPReload(snap *config.Snapshot, reloadErr error, collector *metrics.Collector, auditWriter *audit.Writer, stderr io.Writer) {
+	if reloadErr != nil {
+		collector.ObserveReload(false)
+		if aErr := auditWriter.WriteSync(audit.Event{
+			Kind:   audit.KindLifecycle,
+			Reason: "sighup-reload-failed",
+			Error:  reloadErr.Error(),
+		}); aErr != nil {
+			if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (audit error: %v): %v\n", aErr, reloadErr); wErr != nil {
+				return
+			}
+			return
+		}
+		if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (keeping prior config): %v\n", reloadErr); wErr != nil {
+			return
+		}
+		return
+	}
+	collector.ObserveReload(true)
+	if aErr := auditWriter.WriteSync(audit.Event{
+		Kind:       audit.KindLifecycle,
+		Reason:     "sighup-reload",
+		ConfigHash: snap.Hash,
+	}); aErr != nil {
+		return
+	}
+}
+
+func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stderr io.Writer) error {
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		return err
+	}
+	cfg := store.Current().Config
+	if err := verifyStartupDataplane(cfg, procSysRoot); err != nil {
+		return err
+	}
 	mitmCA, err := ca.Load(cfg.CA.CertPath, cfg.CA.KeyPath)
 	if err != nil {
 		return err
 	}
+
 	flows := proxy.NewFlowRegistry()
 	collector := metrics.NewCollector(metrics.Options{
 		ActiveFlows:  flows.Count,
@@ -152,110 +294,27 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	}
 	registerGrantExpiredAudit(store, auditWriter, stderr)
 
-	eval := policy.NewEvaluator(store)
+	rt := &daemonRuntime{auditWriter: auditWriter}
 	alloc, err := gwdns.NewAllocator(cfg.FakePrefix)
 	if err != nil {
-		return errors.Join(err, auditWriter.Close())
+		return errors.Join(err, rt.shutdownAll())
 	}
+	eval := policy.NewEvaluator(store)
 	leaves := ca.NewLeafCache(mitmCA)
 	dialer := netguard.NewDialer(netguard.Options{Store: store})
 
-	var (
-		dnsServers   []*gwdns.Server
-		proxyServers []*proxy.Server
-		adminSrv     *admin.Server
-		metricsSrv   *metrics.Server
-	)
-
-	shutdownAll := func() error {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		var errs error
-		if adminSrv != nil {
-			errs = errors.Join(errs, adminSrv.Shutdown(shutCtx))
-		}
-		if metricsSrv != nil {
-			errs = errors.Join(errs, metricsSrv.Shutdown(shutCtx))
-		}
-		for _, ps := range proxyServers {
-			errs = errors.Join(errs, ps.Shutdown(shutCtx))
-		}
-		for _, ds := range dnsServers {
-			errs = errors.Join(errs, ds.Shutdown(shutCtx))
-		}
-		errs = errors.Join(errs, auditWriter.Close())
-		return errs
+	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector); err != nil {
+		return errors.Join(err, rt.shutdownAll())
 	}
-
-	for _, link := range cfg.Links {
-		ds, err := gwdns.NewServer(gwdns.ServerOptions{
-			Link:      link,
-			Store:     store,
-			Evaluator: eval,
-			Audit:     auditWriter,
-			Allocator: alloc,
-			OnQuery:   collector.ObserveDNSQuery,
-		})
-		if err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-		if err := ds.Start(); err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-		dnsServers = append(dnsServers, ds)
-
-		ps, err := proxy.NewServer(proxy.Options{
-			Link:      link,
-			Store:     store,
-			Evaluator: eval,
-			Audit:     auditWriter,
-			Leaves:    leaves,
-			Dialer:    dialer,
-			Flows:     flows,
-			OnRequest: collector.ObserveRequest,
-		})
-		if err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-		if err := ps.Start(); err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-		proxyServers = append(proxyServers, ps)
+	if err := rt.startControl(cfg, store, flows, collector); err != nil {
+		return errors.Join(err, rt.shutdownAll())
 	}
-
-	if cfg.Admin.Socket != "" {
-		adminSrv, err = admin.NewServer(admin.Options{
-			SocketPath:  cfg.Admin.Socket,
-			SocketGroup: cfg.Admin.SocketGroup,
-			Store:       store,
-			Flows:       adminFlowAdapter{flows: flows},
-			Audit:       auditWriter,
-			Metrics:     collector,
-		})
-		if err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-		if err := adminSrv.Start(); err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-	}
-
-	if cfg.Metrics.Listen != "" {
-		metricsSrv, err = metrics.NewServer(cfg.Metrics.Listen, collector)
-		if err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-		if err := metricsSrv.Start(); err != nil {
-			return errors.Join(err, shutdownAll())
-		}
-	}
-
 	if err := auditWriter.WriteSync(audit.Event{
 		Kind:       audit.KindLifecycle,
 		Reason:     "started",
 		ConfigHash: store.Current().Hash,
 	}); err != nil {
-		return errors.Join(err, shutdownAll())
+		return errors.Join(err, rt.shutdownAll())
 	}
 
 	var bgWG sync.WaitGroup
@@ -267,31 +326,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	go func() {
 		defer bgWG.Done()
 		store.WatchSIGHUP(ctx, func(snap *config.Snapshot, _ []string, reloadErr error) {
-			if reloadErr != nil {
-				collector.ObserveReload(false)
-				if aErr := auditWriter.WriteSync(audit.Event{
-					Kind:   audit.KindLifecycle,
-					Reason: "sighup-reload-failed",
-					Error:  reloadErr.Error(),
-				}); aErr != nil {
-					if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (audit error: %v): %v\n", aErr, reloadErr); wErr != nil {
-						return
-					}
-					return
-				}
-				if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (keeping prior config): %v\n", reloadErr); wErr != nil {
-					return
-				}
-				return
-			}
-			collector.ObserveReload(true)
-			if aErr := auditWriter.WriteSync(audit.Event{
-				Kind:       audit.KindLifecycle,
-				Reason:     "sighup-reload",
-				ConfigHash: snap.Hash,
-			}); aErr != nil {
-				return
-			}
+			handleSIGHUPReload(snap, reloadErr, collector, auditWriter, stderr)
 		})
 	}()
 
@@ -302,12 +337,11 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		Kind:   audit.KindLifecycle,
 		Reason: "stopped",
 	}); aErr != nil {
-		// Still proceed with graceful shutdown.
 		if _, wErr := fmt.Fprintf(stderr, "gateway: stopped audit write failed: %v\n", aErr); wErr != nil {
-			return shutdownAll()
+			return rt.shutdownAll()
 		}
 	}
-	return shutdownAll()
+	return rt.shutdownAll()
 }
 
 func registerGrantExpiredAudit(store *config.Store, auditWriter *audit.Writer, stderr io.Writer) {
