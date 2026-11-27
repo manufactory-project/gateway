@@ -363,6 +363,8 @@ func sanitizeEvent(ev Event, now time.Time) Event {
 		ev.Method = EscapeMethod(ev.Method)
 	}
 	if ev.Path != "" {
+		// StripQuery handles raw request targets while preserving percent-escaped
+		// sequences (such as %23 and %3F) from url.URL.EscapedPath().
 		p, hadQuery := StripQuery(ev.Path)
 		ev.Path = p
 		if hadQuery {

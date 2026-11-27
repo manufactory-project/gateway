@@ -521,3 +521,63 @@ func TestCleartextPort80OptInAndDeny(t *testing.T) {
 		t.Fatalf("plain opt-in got status=%d body=%q", rPlainOK.StatusCode, plainBody)
 	}
 }
+
+func TestAuditPreservesEscapedHashAndQuestionMark(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"esc.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		RulesYAML: `
+  - id: allow-esc
+    principal: worker-test
+    effect: allow
+    hosts: [esc.example.com]
+    ports: [443]
+    paths: ["/**"]
+`,
+	})
+
+	client := gw.H1Client(t, "esc.example.com")
+	for _, rawTarget := range []string{
+		"https://esc.example.com/v1/ok%23tail",
+		"https://esc.example.com/v1/ok%3Ftail",
+		"https://esc.example.com/v1/ok?x=1",
+	} {
+		resp, err := client.Get(rawTarget)
+		if err != nil {
+			t.Fatalf("GET %s: %v", rawTarget, err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close %s: %v", rawTarget, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s status = %d, want 200", rawTarget, resp.StatusCode)
+		}
+	}
+
+	type wantRec struct {
+		path     string
+		hasQuery bool
+	}
+	wants := []wantRec{
+		{path: "/v1/ok%23tail", hasQuery: false},
+		{path: "/v1/ok%3Ftail", hasQuery: false},
+		{path: "/v1/ok", hasQuery: true},
+	}
+
+	var got []wantRec
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Kind == "request" && ev.Host == "esc.example.com" {
+			got = append(got, wantRec{path: ev.Path, hasQuery: ev.HasQuery})
+		}
+	}
+	if len(got) != len(wants) {
+		t.Fatalf("got %d request audit events (%+v), want %d", len(got), got, len(wants))
+	}
+	for i, w := range wants {
+		if got[i] != w {
+			t.Fatalf("event[%d] = %+v, want %+v", i, got[i], w)
+		}
+	}
+}
