@@ -1,0 +1,24 @@
+# Binaries and build outputs
+/bin/
+/dist/
+gatewayd
+gwctl
+gatewayd-probe
+*.test
+*.out
+coverage.*
+
+# Local runtime state and secrets
+*.key
+*.pem
+*.crt
+*.sock
+*.jsonl
+.env
+.env.*
+
+# Editor / OS clutter
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

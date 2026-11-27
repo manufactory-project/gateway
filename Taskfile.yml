@@ -1,0 +1,19 @@
+version: '3'
+
+env:
+  GOTOOLCHAIN: go1.26.2
+
+tasks:
+  lint:
+    desc: Run golangci-lint (errcheck with check-blank, unused, govet, staticcheck)
+    cmds:
+      - golangci-lint run ./...
+
+  test:
+    desc: Run Go tests with race detector (goleak enforced in tests)
+    cmds:
+      - go test -race -count=1 ./...
+
+  check:
+    desc: Run lint and race-checked tests
+    deps: [lint, test]
