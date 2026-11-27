@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +21,10 @@ import (
 
 	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/ca"
+	"github.com/manufactory-project/gateway/internal/config"
 	"github.com/manufactory-project/gateway/internal/netguard"
+	"github.com/manufactory-project/gateway/internal/policy"
+	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
 func TestUntrustedUpstreamCertRefused(t *testing.T) {
@@ -734,5 +738,153 @@ func TestUpstreamResponseHeaderTimeoutAudits502(t *testing.T) {
 	}
 	if !saw502 {
 		t.Fatal("missing audited 502 for upstream_response_header_timeout")
+	}
+}
+
+type countingStaticResolver struct {
+	hosts map[string][]netip.Addr
+	hits  atomic.Int32
+}
+
+func (r *countingStaticResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	r.hits.Add(1)
+	return r.hosts[host], nil
+}
+
+func TestProductionDialPathBlocksDeniedAddresses(t *testing.T) {
+	dir := t.TempDir()
+	auditDir := filepath.Join(dir, "audit")
+	mitmCert := filepath.Join(dir, "ca.crt")
+	mitmKey := filepath.Join(dir, "ca.key")
+	mitmCA, err := ca.Init(mitmCert, mitmKey)
+	if err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	mitmRoots := x509.NewCertPool()
+	if !mitmRoots.AppendCertsFromPEM(mitmCA.CertPEM) {
+		t.Fatal("append MITM CA")
+	}
+
+	idx := nextTestLinkIndex.Add(1) - 1
+	b2 := 1 + (idx/254)%254
+	b3 := 1 + (idx % 254)
+	linkIP := fmt.Sprintf("127.%d.%d.1", b2, b3)
+	linkSubnet := fmt.Sprintf("127.%d.%d.0/28", b2, b3)
+	ports := freePorts(t, linkIP, 3)
+	httpsAddr := fmt.Sprintf("%s:%d", linkIP, ports[0])
+
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+links:
+  - name: sbx0
+    principal: worker-test
+    subnet: %s
+    gateway_ip: %s
+    https_port: %d
+    http_port: %d
+    dns_port: %d
+rules:
+  - id: allow-ssrf-targets
+    principal: worker-test
+    effect: allow
+    hosts: [loop.ssrf.test, meta.ssrf.test, rfc1918.ssrf.test]
+    ports: [443]
+`, mitmCert, mitmKey, auditDir, linkSubnet, linkIP, ports[0], ports[1], ports[2])
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := aw.Close(); err != nil {
+			t.Errorf("audit close: %v", err)
+		}
+	})
+
+	resolver := &countingStaticResolver{
+		hosts: map[string][]netip.Addr{
+			"loop.ssrf.test":    {netip.MustParseAddr("127.0.0.1")},
+			"meta.ssrf.test":    {netip.MustParseAddr("169.254.169.254")},
+			"rfc1918.ssrf.test": {netip.MustParseAddr("10.0.0.1")},
+		},
+	}
+	// Production wiring: Dialer set, DialContext unset (nil).
+	srv, err := proxy.NewServer(proxy.Options{
+		Link:      store.Current().Config.Links[0],
+		Store:     store,
+		Evaluator: policy.NewEvaluator(store),
+		Audit:     aw,
+		Leaves:    ca.NewLeafCache(mitmCA),
+		Dialer: netguard.NewDialer(netguard.Options{
+			Store:    store,
+			Resolver: resolver,
+			Timeout:  time.Second,
+		}),
+		Flows: proxy.NewFlowRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("proxy.NewServer: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("proxy.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Errorf("proxy.Shutdown: %v", err)
+		}
+	})
+
+	for _, host := range []string{"loop.ssrf.test", "meta.ssrf.test", "rfc1918.ssrf.test"} {
+		tr := &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, httpsAddr)
+			},
+			TLSClientConfig: &tls.Config{
+				ServerName: host,
+				RootCAs:    mitmRoots,
+				MinVersion: tls.VersionTLS12,
+			},
+		}
+		t.Cleanup(tr.CloseIdleConnections)
+		resp, err := (&http.Client{Transport: tr}).Get("https://" + host + "/probe")
+		if err != nil {
+			t.Fatalf("GET %s: %v", host, err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close %s: %v", host, err)
+		}
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("GET %s status = %d, want 502", host, resp.StatusCode)
+		}
+	}
+
+	if resolver.hits.Load() != 3 {
+		t.Fatalf("netguard resolver hits = %d, want 3 (production Dialer was bypassed)", resolver.hits.Load())
+	}
+
+	// Confirm every denied dial was audited as 502 with netguard.ErrBlockedAddress.
+	gwTmp := &testGateway{AuditDir: auditDir}
+	var blockedAudits int
+	for _, ev := range gwTmp.AuditEvents(t) {
+		if ev.Kind == audit.KindRequest && ev.Status == http.StatusBadGateway && strings.Contains(ev.Error, netguard.ErrBlockedAddress.Error()) {
+			blockedAudits++
+		}
+	}
+	if blockedAudits != 3 {
+		t.Fatalf("audited SSRF-blocked 502 events = %d, want 3", blockedAudits)
 	}
 }
