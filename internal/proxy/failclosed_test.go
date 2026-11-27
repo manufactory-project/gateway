@@ -16,7 +16,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/ca"
 	"github.com/manufactory-project/gateway/internal/netguard"
 )
@@ -359,4 +361,184 @@ func TestDNSRebindingBlockedThroughProxy(t *testing.T) {
 	if rebindHits.Load() != 0 {
 		t.Fatalf("DNS rebinding reached canary listener: hits=%d", rebindHits.Load())
 	}
+}
+
+func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
+	t.Run("client_canceled_records_499_not_5xx", func(t *testing.T) {
+		upStarted := make(chan struct{})
+		releaseUp := make(chan struct{})
+		t.Cleanup(func() { close(releaseUp) })
+
+		gw := newTestGateway(t, testGatewaySpec{
+			Hosts: []string{"cancel.example.com"},
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/slow-cancel" {
+					close(upStarted)
+					select {
+					case <-r.Context().Done():
+					case <-releaseUp:
+					}
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}),
+			RulesYAML: `
+  - id: allow-cancel
+    principal: worker-test
+    effect: allow
+    hosts: [cancel.example.com]
+    ports: [443]
+`,
+		})
+
+		reqCtx, reqCancel := context.WithCancel(context.Background())
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://cancel.example.com/slow-cancel", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		client := gw.H1Client(t, "cancel.example.com")
+		reqDone := make(chan error, 1)
+		go func() {
+			resp, rErr := client.Do(req)
+			if resp != nil {
+				if cErr := resp.Body.Close(); cErr != nil {
+					t.Errorf("close resp: %v", cErr)
+				}
+			}
+			reqDone <- rErr
+		}()
+
+		<-upStarted
+		reqCancel()
+		if rErr := <-reqDone; rErr == nil {
+			t.Fatal("expected canceled client request to return error")
+		}
+
+		var gotEvent *audit.Event
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			for _, ev := range gw.AuditEvents(t) {
+				if ev.Kind == audit.KindRequest && ev.Path == "/slow-cancel" {
+					e := ev
+					gotEvent = &e
+					break
+				}
+			}
+			if gotEvent != nil {
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		if gotEvent == nil {
+			t.Fatal("missing completed audit event for /slow-cancel")
+		}
+		if gotEvent.Status != 499 || gotEvent.Error != "client-canceled" {
+			t.Fatalf("audit event status=%d error=%q, want status=499 error=%q", gotEvent.Status, gotEvent.Error, "client-canceled")
+		}
+
+		rec := httptest.NewRecorder()
+		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		mText := rec.Body.String()
+		if !strings.Contains(mText, `gateway_requests_total{effect="allow",principal="worker-test",status="499"} 1`) {
+			t.Fatalf("metrics missing status=499 counter:\n%s", mText)
+		}
+		if strings.Contains(mText, `status="502"`) {
+			t.Fatalf("metrics unexpectedly counted client-canceled request as 502:\n%s", mText)
+		}
+	})
+
+	t.Run("upstream_failure_stays_502_and_revoke_is_not_499", func(t *testing.T) {
+		revokeStarted := make(chan struct{})
+		releaseRevoke := make(chan struct{})
+		t.Cleanup(func() { close(releaseRevoke) })
+
+		gw := newTestGateway(t, testGatewaySpec{
+			Hosts: []string{"fail.example.com"},
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/drop-upstream":
+					panic(http.ErrAbortHandler)
+				case "/slow-revoke":
+					close(revokeStarted)
+					select {
+					case <-r.Context().Done():
+					case <-releaseRevoke:
+					}
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			}),
+			RulesYAML: `
+  - id: allow-fail
+    principal: worker-test
+    effect: allow
+    hosts: [fail.example.com]
+    ports: [443]
+`,
+		})
+
+		client := gw.H1Client(t, "fail.example.com")
+		resp, err := client.Get("https://fail.example.com/drop-upstream")
+		if err != nil {
+			t.Fatalf("GET /drop-upstream: %v", err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close resp: %v", err)
+		}
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("upstream failure status = %d, want 502", resp.StatusCode)
+		}
+
+		// Also verify gateway-initiated revoke teardown does NOT record 499.
+		revDone := make(chan error, 1)
+		go func() {
+			r2, rErr := gw.H1Client(t, "fail.example.com").Get("https://fail.example.com/slow-revoke")
+			if r2 != nil {
+				if cErr := r2.Body.Close(); cErr != nil {
+					t.Errorf("close r2: %v", cErr)
+				}
+			}
+			revDone <- rErr
+		}()
+		<-revokeStarted
+		if n := gw.Flows.RevokeByPrincipal("worker-test", ""); n == 0 {
+			t.Fatal("expected RevokeByPrincipal to tear down /slow-revoke flow")
+		}
+		<-revDone
+
+		var dropEv, revEv *audit.Event
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			for _, ev := range gw.AuditEvents(t) {
+				if ev.Kind == audit.KindRequest && ev.Path == "/drop-upstream" {
+					e := ev
+					dropEv = &e
+				}
+				if ev.Kind == audit.KindRequest && ev.Path == "/slow-revoke" {
+					e := ev
+					revEv = &e
+				}
+			}
+			if dropEv != nil && revEv != nil {
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		if dropEv == nil || dropEv.Status != http.StatusBadGateway || dropEv.Error == "client-canceled" {
+			t.Fatalf("unexpected /drop-upstream audit event: %+v", dropEv)
+		}
+		if revEv == nil || revEv.Status != http.StatusBadGateway || revEv.Error == "client-canceled" {
+			t.Fatalf("revoked flow must not be logged as 499/client-canceled, got: %+v", revEv)
+		}
+
+		rec := httptest.NewRecorder()
+		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		mText := rec.Body.String()
+		if !strings.Contains(mText, `gateway_requests_total{effect="allow",principal="worker-test",status="502"} 2`) {
+			t.Fatalf("metrics missing status=502 count 2:\n%s", mText)
+		}
+		if strings.Contains(mText, `status="499"`) {
+			t.Fatalf("metrics unexpectedly recorded status=499:\n%s", mText)
+		}
+	})
 }

@@ -29,6 +29,8 @@ import (
 	"github.com/manufactory-project/gateway/internal/secret"
 )
 
+const statusClientClosedRequest = 499
+
 // Options configures a per-link MITM proxy Server.
 type Options struct {
 	Link          config.LinkConfig
@@ -511,6 +513,10 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			rc.deny(w, http.StatusRequestEntityTooLarge, "body-too-large")
+			return
+		}
+		if rc.r.Context().Err() != nil && !af.isTornDown() {
+			rc.auditCompleted(statusClientClosedRequest, countingBody.n.Load(), 0, "client-canceled")
 			return
 		}
 		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, err.Error())

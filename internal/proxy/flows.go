@@ -51,6 +51,13 @@ func (f *activeFlow) setUpstreamConn(c net.Conn) {
 	f.mu.Unlock()
 }
 
+func (f *activeFlow) isTornDown() bool {
+	f.mu.Lock()
+	td := f.tornDown
+	f.mu.Unlock()
+	return td
+}
+
 // teardown immediately cancels the request context, closes the guest connection,
 // and closes any gateway-owned WebSocket upstream socket.
 func (f *activeFlow) teardown() {
