@@ -240,7 +240,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	sni := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hello.ServerName)), ".")
+	sni := config.NormalizeHost(hello.ServerName)
 	srcIP := ""
 	if hello.Conn != nil && hello.Conn.RemoteAddr() != nil {
 		if h, _, err := net.SplitHostPort(hello.Conn.RemoteAddr().String()); err == nil {
@@ -695,7 +695,7 @@ func validateHostAndSNI(r *http.Request, dstPort uint16) (string, string) {
 		}
 		hostPart = h
 	}
-	host := strings.TrimSuffix(strings.ToLower(hostPart), ".")
+	host := config.NormalizeHost(hostPart)
 	if host == "" {
 		return "", "invalid-host"
 	}
@@ -706,7 +706,7 @@ func validateHostAndSNI(r *http.Request, dstPort uint16) (string, string) {
 		if r.TLS == nil {
 			return "", "missing-tls"
 		}
-		sni := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(r.TLS.ServerName)), ".")
+		sni := config.NormalizeHost(r.TLS.ServerName)
 		if sni == "" || sni != host {
 			return "", "sni-host-mismatch"
 		}

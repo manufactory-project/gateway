@@ -5,9 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/manufactory-project/gateway/internal/config"
 )
 
 // FlowInfo describes one active in-flight HTTP request, H2 stream, SSE stream, or WebSocket flow.
@@ -158,7 +159,7 @@ func (r *FlowRegistry) RevokeByGrant(grantID string) int {
 
 // RevokeByPrincipal tears down every active flow for principal (optionally filtered to exact host).
 func (r *FlowRegistry) RevokeByPrincipal(principal, host string) int {
-	normHost := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	normHost := config.NormalizeHost(host)
 	return r.revokeMatching(func(info FlowInfo) bool {
 		if info.Principal != principal {
 			return false

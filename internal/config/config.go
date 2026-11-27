@@ -686,9 +686,14 @@ func validateBinding(ruleID string, b *BindingConfig, ruleHosts map[string]bool)
 	return nil
 }
 
+// NormalizeHost trims surrounding whitespace, lowercases, and strips a single trailing dot.
+func NormalizeHost(raw string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+}
+
 // NormalizeExactHost validates and lowercases an exact DNS hostname (no wildcard, no IP literal).
 func NormalizeExactHost(raw string) (string, error) {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+	h := NormalizeHost(raw)
 	if h == "" {
 		return "", errors.New("empty hostname")
 	}
@@ -706,7 +711,7 @@ func NormalizeExactHost(raw string) (string, error) {
 
 // NormalizeHostPattern validates an exact hostname or single leading wildcard (*.zone).
 func NormalizeHostPattern(raw string) (string, error) {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+	h := NormalizeHost(raw)
 	if h == "" {
 		return "", errors.New("empty host pattern")
 	}

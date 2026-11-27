@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -147,7 +146,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Con
 
 // DialHost dials hostname on port with connect-time Control enforcement.
 func (d *Dialer) DialHost(ctx context.Context, network, rawHost string, port uint16) (net.Conn, error) {
-	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(rawHost)), ".")
+	host := config.NormalizeHost(rawHost)
 	if host == "" {
 		return nil, fmt.Errorf("%w: empty host", ErrIPLiteralHost)
 	}

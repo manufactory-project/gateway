@@ -527,7 +527,7 @@ func matchGlob(pat, val string) bool {
 }
 
 func normalizeLookupHost(raw string) (string, bool) {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+	h := config.NormalizeHost(raw)
 	if h == "" || len(h) > 253 || strings.Contains(h, "*") {
 		return "", false
 	}

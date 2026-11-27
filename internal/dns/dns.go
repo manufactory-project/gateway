@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
-	"strings"
 	"sync"
 
 	mdns "github.com/miekg/dns"
@@ -60,7 +59,7 @@ func NewAllocator(prefix netip.Prefix) (*Allocator, error) {
 // Allocate returns the fake IPv4 address for normalized host, assigning a new one
 // from the pool if not yet seen.
 func (a *Allocator) Allocate(host string) netip.Addr {
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	host = config.NormalizeHost(host)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -237,7 +236,7 @@ func firstQuestionMeta(r *mdns.Msg) (qname, qtypeName string) {
 		return "", ""
 	}
 	q := r.Question[0]
-	qname = strings.TrimSuffix(strings.ToLower(q.Name), ".")
+	qname = config.NormalizeHost(q.Name)
 	qtypeName = mdns.TypeToString[q.Qtype]
 	if qtypeName == "" {
 		qtypeName = fmt.Sprintf("TYPE%d", q.Qtype)
