@@ -45,6 +45,7 @@ type Store struct {
 
 	snap atomic.Pointer[Snapshot]
 
+	reloadMu  sync.Mutex
 	mu        sync.RWMutex
 	gen       uint64
 	grantGen  uint64
@@ -120,6 +121,9 @@ func (s *Store) SetOnGrantExpired(fn func(grant Grant)) {
 // atomically replaced and all in-memory TTL grants are wiped before reload
 // callbacks run.
 func (s *Store) Reload() (*Snapshot, []string, error) {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
 	cfg, hash, err := LoadFile(s.path)
 	if err != nil {
 		return nil, nil, err

@@ -261,6 +261,29 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	selectors := 0
+	if req.FlowID != "" {
+		selectors++
+	}
+	if req.GrantID != "" {
+		selectors++
+	}
+	if req.Principal != "" {
+		selectors++
+	}
+	if selectors == 0 {
+		writeError(w, http.StatusBadRequest, "must specify flow_id, grant_id, or principal")
+		return
+	}
+	if selectors > 1 {
+		writeError(w, http.StatusBadRequest, "must specify only one of flow_id, grant_id, or principal")
+		return
+	}
+	if req.Host != "" && req.Principal == "" {
+		writeError(w, http.StatusBadRequest, "host filter requires principal")
+		return
+	}
+
 	var (
 		revokedFlows int
 		revokedGrant bool
@@ -277,9 +300,6 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	case req.Principal != "":
 		revokedFlows = s.flows.RevokeByPrincipal(req.Principal, req.Host)
 		reason = "revoke-principal"
-	default:
-		writeError(w, http.StatusBadRequest, "must specify flow_id, grant_id, or principal")
-		return
 	}
 
 	if err := s.audit.WriteSync(audit.Event{

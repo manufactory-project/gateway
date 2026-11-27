@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -468,5 +469,84 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	}
 	if rem := store.ActiveGrants(); len(rem) != 0 {
 		t.Fatalf("grants survived final Reload: %+v", rem)
+	}
+}
+
+func TestConcurrentReloadsAreSerialized(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	cfgA := strings.Replace(validYAML, "deb.debian.org", "alpha.example.com", 1)
+	cfgB := strings.Replace(validYAML, "deb.debian.org", "beta.example.com", 1)
+	if err := os.WriteFile(cfgPath, []byte(cfgA), 0o600); err != nil {
+		t.Fatalf("write initial config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	var (
+		inFlight      atomic.Int32
+		overlapped    atomic.Bool
+		lastMu        sync.Mutex
+		lastFinishedH string
+	)
+	store.OnReload(func(_, next *config.Snapshot, _ []string) {
+		if inFlight.Add(1) > 1 {
+			overlapped.Store(true)
+		}
+		time.Sleep(15 * time.Millisecond)
+		lastMu.Lock()
+		lastFinishedH = next.Hash
+		lastMu.Unlock()
+		inFlight.Add(-1)
+	})
+
+	atomicWrite := func(content string) error {
+		tmp, err := os.CreateTemp(dir, "cfg-*")
+		if err != nil {
+			return err
+		}
+		name := tmp.Name()
+		if _, err := tmp.WriteString(content); err != nil {
+			if cErr := tmp.Close(); cErr != nil {
+				return cErr
+			}
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			return err
+		}
+		return os.Rename(name, cfgPath)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		body := cfgA
+		if i%2 == 1 {
+			body = cfgB
+		}
+		wg.Add(1)
+		go func(payload string) {
+			defer wg.Done()
+			if wErr := atomicWrite(payload); wErr != nil {
+				t.Errorf("atomicWrite: %v", wErr)
+				return
+			}
+			if _, _, rErr := store.Reload(); rErr != nil {
+				t.Errorf("Reload: %v", rErr)
+			}
+		}(body)
+	}
+	wg.Wait()
+
+	if overlapped.Load() {
+		t.Fatal("concurrent Reload calls overlapped instead of serializing")
+	}
+	lastMu.Lock()
+	wantHash := lastFinishedH
+	lastMu.Unlock()
+	if got := store.Current().Hash; got != wantHash {
+		t.Fatalf("final Current().Hash = %s, want last finished reload hash %s", got, wantHash)
 	}
 }

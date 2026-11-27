@@ -33,6 +33,9 @@ func runNetsetup(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: gateway netsetup --config <path> [--dry-run] (unexpected arguments: %s)", strings.Join(fs.Args(), " "))
+	}
 	if *cfgPath == "" {
 		return errors.New("netsetup: --config is required")
 	}
@@ -94,6 +97,9 @@ func runDaemon(args []string, stdout, stderr io.Writer) error {
 	procSysRoot := fs.String("proc-sys-root", "/proc/sys", "root directory for sysctl verification")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: gateway run --config <path> (unexpected arguments: %s)", strings.Join(fs.Args(), " "))
 	}
 	if *cfgPath == "" {
 		return errors.New("--config is required")

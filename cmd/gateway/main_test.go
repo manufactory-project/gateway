@@ -620,6 +620,9 @@ rules:
 		{"ca", "init", "--bogus"},
 		{"dataplane", "check", "--config", cfgPath, "extra"},
 		{"dataplane", "check", "--bogus"},
+		{"run", "--config", cfgPath, "extra"},
+		{"netsetup", "--config", cfgPath, "extra"},
+		{"netsetup", "--config", cfgPath, "extra", "--dry-run"},
 	}
 	for _, args := range invalidCases {
 		var out, errBuf bytes.Buffer

@@ -257,11 +257,14 @@ func VerifySysctls(procSysRoot string, cfg *config.Config) error {
 }
 
 // Apply executes netsetup as root (invoked from systemd ExecStartPre=+):
-// removes any stale ready_file first, configures interfaces/routes/rules, writes
-// sysctls, writes the dnsmasq config, loads the nftables ruleset atomically via
-// `nft -f -`, verifies table inet gw and its chains exist, and writes ready_file
-// last only after everything has succeeded.
+// removes any stale ready_file first, writes sysctls, loads and verifies the
+// nftables ruleset atomically via `nft -f -`, then configures interfaces/routes/rules,
+// writes the dnsmasq config, and writes ready_file last only after everything has succeeded.
 func Apply(ctx context.Context, cfg *config.Config) error {
+	return applyWithPaths(ctx, cfg, "/proc/sys", 0)
+}
+
+func applyWithPaths(ctx context.Context, cfg *config.Config, procSysRoot string, expectedUID uint32) error {
 	if cfg.Dataplane.ReadyFile != "" {
 		if err := os.Remove(cfg.Dataplane.ReadyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("netsetup: remove stale ready_file %s: %w", cfg.Dataplane.ReadyFile, err)
@@ -277,25 +280,13 @@ func Apply(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
-	for _, cmdSpec := range IPCommands(cfg) {
-		cmd := exec.CommandContext(ctx, cmdSpec.Args[0], cmdSpec.Args[1:]...)
-		out, err := cmd.CombinedOutput()
-		if err != nil && !cmdSpec.Optional {
-			return fmt.Errorf("netsetup: %s failed: %w: %s", strings.Join(cmdSpec.Args, " "), err, strings.TrimSpace(string(out)))
-		}
-	}
-
+	// Apply sysctls and nftables BEFORE bringing links up or assigning addresses
+	// so there is no unguarded forwarding or link-local IPv6 window.
 	for _, sc := range DesiredSysctls(cfg) {
 		rel := strings.ReplaceAll(sc.Key, ".", string(filepath.Separator))
-		p := filepath.Join("/proc/sys", rel)
+		p := filepath.Join(procSysRoot, rel)
 		if err := os.WriteFile(p, []byte(sc.Value+"\n"), 0o644); err != nil {
 			return fmt.Errorf("netsetup: write sysctl %s=%s: %w", sc.Key, sc.Value, err)
-		}
-	}
-
-	if cfg.Dataplane.DHCP.ConfigPath != "" {
-		if err := writeOwnedFile(cfg.Dataplane.DHCP.ConfigPath, []byte(dnsmasqConf), 0); err != nil {
-			return fmt.Errorf("netsetup: write dnsmasq config %s: %w", cfg.Dataplane.DHCP.ConfigPath, err)
 		}
 	}
 
@@ -309,8 +300,22 @@ func Apply(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 
+	for _, cmdSpec := range IPCommands(cfg) {
+		cmd := exec.CommandContext(ctx, cmdSpec.Args[0], cmdSpec.Args[1:]...)
+		out, err := cmd.CombinedOutput()
+		if err != nil && !cmdSpec.Optional {
+			return fmt.Errorf("netsetup: %s failed: %w: %s", strings.Join(cmdSpec.Args, " "), err, strings.TrimSpace(string(out)))
+		}
+	}
+
+	if cfg.Dataplane.DHCP.ConfigPath != "" {
+		if err := writeOwnedFile(cfg.Dataplane.DHCP.ConfigPath, []byte(dnsmasqConf), expectedUID); err != nil {
+			return fmt.Errorf("netsetup: write dnsmasq config %s: %w", cfg.Dataplane.DHCP.ConfigPath, err)
+		}
+	}
+
 	if cfg.Dataplane.ReadyFile != "" {
-		if err := writeOwnedFile(cfg.Dataplane.ReadyFile, []byte("ok\n"), 0); err != nil {
+		if err := writeOwnedFile(cfg.Dataplane.ReadyFile, []byte("ok\n"), expectedUID); err != nil {
 			return fmt.Errorf("netsetup: write ready_file %s: %w", cfg.Dataplane.ReadyFile, err)
 		}
 	}

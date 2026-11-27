@@ -702,3 +702,89 @@ rules:
 		}
 	}
 }
+
+func TestAdminRevokeRejectsMultipleSelectors(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	if _, err := ca.Init(certPath, keyPath); err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+links:
+  - name: sbx0
+    principal: worker-a
+    subnet: 127.0.23.0/28
+    gateway_ip: 127.0.23.1
+`, certPath, keyPath, filepath.Join(dir, "audit"))
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	aw, err := audit.NewWriter(audit.Options{Dir: filepath.Join(dir, "audit")})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := aw.Close(); err != nil {
+			t.Errorf("audit close: %v", err)
+		}
+	})
+	sockPath := filepath.Join(dir, "admin.sock")
+	srv, err := admin.NewServer(admin.Options{
+		SocketPath: sockPath,
+		Store:      store,
+		Flows:      testFlowAdapter{flows: proxy.NewFlowRegistry()},
+		Audit:      aw,
+	})
+	if err != nil {
+		t.Fatalf("admin.NewServer: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("admin.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Errorf("admin.Shutdown: %v", err)
+		}
+	})
+
+	unixClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sockPath)
+			},
+		},
+	}
+	t.Cleanup(unixClient.CloseIdleConnections)
+
+	for _, body := range []string{
+		`{"flow_id":"f1","grant_id":"g1"}`,
+		`{"flow_id":"f1","principal":"worker-a"}`,
+		`{"grant_id":"g1","principal":"worker-a"}`,
+		`{"host":"example.com"}`,
+	} {
+		resp, err := unixClient.Post("http://unix/v1/revoke", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /v1/revoke %s: %v", body, err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close body: %v", err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("POST /v1/revoke %s status = %d, want 400", body, resp.StatusCode)
+		}
+	}
+}

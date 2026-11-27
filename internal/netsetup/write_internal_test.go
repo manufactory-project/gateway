@@ -1,10 +1,14 @@
 package netsetup
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/manufactory-project/gateway/internal/config"
 )
 
 func TestWriteOwnedFileSafety(t *testing.T) {
@@ -117,4 +121,107 @@ func TestWriteOwnedFileSafety(t *testing.T) {
 			t.Fatalf("victim file altered: %q (err=%v)", got, rErr)
 		}
 	})
+}
+
+func TestApplyOrderSysctlsAndNftBeforeIP(t *testing.T) {
+	dir := t.TempDir()
+	procRoot := filepath.Join(dir, "proc-sys")
+	dpDir := filepath.Join(dir, "dataplane")
+	readyFile := filepath.Join(dpDir, "dataplane.ready")
+	dnsmasqFile := filepath.Join(dpDir, "dnsmasq.conf")
+
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: /etc/gateway/ca/ca.crt
+  key_path: /etc/gateway/ca/ca.key
+audit:
+  dir: /var/log/gateway/audit
+dataplane:
+  ready_file: %s
+  dhcp:
+    user: dnsmasq
+    lease_file: /var/lib/gateway/dnsmasq.leases
+    config_path: %s
+links:
+  - name: sbx0
+    interface: sbx0
+    principal: worker-a
+    subnet: 10.200.0.0/28
+    gateway_ip: 10.200.0.1
+    ct_zone: 101
+    route_table: 101
+`, readyFile, dnsmasqFile)
+	cfg, err := config.Parse([]byte(cfgYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	for _, sc := range DesiredSysctls(cfg) {
+		p := filepath.Join(procRoot, strings.ReplaceAll(sc.Key, ".", string(filepath.Separator)))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir sysctl dir: %v", err)
+		}
+		if err := os.WriteFile(p, []byte("9\n"), 0o644); err != nil {
+			t.Fatalf("seed sysctl: %v", err)
+		}
+	}
+
+	nftOut, err := RenderNftables(cfg)
+	if err != nil {
+		t.Fatalf("RenderNftables: %v", err)
+	}
+	nftOutPath := filepath.Join(dir, "nft.out")
+	if err := os.WriteFile(nftOutPath, []byte(nftOut), 0o600); err != nil {
+		t.Fatalf("write nft.out: %v", err)
+	}
+	orderLog := filepath.Join(dir, "order.log")
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	ipFwdFile := filepath.Join(procRoot, "net", "ipv4", "ip_forward")
+	nftScript := fmt.Sprintf(`#!/bin/sh
+val="$(cat %q)"
+printf 'nft %%s (ip_forward=%%s)\n' "$*" "$val" >> %q
+if [ "$1" = "list" ]; then
+  cat %q
+fi
+`, ipFwdFile, orderLog, nftOutPath)
+	ipScript := fmt.Sprintf(`#!/bin/sh
+printf 'ip %%s\n' "$*" >> %q
+`, orderLog)
+	if err := os.WriteFile(filepath.Join(binDir, "nft"), []byte(nftScript), 0o755); err != nil {
+		t.Fatalf("write fake nft: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "ip"), []byte(ipScript), 0o755); err != nil {
+		t.Fatalf("write fake ip: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := applyWithPaths(context.Background(), cfg, procRoot, uint32(os.Getuid())); err != nil {
+		t.Fatalf("applyWithPaths: %v", err)
+	}
+
+	rawLog, err := os.ReadFile(orderLog)
+	if err != nil {
+		t.Fatalf("read order.log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(rawLog)), "\n")
+	nftLoadIdx, firstIPIdx := -1, -1
+	for i, line := range lines {
+		if strings.HasPrefix(line, "nft -f -") {
+			nftLoadIdx = i
+			if !strings.Contains(line, "(ip_forward=0)") {
+				t.Fatalf("sysctls were not applied before nft -f -: %q", line)
+			}
+		}
+		if strings.HasPrefix(line, "ip ") && firstIPIdx == -1 {
+			firstIPIdx = i
+		}
+	}
+	if nftLoadIdx < 0 || firstIPIdx < 0 {
+		t.Fatalf("missing expected commands in order.log:\n%s", string(rawLog))
+	}
+	if nftLoadIdx >= firstIPIdx {
+		t.Fatalf("nft -f - (line %d) must run BEFORE first ip command (line %d):\n%s", nftLoadIdx, firstIPIdx, string(rawLog))
+	}
 }
