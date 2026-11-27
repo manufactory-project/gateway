@@ -419,3 +419,22 @@ func TestDirectHTTPSNoSNIBypassFails(t *testing.T) {
 		t.Fatalf("expected GetCertificate to record exactly one ClientHello with ServerName == \"\", got %#v", snis)
 	}
 }
+
+func TestTCPBlockedRefusedFails(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	closedAddr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	res := checkTCPBlocked(context.Background(), "blocked_tcp_22", closedAddr, 2*time.Second)
+	if res.Pass {
+		t.Fatalf("expected closed loopback port (refused/reset) to FAIL checkTCPBlocked, got pass: %+v", res)
+	}
+	if !strings.HasPrefix(res.Got, "refused:") && !strings.HasPrefix(res.Got, "reset:") {
+		t.Fatalf("expected got to report refused/reset class, got %q", res.Got)
+	}
+}

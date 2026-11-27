@@ -2,7 +2,12 @@
 
 package main
 
-import "syscall"
+import (
+	"context"
+	"errors"
+	"net"
+	"syscall"
+)
 
 func reuseAddrControl(_, _ string, c syscall.RawConn) error {
 	var sockErr error
@@ -12,4 +17,27 @@ func reuseAddrControl(_, _ string, c syscall.RawConn) error {
 		return err
 	}
 	return sockErr
+}
+
+func classifyDialError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "refused"
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return "reset"
+	}
+	if errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL) ||
+		errors.Is(err, syscall.EAFNOSUPPORT) {
+		return "local (no route)"
+	}
+	return "other"
 }

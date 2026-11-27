@@ -271,21 +271,23 @@ func checkDialByNameControl(ctx context.Context, cfg probeConfig) Result {
 }
 
 func checkTCPBlocked(ctx context.Context, name, addr string, timeout time.Duration) Result {
+	const expect = "tcp connect timeout (dropped, never refused/reset)"
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp4", addr)
 	if err != nil {
+		class := classifyDialError(err)
 		return Result{
 			Check:  name,
-			Expect: "tcp connect blocked",
-			Got:    fmt.Sprintf("blocked: %v", err),
-			Pass:   true,
+			Expect: expect,
+			Got:    fmt.Sprintf("%s: %v", class, err),
+			Pass:   class == "timeout",
 		}
 	}
 	closeQuietly(conn)
 	return Result{
 		Check:  name,
-		Expect: "tcp connect blocked",
-		Got:    fmt.Sprintf("unexpectedly connected to %s", addr),
+		Expect: expect,
+		Got:    fmt.Sprintf("connected to %s", addr),
 		Pass:   false,
 	}
 }
@@ -474,44 +476,45 @@ func checkUnreachableService(ctx context.Context, name, addr string, timeout tim
 	if err != nil {
 		return Result{Check: name, Expect: "unreachable", Got: fmt.Sprintf("bad addr %q: %v", addr, err), Pass: false}
 	}
+	if port != "80" {
+		return checkTCPBlocked(ctx, name, addr, timeout)
+	}
+	return checkUnreachableHTTP(ctx, name, addr, host, timeout)
+}
+
+func checkUnreachableHTTP(ctx context.Context, name, addr, hostHeader string, timeout time.Duration) Result {
+	const expect = "unreachable (timeout or gatewayd 403)"
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp4", addr)
 	if err != nil {
-		return Result{Check: name, Expect: "unreachable", Got: fmt.Sprintf("blocked: %v", err), Pass: true}
+		class := classifyDialError(err)
+		return Result{Check: name, Expect: expect, Got: fmt.Sprintf("%s: %v", class, err), Pass: class == "timeout"}
 	}
 	defer closeQuietly(conn)
 
 	// Port 80 is DNATed to gatewayd, which must refuse IP-literal Host with 403.
-	if port == "80" {
-		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-			return Result{Check: name, Expect: "unreachable", Got: fmt.Sprintf("set deadline: %v", err), Pass: false}
-		}
-		reqStr := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host)
-		if _, err := io.WriteString(conn, reqStr); err != nil {
-			return Result{Check: name, Expect: "unreachable", Got: fmt.Sprintf("write refused: %v", err), Pass: true}
-		}
-		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
-		if err != nil {
-			return Result{Check: name, Expect: "unreachable", Got: fmt.Sprintf("read refused: %v", err), Pass: true}
-		}
-		defer closeQuietly(resp.Body)
-		body, rErr := io.ReadAll(io.LimitReader(resp.Body, 512))
-		if rErr != nil {
-			return Result{Check: name, Expect: "unreachable", Got: fmt.Sprintf("read body: %v", rErr), Pass: false}
-		}
-		denied := resp.StatusCode == http.StatusForbidden && strings.Contains(string(body), "egress denied")
-		return Result{
-			Check:  name,
-			Expect: "unreachable (blocked or gatewayd 403)",
-			Got:    fmt.Sprintf("HTTP %d", resp.StatusCode),
-			Pass:   denied,
-		}
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return Result{Check: name, Expect: expect, Got: fmt.Sprintf("set deadline: %v", err), Pass: false}
 	}
+	reqStr := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", hostHeader)
+	if _, err := io.WriteString(conn, reqStr); err != nil {
+		return Result{Check: name, Expect: expect, Got: fmt.Sprintf("write error: %v", err), Pass: false}
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		return Result{Check: name, Expect: expect, Got: fmt.Sprintf("read error: %v", err), Pass: false}
+	}
+	defer closeQuietly(resp.Body)
+	body, rErr := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if rErr != nil {
+		return Result{Check: name, Expect: expect, Got: fmt.Sprintf("read body: %v", rErr), Pass: false}
+	}
+	denied := resp.StatusCode == http.StatusForbidden && strings.Contains(string(body), "egress denied")
 	return Result{
 		Check:  name,
-		Expect: "unreachable",
-		Got:    fmt.Sprintf("unexpectedly connected to %s", addr),
-		Pass:   false,
+		Expect: expect,
+		Got:    fmt.Sprintf("HTTP %d", resp.StatusCode),
+		Pass:   denied,
 	}
 }
 
@@ -614,10 +617,11 @@ func checkIPv6Dropped(ctx context.Context, target string, timeout time.Duration)
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp6", target)
 	if err != nil {
+		class := classifyDialError(err)
 		return Result{
 			Check:  "ipv6_egress_dropped",
 			Expect: "ipv6 egress dropped",
-			Got:    fmt.Sprintf("dropped: %v", err),
+			Got:    fmt.Sprintf("%s: %v", class, err),
 			Pass:   true,
 		}
 	}
@@ -625,7 +629,7 @@ func checkIPv6Dropped(ctx context.Context, target string, timeout time.Duration)
 	return Result{
 		Check:  "ipv6_egress_dropped",
 		Expect: "ipv6 egress dropped",
-		Got:    fmt.Sprintf("unexpectedly connected over IPv6 to %s", target),
+		Got:    fmt.Sprintf("connected over IPv6 to %s", target),
 		Pass:   false,
 	}
 }

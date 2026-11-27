@@ -449,7 +449,32 @@ run_probe_guest1() {
     --peer-guest-addr "${G0_IP}:8080"
 }
 
-echo "==> Step 2.4: Running gatewayd-probe on both guests"
+start_guest_peer_listener() {
+  local ginst="$1"
+  local gip="$2"
+  incus exec "$ginst" --project "$PROJECT" -- bash -ceu "
+    systemctl stop gwd-peer-listen.service 2>/dev/null || true
+    systemctl reset-failed gwd-peer-listen.service 2>/dev/null || true
+    systemd-run --unit=gwd-peer-listen --quiet /usr/bin/python3 -m http.server 8080 --bind 0.0.0.0
+    ok=0
+    for _ in \$(seq 1 20); do
+      if timeout 2s bash -c 'exec 3<>/dev/tcp/${gip}/8080' 2>/dev/null; then
+        ok=1
+        break
+      fi
+      sleep 0.25
+    done
+    if [[ \"\$ok\" -ne 1 ]]; then
+      echo 'FAIL: peer listener control ${gip}:8080 did not become reachable inside ${ginst}' >&2
+      exit 1
+    fi
+    echo '    PASS: peer listener control reachable inside ${ginst} at ${gip}:8080'
+  "
+}
+
+echo "==> Step 2.4: Starting guest :8080 listeners (positive controls) and running gatewayd-probe"
+start_guest_peer_listener "$G0_INST" "$G0_IP"
+start_guest_peer_listener "$G1_INST" "$G1_IP"
 run_probe_guest0
 run_probe_guest1
 
