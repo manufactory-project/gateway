@@ -69,3 +69,16 @@ the locked plain-Go wire suite is the living verification inventory.
   `gatewayd` always verifies upstream TLS certificates against system roots, so `ca_key` alone
   confers no upstream interception. Because the CA carries no name constraints, guests cannot scope
   what they trust `gatewayd` to intercept.
+
+## Policy Precedence & Reload Semantics
+
+- **Rule precedence:** Evaluation is most-specific-first: host (exact before wildcard, longer
+  wildcard suffix before shorter), then path, then method; `deny` wins only on an exact rank tie.
+  A narrower `allow` or a path-scoped ephemeral grant outranks a host-wide `deny`. The emergency
+  stop for any live session is `gwctl revoke` or removing the matching `allow` rule and reloading.
+- **Live reload semantics:** On `SIGHUP` or `gwctl reload`, all ephemeral grants are wiped, active
+  flows that are no longer allowed (by host, port, method, or path) are torn down immediately via
+  `cancel()` + `conn.Close()`, and open WebSockets are torn down if a `Binding` is added to their
+  host. Changes to `ws_max_egress_bytes`, `records`, or `bindings` otherwise apply only to new
+  flows. Changes to `links`, principals, `dns.fake_cidr`, `ca`, `audit`, `admin`, or `metrics`
+  require a daemon restart and are refused on reload.

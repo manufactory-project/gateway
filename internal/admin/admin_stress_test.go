@@ -570,24 +570,59 @@ rules:
 		}(i)
 	}
 
-	// Control-plane hammer: SIGHUP + Admin Reload + Admin Grant/Revoke
+	// Control-plane hammer: SIGHUP + rule edits + Admin Reload + Add/Delete/Expire grants + Admin Revoke
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		altYAML := strings.Replace(cfgYAML, "hosts: [stress.example.com]", "hosts: [stress.example.com, ephemeral.example.com]", 1)
 		for i := 0; i < 6 && stressCtx.Err() == nil; i++ {
+			// Flip YAML rule set back and forth while requests are in flight.
+			nextCfg := altYAML
+			if i%2 == 1 {
+				nextCfg = cfgYAML
+			}
+			if err := os.WriteFile(cfgPath, []byte(nextCfg), 0o600); err != nil {
+				t.Errorf("write toggled config: %v", err)
+			}
+			// Add a grant, delete it, and add a short-TTL grant that expires mid-flight.
+			if gDel, err := cAdmin.CreateGrant(context.Background(), admin.GrantRequest{
+				Principal: "worker-stress",
+				Host:      "ephemeral.example.com",
+				Port:      443,
+				TTL:       "5m",
+			}); err == nil {
+				if _, dErr := cAdmin.DeleteGrant(context.Background(), gDel.ID); dErr != nil {
+					t.Errorf("DeleteGrant: %v", dErr)
+				}
+			}
+			if _, err := cAdmin.CreateGrant(context.Background(), admin.GrantRequest{
+				Principal: "worker-stress",
+				Host:      "ephemeral.example.com",
+				Port:      443,
+				TTL:       "30ms",
+			}); err != nil {
+				t.Logf("CreateGrant short TTL raced with reload: %v", err)
+			}
+			time.Sleep(20 * time.Millisecond)
+			if res, err := cAdmin.Revoke(context.Background(), admin.RevokeRequest{Principal: "worker-stress"}); err != nil {
+				t.Errorf("Admin Revoke: %v", err)
+			} else {
+				revokedHits.Add(int32(res.RevokedFlows))
+			}
 			if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
 				t.Errorf("kill SIGHUP: %v", err)
 			}
 			if _, err := cAdmin.Reload(context.Background()); err != nil {
 				t.Errorf("Admin Reload: %v", err)
 			}
-			res, err := cAdmin.Revoke(context.Background(), admin.RevokeRequest{Principal: "worker-stress"})
-			if err != nil {
-				t.Errorf("Admin Revoke: %v", err)
-			} else {
-				revokedHits.Add(int32(res.RevokedFlows))
-			}
-			time.Sleep(35 * time.Millisecond)
+			time.Sleep(25 * time.Millisecond)
+		}
+		// Restore base config cleanly for subsequent header-flood check.
+		if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+			t.Errorf("restore base config: %v", err)
+		}
+		if _, err := cAdmin.Reload(context.Background()); err != nil {
+			t.Errorf("final restore Reload: %v", err)
 		}
 	}()
 
@@ -595,6 +630,9 @@ rules:
 
 	if completedOK.Load() == 0 {
 		t.Fatal("stress test completed 0 successful requests")
+	}
+	if revokedHits.Load() == 0 {
+		t.Fatal("stress test revoked 0 in-flight flows (expected revokedHits > 0)")
 	}
 
 	// Resource-bound check: header flood (> MaxHeaderBytes + Go 4 KiB read slop) is rejected cleanly with 431.

@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"net"
 	"strings"
@@ -67,9 +68,20 @@ func (f *activeFlow) teardown() {
 	if f.guestConn != nil {
 		closeQuietly(f.guestConn)
 	}
-	if up != nil {
+	// Never close a shared upstream HTTP/2 connection pooled across other guests/grants:
+	// f.cancel() immediately sends RST_STREAM for this stream while leaving other connections'
+	// streams intact. Exclusive HTTP/1.1 and WebSocket upstream sockets are closed directly.
+	if up != nil && !isSharedH2Conn(up) {
 		closeQuietly(up)
 	}
+}
+
+func isSharedH2Conn(c net.Conn) bool {
+	tc, ok := c.(*tls.Conn)
+	if !ok {
+		return false
+	}
+	return tc.ConnectionState().NegotiatedProtocol == "h2"
 }
 
 // FlowRegistry tracks every active per-request/per-stream flow independently so
