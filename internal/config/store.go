@@ -104,9 +104,9 @@ func (s *Store) OnReload(fn func(prev, next *Snapshot, wipedGrantIDs []string) i
 	s.onReload = append(s.onReload, fn)
 }
 
-// SetOnGrantExpired registers a callback invoked when a grant is pruned on TTL expiry.
-// Multiple callbacks may be registered (e.g. one per link server and audit wiring).
-func (s *Store) SetOnGrantExpired(fn func(grant Grant)) {
+// OnGrantExpired registers a callback invoked when a grant is pruned on TTL expiry.
+// Multiple callbacks may be registered (e.g. teardown and audit wiring).
+func (s *Store) OnGrantExpired(fn func(grant Grant)) {
 	if fn == nil {
 		return
 	}

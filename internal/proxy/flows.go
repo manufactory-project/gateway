@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/config"
+	"github.com/manufactory-project/gateway/internal/policy"
 )
 
 // FlowInfo describes one active in-flight HTTP request, H2 stream, SSE stream, or WebSocket flow.
@@ -258,6 +260,25 @@ func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool, reason string) []
 
 func (r *FlowRegistry) revokeMatching(pred func(FlowInfo) bool, reason string) int {
 	return len(r.RevokeWhereWithReason(pred, reason))
+}
+
+// RevokeReloadedFlows tears down every active flow across all links that was admitted
+// by a wiped grant or is no longer permitted by the reloaded policy.
+func RevokeReloadedFlows(flows *FlowRegistry, eval *policy.Evaluator, wipedGrantIDs []string) int {
+	revoked := flows.RevokeWhereWithReason(func(info FlowInfo) bool {
+		if info.GrantID != "" && slices.Contains(wipedGrantIDs, info.GrantID) {
+			return true
+		}
+		dec := eval.DecideRequest(info.Principal, info.Host, info.Port, info.Method, info.Path)
+		if !dec.Allow {
+			return true
+		}
+		if info.Protocol == "websocket" && !dec.AllowWebSocket {
+			return true
+		}
+		return false
+	}, TeardownReload)
+	return len(revoked)
 }
 
 func newFlowID() string {

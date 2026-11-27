@@ -14,7 +14,6 @@ import (
 	"net/netip"
 	"net/textproto"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,8 +68,8 @@ type Server struct {
 
 // NewServer constructs a per-link Server without binding sockets yet.
 func NewServer(opts Options) (*Server, error) {
-	if opts.Store == nil || opts.Evaluator == nil || opts.Audit == nil || opts.Leaves == nil {
-		return nil, errors.New("proxy: store, evaluator, audit, and leaves are required")
+	if opts.Store == nil || opts.Evaluator == nil || opts.Audit == nil || opts.Leaves == nil || opts.Flows == nil {
+		return nil, errors.New("proxy: store, evaluator, audit, leaves, and flows are required")
 	}
 	if !opts.Link.ParsedGatewayIP.IsValid() || opts.Link.ParsedGatewayIP.IsUnspecified() {
 		return nil, errors.New("proxy: explicit non-wildcard gateway_ip is required")
@@ -81,10 +80,6 @@ func NewServer(opts Options) (*Server, error) {
 			return nil, errors.New("proxy: dialer or dialContext is required")
 		}
 		dialFn = opts.Dialer.DialContext
-	}
-	flows := opts.Flows
-	if flows == nil {
-		flows = NewFlowRegistry()
 	}
 
 	hCfg := opts.Store.Current().Config.HTTP
@@ -110,38 +105,17 @@ func NewServer(opts Options) (*Server, error) {
 		audit:          opts.Audit,
 		leaves:         opts.Leaves,
 		dialContext:    dialFn,
-		flows:          flows,
+		flows:          opts.Flows,
 		onRequest:      opts.OnRequest,
 		onConnRejected: opts.OnConnRejected,
 		transport:      tr,
 	}
-
-	opts.Store.OnReload(s.onConfigReload)
-	opts.Store.SetOnGrantExpired(func(g config.Grant) {
-		s.flows.RevokeByGrantWithReason(g.ID, TeardownGrantExpired)
-	})
 	return s, nil
 }
 
-func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) int {
-	revoked := s.flows.RevokeWhereWithReason(func(info FlowInfo) bool {
-		if info.Link != s.link.Name {
-			return false
-		}
-		if info.GrantID != "" && slices.Contains(wipedGrantIDs, info.GrantID) {
-			return true
-		}
-		dec := s.eval.DecideRequest(info.Principal, info.Host, info.Port, info.Method, info.Path)
-		if !dec.Allow {
-			return true
-		}
-		if info.Protocol == "websocket" && !dec.AllowWebSocket {
-			return true
-		}
-		return false
-	}, TeardownReload)
+// CloseIdleConnections closes any idle pooled upstream connections held by this server.
+func (s *Server) CloseIdleConnections() {
 	s.transport.CloseIdleConnections()
-	return len(revoked)
 }
 
 // Start binds explicit HTTPS and HTTP TCP listeners on link.ParsedGatewayIP.

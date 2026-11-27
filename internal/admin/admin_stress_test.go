@@ -428,10 +428,11 @@ rules:
 		return guardDialer.DialHost(ctx, network, host, upPort)
 	}
 
+	eval := policy.NewEvaluator(store)
 	pSrv, err := proxy.NewServer(proxy.Options{
 		Link:        store.Current().Config.Links[0],
 		Store:       store,
-		Evaluator:   policy.NewEvaluator(store),
+		Evaluator:   eval,
 		Audit:       aw,
 		Leaves:      ca.NewLeafCache(mitmCA),
 		DialContext: dialUp,
@@ -441,6 +442,14 @@ rules:
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
 	}
+	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+		pSrv.CloseIdleConnections()
+		return n
+	})
+	store.OnGrantExpired(func(g config.Grant) {
+		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+	})
 	if err := pSrv.Start(); err != nil {
 		t.Fatalf("proxy.Start: %v", err)
 	}
@@ -875,8 +884,9 @@ func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.C
 		}
 	})
 	flows := proxy.NewFlowRegistry()
+	eval := policy.NewEvaluator(store)
 	pSrv, err := proxy.NewServer(proxy.Options{
-		Link: store.Current().Config.Links[0], Store: store, Evaluator: policy.NewEvaluator(store),
+		Link: store.Current().Config.Links[0], Store: store, Evaluator: eval,
 		Leaves: ca.NewLeafCache(rootCA), Audit: aw, Flows: flows,
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
@@ -886,6 +896,14 @@ func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.C
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
 	}
+	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+		pSrv.CloseIdleConnections()
+		return n
+	})
+	store.OnGrantExpired(func(g config.Grant) {
+		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+	})
 	if err := pSrv.Start(); err != nil {
 		t.Fatalf("proxy.Start: %v", err)
 	}

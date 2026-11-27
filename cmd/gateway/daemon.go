@@ -316,6 +316,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
+	registerFlowLifecycleCallbacks(store, eval, flows, rt.proxyServers)
 	if err := rt.startControl(cfg, store, flows, collector); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
@@ -354,8 +355,21 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	return rt.shutdownAll()
 }
 
+func registerFlowLifecycleCallbacks(store *config.Store, eval *policy.Evaluator, flows *proxy.FlowRegistry, servers []*proxy.Server) {
+	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+		for _, ps := range servers {
+			ps.CloseIdleConnections()
+		}
+		return n
+	})
+	store.OnGrantExpired(func(g config.Grant) {
+		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+	})
+}
+
 func registerGrantExpiredAudit(store *config.Store, auditWriter *audit.Writer, stderr io.Writer) {
-	store.SetOnGrantExpired(func(g config.Grant) {
+	store.OnGrantExpired(func(g config.Grant) {
 		if aErr := auditWriter.WriteSync(audit.Event{
 			Kind:      audit.KindGrant,
 			Principal: g.Principal,

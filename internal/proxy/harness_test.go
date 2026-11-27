@@ -278,10 +278,11 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		}
 	}
 
+	eval := policy.NewEvaluator(store)
 	srv, err := proxy.NewServer(proxy.Options{
 		Link:           store.Current().Config.Links[0],
 		Store:          store,
-		Evaluator:      policy.NewEvaluator(store),
+		Evaluator:      eval,
 		Audit:          aw,
 		Leaves:         ca.NewLeafCache(leafCA),
 		DialContext:    dialFn,
@@ -292,6 +293,14 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
 	}
+	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+		srv.CloseIdleConnections()
+		return n
+	})
+	store.OnGrantExpired(func(g config.Grant) {
+		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+	})
 	if err := srv.Start(); err != nil {
 		t.Fatalf("proxy.Start: %v", err)
 	}

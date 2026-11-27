@@ -80,7 +80,7 @@ Guest packet on sandbox interface (sbxN)
   `onConfigReload` callbacks tear down flows that are no longer allowed and WebSockets on hosts
   that gained a secret binding.
 - **Grant TTL expiry & WebSocket grants:** One `config.Store.RunGrantPruner` goroutine owned by `cmd/gateway`
-  periodically prunes expired grants and invokes all registered `SetOnGrantExpired` callbacks
+  periodically prunes expired grants and invokes all registered `OnGrantExpired` callbacks
   across links so expired grant flows tear down immediately. Ephemeral grants (`POST /v1/grants`)
   may carry `allow_websocket`, using the default egress cap (`http.ws_max_egress_bytes`, 64 MiB
   by default), and are refused on any host with a secret binding for that principal.

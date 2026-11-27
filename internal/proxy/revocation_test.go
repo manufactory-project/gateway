@@ -19,7 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manufactory-project/gateway/internal/ca"
 	"github.com/manufactory-project/gateway/internal/netguard"
+	"github.com/manufactory-project/gateway/internal/policy"
 	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
@@ -1005,4 +1007,23 @@ func TestFlowTeardownReasonsHTTPAndWebSocket(t *testing.T) {
 	drainHTTPAndWS(t, rRel, wsRel, wsRelBR)
 	waitAuditCompletedError(t, gw, "/http-reload", "reload")
 	waitAuditCompletedError(t, gw, "/ws-reload", "reload")
+}
+
+func TestNewServerRequiresFlows(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{Hosts: []string{"reqflows.example.com"}})
+	_, err := proxy.NewServer(proxy.Options{
+		Link:      gw.Store.Current().Config.Links[0],
+		Store:     gw.Store,
+		Evaluator: policy.NewEvaluator(gw.Store),
+		Audit:     gw.Audit,
+		Leaves:    ca.NewLeafCache(testUpstreamCA),
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		Flows: nil,
+	})
+	if err == nil {
+		t.Fatal("expected proxy.NewServer with Flows=nil to return an error")
+	}
 }
