@@ -135,6 +135,9 @@ func handleNonWSResponse(w http.ResponseWriter, rc *reqContext, resp *http.Respo
 		errText = copyErr.Error()
 	}
 	rc.auditCompleted(resp.StatusCode, 0, bytesIn, errText)
+	if copyErr != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func writeWS101Response(clientConn net.Conn, upstreamHeader http.Header) error {

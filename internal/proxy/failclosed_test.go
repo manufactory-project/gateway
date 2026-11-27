@@ -542,3 +542,68 @@ func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
 		}
 	})
 }
+
+func TestTruncatedUpstreamResponseAbortsGuestH1AndH2(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"trunc.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			rc := http.NewResponseController(w)
+			if _, err := io.WriteString(w, "partial-chunk-before-abort"); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+			panic(http.ErrAbortHandler)
+		}),
+		RulesYAML: `
+  - id: allow-trunc
+    principal: worker-test
+    effect: allow
+    hosts: [trunc.example.com]
+    ports: [443]
+`,
+	})
+
+	for _, tc := range []struct {
+		name   string
+		path   string
+		client *http.Client
+	}{
+		{name: "H1", path: "/trunc-h1", client: gw.H1Client(t, "trunc.example.com")},
+		{name: "H2", path: "/trunc-h2", client: gw.H2Client(t, "trunc.example.com")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := tc.client.Get("https://trunc.example.com" + tc.path)
+			if err != nil {
+				t.Fatalf("%s GET failed before headers: %v", tc.name, err)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			if cErr := resp.Body.Close(); cErr != nil {
+				t.Logf("%s close body: %v", tc.name, cErr)
+			}
+			if readErr == nil {
+				t.Fatalf("%s guest read succeeded cleanly (%q) despite truncated upstream response", tc.name, string(body))
+			}
+
+			var found *audit.Event
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				for _, ev := range gw.AuditEvents(t) {
+					if ev.Kind == audit.KindRequest && ev.Path == tc.path {
+						e := ev
+						found = &e
+					}
+				}
+				if found != nil {
+					break
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+			if found == nil || found.Error == "" {
+				t.Fatalf("%s missing completion audit with error: %+v", tc.name, found)
+			}
+		})
+	}
+}

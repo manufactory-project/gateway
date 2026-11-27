@@ -541,6 +541,9 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		errText = copyErr.Error()
 	}
 	rc.auditCompleted(resp.StatusCode, countingBody.n.Load(), bytesIn, errText)
+	if copyErr != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func buildOutboundRequest(ctx context.Context, rc *reqContext, body io.Reader) (*http.Request, error) {
