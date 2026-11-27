@@ -18,7 +18,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 RuntimeDirectory=gatewayd
-ReadWritePaths=/var/log/gatewayd/audit
+LogsDirectory=gatewayd/audit
 
 [Install]
 WantedBy=multi-user.target

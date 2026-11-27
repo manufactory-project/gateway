@@ -169,7 +169,9 @@ Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
   one-shot setup), `CapabilityBoundingSet=` and `AmbientCapabilities=` both empty,
   `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
   `RuntimeDirectory=gatewayd` (admin socket, `dataplane.ready`, and generated `dnsmasq.conf`), and
-  `ReadWritePaths=/var/log/gatewayd/audit` only.
+  `LogsDirectory=gatewayd/audit` (creating and granting write access to `/var/log/gatewayd/audit`
+  only). When `gatewayd.service` stops, `RuntimeDirectory=gatewayd` deletes `/run/gatewayd`,
+  including `dataplane.ready`.
 - **`deploy/gatewayd-dhcp.service`:** Ordered `After=gatewayd.service` and
   `Requires=gatewayd.service`. Runs
   `/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gatewayd/dnsmasq.conf` with no flags
@@ -178,8 +180,10 @@ Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
   `user=`.
 - **Non-root / `CapEff` guarantee:** Once running, `gatewayd`'s `/proc/<pid>/status` shows a
   non-root `Uid` and `CapEff`, `CapPrm`, and `CapAmb` all `0000000000000000`. Because `netsetup`
-  emits unconditional `dhcp-broadcast` and `no-ping`, `dnsmasq` drops to its non-root `user=` with
-  `CapEff` and `CapPrm` both `0000000000000000` and opens only UDP `:67` (zero `:53` sockets).
+  emits unconditional `dhcp-broadcast` and `no-ping`, `dnsmasq` is configured to drop to its
+  non-root `user=` with `CapEff` and `CapPrm` both `0000000000000000` and open only UDP `:67`
+  (zero `:53` sockets) *(zero `CapEff`/`CapPrm` for `dnsmasq` pending empirical confirmation in
+  Step 2.3)*.
 - **Stale-ready-file behaviour:** Under systemd, `ExecStartPre=+ gatewayd netsetup` always deletes
   any stale `dataplane.ready` first and only writes it back after `nft -f` and `CheckNftTable`
   succeed. Because unprivileged `gatewayd` has zero `CAP_NET_ADMIN`, it verifies

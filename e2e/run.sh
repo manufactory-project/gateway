@@ -275,7 +275,6 @@ gw_exec bash -ceu '
   id -u gatewayd >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin gatewayd
   id -u dnsmasq  >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin dnsmasq
   install -d -o root -g gatewayd -m 0750 /etc/gatewayd /etc/gatewayd/ca
-  install -d -o gatewayd -g gatewayd -m 0750 /var/log/gatewayd/audit
   install -d -o dnsmasq -g dnsmasq -m 0750 /var/lib/gatewayd
 '
 

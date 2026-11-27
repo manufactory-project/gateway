@@ -5,6 +5,7 @@ ca:
   key_path: /etc/gatewayd/ca/ca.key
 
 audit:
+  # Managed by LogsDirectory=gatewayd/audit in deploy/gatewayd.service.
   dir: /var/log/gatewayd/audit
   retain_days: 30
   max_file_bytes: 104857600
