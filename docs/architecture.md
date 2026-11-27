@@ -180,14 +180,16 @@ Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
   `user=`.
 - **Non-root / `CapEff` guarantee:** Once running, `gatewayd`'s `/proc/<pid>/status` shows a
   non-root `Uid` and `CapEff`, `CapPrm`, and `CapAmb` all `0000000000000000`. Because `netsetup`
-  emits unconditional `dhcp-broadcast` and `no-ping`, `dnsmasq` is configured to drop to its
-  non-root `user=` with `CapEff` and `CapPrm` both `0000000000000000` and open only UDP `:67`
-  (zero `:53` sockets) *(zero `CapEff`/`CapPrm` for `dnsmasq` pending empirical confirmation in
-  Step 2.3)*.
-- **Stale-ready-file behaviour:** Under systemd, `ExecStartPre=+ gatewayd netsetup` always deletes
-  any stale `dataplane.ready` first and only writes it back after `nft -f` and `CheckNftTable`
-  succeed. Because unprivileged `gatewayd` has zero `CAP_NET_ADMIN`, it verifies
-  `dataplane.ready` existence and sysctls at startup rather than reading `table inet gw` directly,
-  whereas root `gwctl dataplane check` inspects `table inet gw` directly and fails if the table is
-  missing. *(Observed direct-restart behaviour with a deleted table and stale `dataplane.ready`:
-  pending Step 2.1 E2E run.)*
+  emits unconditional `dhcp-broadcast` and `no-ping`, `dnsmasq` drops to its non-root `user=` with
+  `CapEff` and `CapPrm` both `0000000000000000` and opens only UDP `:67` (zero `:53` sockets),
+  verified on live containers.
+- **Stale-ready-file behaviour:** Because unprivileged `gatewayd` has zero `CAP_NET_ADMIN`, it
+  checks kernel sysctls and `dataplane.ready` existence at startup rather than reading
+  `table inet gw` directly. If `table inet gw` is deleted while a stale `dataplane.ready` file and
+  valid sysctls remain, starting `gatewayd` directly without `netsetup` keeps running (`rc 124`
+  under `timeout`), whereas root `gwctl dataplane check` inspects `table inet gw` directly and
+  fails. In normal deployment, the guards against a stale ready file are systemd always re-running
+  `ExecStartPre=+ gatewayd netsetup` (which deletes any stale ready file first and reloads
+  `table inet gw`), `RuntimeDirectory=gatewayd` deleting `/run/gatewayd` on service stop, and
+  `net.ipv4.ip_forward=0` keeping forwarding disabled. Note that `gwctl dataplane check` also writes
+  `dataplane.ready` when it succeeds, making it a second writer alongside `gatewayd netsetup`.
