@@ -27,10 +27,14 @@
 ```
 Guest packet on sandbox interface (sbxN)
   -> nftables (table inet gw):
-       raw_prerouting/raw_out: per-link conntrack zone (ct zone set <ct_zone>)
-       prerouting_filter: drop IPv6, drop fib daddr type local (except link IP / DHCP)
-       prerouting_nat: DNAT :53 -> link_ip:dns_port, :443 -> link_ip:https_port, :80 -> link_ip:http_port
-       input / forward: default drop (admit ct status dnat + UDP 67 only)
+       raw_prerouting/raw_output: set per-link conntrack zone (ct zone set <ct_zone>)
+       prerouting_guard: drop IPv6 from @sandbox_ifs; drop fib daddr type local from @sandbox_ifs
+         except UDP 53/67 and TCP 53 to that link's gateway IP
+       prerouting_nat: DNAT :53 (UDP and TCP), :443, and :80 to link_ip:{dns,https,http}_port
+       input (policy accept): for @sandbox_ifs drop IPv6 and ct state invalid, accept ct status dnat
+         and UDP 68->67, drop everything else
+       forward (policy accept): drop iifname @sandbox_ifs and oifname @sandbox_ifs
+       output (policy accept): drop IPv6 to @sandbox_ifs
   -> DNS (internal/dns, UDP+TCP on link_ip:dns_port):
        Never forwards upstream. Ignores+audits QR=1 response packets; returns REFUSED/NOTIMP for
        malformed/non-QUERY/non-IN packets; returns synthetic A from dns.fake_cidr (198.18.0.0/15)
