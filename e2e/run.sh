@@ -729,7 +729,7 @@ start_guest_peer_listener() {
 ensure_host_tcp_control() {
   local port="$1"
   if ! gw_exec bash -ceu "timeout 2s bash -c 'exec 3<>/dev/tcp/${GW_UPSTREAM_GW}/${port}'" 2>/dev/null; then
-    local py_cmd=(python3 -c 'import socket,sys; s=socket.create_server((sys.argv[1],int(sys.argv[2])),reuse_address=True); [s.accept()[0].close() for _ in iter(int,1)]' "$GW_UPSTREAM_GW" "$port")
+    local py_cmd=(python3 -c 'import socket,sys; s=socket.create_server((sys.argv[1],int(sys.argv[2]))); [s.accept()[0].close() for _ in iter(int,1)]' "$GW_UPSTREAM_GW" "$port")
     [[ "$(id -u)" -eq 0 ]] || py_cmd=(sudo "${py_cmd[@]}")
     "${py_cmd[@]}" &
     EXTRA_PIDS+=("$!")
