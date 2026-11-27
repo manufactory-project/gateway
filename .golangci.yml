@@ -7,6 +7,8 @@ linters:
   default: none
   enable:
     - errcheck
+    - funlen
+    - gocognit
     - govet
     - ineffassign
     - nolintlint
@@ -16,9 +18,20 @@ linters:
     errcheck:
       check-type-assertions: true
       check-blank: true
+    gocognit:
+      min-complexity: 80
+    funlen:
+      lines: 200
+      statements: 105
     nolintlint:
       require-explanation: true
       require-specific: true
+  exclusions:
+    rules:
+      - path: _test\.go$
+        linters:
+          - funlen
+          - gocognit
 
 issues:
   max-issues-per-linter: 0
