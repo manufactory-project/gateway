@@ -295,3 +295,141 @@ rules:
 		t.Fatal("reload output mismatch")
 	}
 }
+
+func TestGrantLifecycleAudit(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	if _, err := ca.Init(certPath, keyPath); err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	auditDir := filepath.Join(dir, "audit")
+	sockPath := filepath.Join(dir, "admin.sock")
+	readyFile := filepath.Join(dir, "dataplane.ready")
+	if err := os.WriteFile(readyFile, []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write readyFile: %v", err)
+	}
+
+	linkPorts := freePorts(t, "127.0.27.1", 3)
+	daemonYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+admin:
+  socket: %s
+dataplane:
+  verify_sysctls: false
+  ready_file: %s
+links:
+  - name: sbx0
+    principal: worker-claude
+    subnet: 127.0.27.0/28
+    gateway_ip: 127.0.27.1
+    https_port: %d
+    http_port: %d
+    dns_port: %d
+rules:
+  - id: r1
+    principal: worker-claude
+    effect: allow
+    hosts: [api.anthropic.com]
+    ports: [443]
+`, certPath, keyPath, auditDir, sockPath, readyFile, linkPorts[0], linkPorts[1], linkPorts[2])
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(daemonYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- serveDaemon(ctx, cfgPath, "/proc/sys", &bytes.Buffer{}, &bytes.Buffer{})
+	}()
+
+	client := admin.NewClient(sockPath)
+	t.Cleanup(client.Close)
+	deadline := time.Now().Add(2 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		if st, err := client.Status(context.Background()); err == nil && st.AuditHealthy {
+			ready = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !ready {
+		cancel()
+		<-done
+		t.Fatal("daemon did not become ready")
+	}
+
+	g, err := client.CreateGrant(context.Background(), admin.GrantRequest{
+		Principal: "worker-claude",
+		Host:      "login.example.test",
+		Port:      443,
+		TTL:       "120ms",
+	})
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("CreateGrant: %v", err)
+	}
+
+	// Wait past expiry and several pruner ticks (50ms) so any duplicate emission would be caught.
+	time.Sleep(320 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serveDaemon shutdown: %v", err)
+	}
+
+	entries, err := filepath.Glob(filepath.Join(auditDir, "*.jsonl"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("glob audit jsonl: %v (entries=%v)", err, entries)
+	}
+	var createdEvents, expiredEvents []audit.Event
+	for _, p := range entries {
+		raw, rErr := os.ReadFile(p)
+		if rErr != nil {
+			t.Fatalf("read audit %s: %v", p, rErr)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line == "" {
+				continue
+			}
+			var ev audit.Event
+			if uErr := json.Unmarshal([]byte(line), &ev); uErr != nil {
+				t.Fatalf("unmarshal audit line %q: %v", line, uErr)
+			}
+			if ev.Kind == audit.KindGrant && ev.GrantID == g.ID {
+				switch ev.Reason {
+				case "grant-created":
+					createdEvents = append(createdEvents, ev)
+				case "grant-expired":
+					expiredEvents = append(expiredEvents, ev)
+				}
+			}
+		}
+	}
+
+	wantExpires := g.ExpiresAt.UTC().Format(time.RFC3339)
+	if len(createdEvents) != 1 {
+		t.Fatalf("want 1 grant-created event, got %d", len(createdEvents))
+	}
+	ce := createdEvents[0]
+	if ce.TTL != "120ms" || ce.ExpiresAt != wantExpires {
+		t.Fatalf("grant-created ttl=%q expires_at=%q, want ttl=%q expires_at=%q", ce.TTL, ce.ExpiresAt, "120ms", wantExpires)
+	}
+	if _, err := time.Parse(time.RFC3339, ce.ExpiresAt); err != nil {
+		t.Fatalf("grant-created expires_at %q is not RFC3339: %v", ce.ExpiresAt, err)
+	}
+
+	if len(expiredEvents) != 1 {
+		t.Fatalf("want exactly 1 grant-expired event, got %d", len(expiredEvents))
+	}
+	ee := expiredEvents[0]
+	if ee.Principal != "worker-claude" || ee.Host != "login.example.test" || ee.Port != 443 || ee.ExpiresAt != wantExpires {
+		t.Fatalf("unexpected grant-expired event: %+v", ee)
+	}
+}

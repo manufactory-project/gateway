@@ -73,6 +73,8 @@ type Event struct {
 	Reason     string    `json:"reason,omitempty"`
 	RuleID     string    `json:"rule_id,omitempty"`
 	GrantID    string    `json:"grant_id,omitempty"`
+	TTL        string    `json:"ttl,omitempty"`
+	ExpiresAt  string    `json:"expires_at,omitempty"`
 	FlowID     string    `json:"flow_id,omitempty"`
 	Secrets    []string  `json:"secrets,omitempty"`
 	BytesOut   int64     `json:"bytes_out,omitempty"`
@@ -378,6 +380,12 @@ func sanitizeEvent(ev Event, now time.Time) Event {
 	}
 	if ev.Error != "" {
 		ev.Error = EscapeString(ev.Error)
+	}
+	if ev.TTL != "" {
+		ev.TTL = EscapeString(ev.TTL)
+	}
+	if ev.ExpiresAt != "" {
+		ev.ExpiresAt = EscapeString(ev.ExpiresAt)
 	}
 	return ev
 }

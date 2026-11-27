@@ -49,7 +49,7 @@ type Store struct {
 	gen       uint64
 	grants    map[string]Grant
 	onReload  []func(prev, next *Snapshot, wipedGrantIDs []string)
-	onExpired []func(grantID string)
+	onExpired []func(grant Grant)
 }
 
 // NewStore loads path once and returns a Store holding the initial snapshot.
@@ -92,8 +92,8 @@ func (s *Store) OnReload(fn func(prev, next *Snapshot, wipedGrantIDs []string)) 
 }
 
 // SetOnGrantExpired registers a callback invoked when a grant is pruned on TTL expiry.
-// Multiple callbacks may be registered (e.g. one per link server).
-func (s *Store) SetOnGrantExpired(fn func(grantID string)) {
+// Multiple callbacks may be registered (e.g. one per link server and audit wiring).
+func (s *Store) SetOnGrantExpired(fn func(grant Grant)) {
 	if fn == nil {
 		return
 	}
@@ -297,12 +297,12 @@ func (s *Store) RevokeGrant(id string) bool {
 func (s *Store) ActiveGrants() []Grant {
 	now := s.now().UTC()
 	s.mu.Lock()
-	var expired []string
+	var expired []Grant
 	out := make([]Grant, 0, len(s.grants))
 	for id, g := range s.grants {
 		if !g.ExpiresAt.After(now) {
 			delete(s.grants, id)
-			expired = append(expired, id)
+			expired = append(expired, g)
 			continue
 		}
 		out = append(out, g)
@@ -310,9 +310,9 @@ func (s *Store) ActiveGrants() []Grant {
 	cbs := slices.Clone(s.onExpired)
 	s.mu.Unlock()
 
-	for _, id := range expired {
+	for _, g := range expired {
 		for _, cb := range cbs {
-			cb(id)
+			cb(g)
 		}
 	}
 	return out
@@ -322,22 +322,24 @@ func (s *Store) ActiveGrants() []Grant {
 func (s *Store) PruneExpiredGrants() []string {
 	now := s.now().UTC()
 	s.mu.Lock()
-	var expired []string
+	var expired []Grant
 	for id, g := range s.grants {
 		if !g.ExpiresAt.After(now) {
 			delete(s.grants, id)
-			expired = append(expired, id)
+			expired = append(expired, g)
 		}
 	}
 	cbs := slices.Clone(s.onExpired)
 	s.mu.Unlock()
 
-	for _, id := range expired {
+	ids := make([]string, 0, len(expired))
+	for _, g := range expired {
+		ids = append(ids, g.ID)
 		for _, cb := range cbs {
-			cb(id)
+			cb(g)
 		}
 	}
-	return expired
+	return ids
 }
 
 // RunGrantPruner periodically prunes expired grants until ctx is cancelled.

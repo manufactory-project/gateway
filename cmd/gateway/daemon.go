@@ -128,7 +128,6 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	if err != nil {
 		return err
 	}
-
 	flows := proxy.NewFlowRegistry()
 	collector := metrics.NewCollector(metrics.Options{
 		ActiveFlows:  flows.Count,
@@ -151,6 +150,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	if err != nil {
 		return err
 	}
+	registerGrantExpiredAudit(store, auditWriter, stderr)
 
 	eval := policy.NewEvaluator(store)
 	alloc, err := gwdns.NewAllocator(cfg.FakePrefix)
@@ -308,6 +308,24 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		}
 	}
 	return shutdownAll()
+}
+
+func registerGrantExpiredAudit(store *config.Store, auditWriter *audit.Writer, stderr io.Writer) {
+	store.SetOnGrantExpired(func(g config.Grant) {
+		if aErr := auditWriter.WriteSync(audit.Event{
+			Kind:      audit.KindGrant,
+			Principal: g.Principal,
+			Host:      g.Host,
+			Port:      int(g.Port),
+			GrantID:   g.ID,
+			ExpiresAt: g.ExpiresAt.UTC().Format(time.RFC3339),
+			Reason:    "grant-expired",
+		}); aErr != nil {
+			if _, wErr := fmt.Fprintf(stderr, "gateway: grant-expired audit write failed: %v\n", aErr); wErr != nil {
+				return
+			}
+		}
+	})
 }
 
 type adminFlowAdapter struct {

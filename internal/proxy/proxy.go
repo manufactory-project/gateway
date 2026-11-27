@@ -111,8 +111,8 @@ func NewServer(opts Options) (*Server, error) {
 	}
 
 	opts.Store.OnReload(s.onConfigReload)
-	opts.Store.SetOnGrantExpired(func(grantID string) {
-		s.flows.RevokeByGrant(grantID)
+	opts.Store.SetOnGrantExpired(func(g config.Grant) {
+		s.flows.RevokeByGrant(g.ID)
 	})
 	return s, nil
 }

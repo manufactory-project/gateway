@@ -326,6 +326,8 @@ func (s *Server) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 		Host:      g.Host,
 		Port:      int(g.Port),
 		GrantID:   g.ID,
+		TTL:       ttl.String(),
+		ExpiresAt: g.ExpiresAt.UTC().Format(time.RFC3339),
 		Effect:    audit.EffectAllow,
 		Reason:    "grant-created",
 	}); err != nil {

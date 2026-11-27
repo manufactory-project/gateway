@@ -273,7 +273,7 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 
 	// Verify grant TTL expiry fires callback cleanly.
 	var expiredID string
-	store.SetOnGrantExpired(func(id string) { expiredID = id })
+	store.SetOnGrantExpired(func(g config.Grant) { expiredID = g.ID })
 	g2, err := store.AddGrant("worker-codex", "auth.openai.com", 443, nil, nil, 1*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant g2: %v", err)
@@ -357,8 +357,8 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	// Multiple SetOnGrantExpired callbacks (e.g. across links) must ALL fire on expiry via a single RunGrantPruner loop.
 	cb1Ch := make(chan string, 2)
 	cb2Ch := make(chan string, 2)
-	store.SetOnGrantExpired(func(id string) { cb1Ch <- id })
-	store.SetOnGrantExpired(func(id string) { cb2Ch <- id })
+	store.SetOnGrantExpired(func(g config.Grant) { cb1Ch <- g.ID })
+	store.SetOnGrantExpired(func(g config.Grant) { cb2Ch <- g.ID })
 	gExp, err := store.AddGrant("worker-claude", "exp.example.com", 443, nil, nil, time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant exp: %v", err)
