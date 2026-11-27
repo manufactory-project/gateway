@@ -3,12 +3,18 @@ package proxy_test
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/tls"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/manufactory-project/gateway/internal/netguard"
 )
 
 func wsEchoHandler(w http.ResponseWriter, r *http.Request) {
@@ -215,5 +221,125 @@ func TestWebSocketUpstreamNonWS101Returns502(t *testing.T) {
 	}
 	if !sawNonWS101 {
 		t.Fatal("missing audit record for unexpected-101-non-websocket")
+	}
+}
+
+func TestWebSocketGuestDisconnectDuringHandshakeClosesUpstreamAndUnregistersFlow(t *testing.T) {
+	reqReceived := make(chan struct{}, 2)
+	upClosed := make(chan struct{}, 2)
+
+	rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen silent ws upstream: %v", err)
+	}
+	silentPort := tcpPort(t, rawLn.Addr())
+
+	const host = "ws-silent.example.com"
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{host},
+		RulesYAML: `
+  - id: allow-ws-silent
+    principal: worker-test
+    effect: allow
+    hosts: [ws-silent.example.com]
+    ports: [443]
+    allow_websocket: true
+`,
+		DialOverride: func(guard *netguard.Dialer, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return func(ctx context.Context, network, addr string) (net.Conn, error) {
+				h, _, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				return guard.DialHost(ctx, network, h, silentPort)
+			}
+		},
+	})
+
+	tlsLn := tls.NewListener(rawLn, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{makeSignedServerCert(t, testUpstreamCA, []string{host})},
+	})
+	var (
+		upMu    sync.Mutex
+		upConns []net.Conn
+		upWG    sync.WaitGroup
+	)
+	upWG.Add(1)
+	go func() {
+		defer upWG.Done()
+		for {
+			c, aErr := tlsLn.Accept()
+			if aErr != nil {
+				return
+			}
+			upMu.Lock()
+			upConns = append(upConns, c)
+			upMu.Unlock()
+			upWG.Add(1)
+			go func(conn net.Conn) {
+				defer upWG.Done()
+				defer func() {
+					if cErr := conn.Close(); cErr != nil {
+						return
+					}
+				}()
+				br := bufio.NewReader(conn)
+				req, rErr := http.ReadRequest(br)
+				if rErr != nil {
+					return
+				}
+				if cErr := req.Body.Close(); cErr != nil {
+					return
+				}
+				reqReceived <- struct{}{}
+				var buf [1]byte
+				if _, rErr := br.Read(buf[:]); rErr != nil {
+					upClosed <- struct{}{}
+				}
+			}(c)
+		}
+	}()
+	t.Cleanup(func() {
+		if cErr := tlsLn.Close(); cErr != nil {
+			t.Logf("close silent tlsLn: %v", cErr)
+		}
+		upMu.Lock()
+		for _, c := range upConns {
+			if cErr := c.Close(); cErr != nil {
+				continue
+			}
+		}
+		upMu.Unlock()
+		upWG.Wait()
+	})
+
+	guestConn := gw.DialTLS(t, host)
+	if _, err := io.WriteString(guestConn, "GET /ws-hang HTTP/1.1\r\nHost: "+host+"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"); err != nil {
+		t.Fatalf("write WS upgrade: %v", err)
+	}
+	select {
+	case <-reqReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for silent upstream to receive WS upgrade")
+	}
+
+	// Guest disconnects while upstream never answers.
+	if err := guestConn.Close(); err != nil {
+		t.Fatalf("close guestConn: %v", err)
+	}
+
+	select {
+	case <-upClosed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream connection remained open after guest disconnected during WS handshake")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for gw.Flows.Count() != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if cnt := gw.Flows.Count(); cnt != 0 {
+		t.Fatalf("flow remained in registry after guest disconnect during WS handshake: count=%d", cnt)
 	}
 }

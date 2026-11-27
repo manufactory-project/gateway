@@ -12,7 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
+
+const wsHandshakeTimeout = 30 * time.Second
 
 var errWSEgressCapExceeded = errors.New("websocket egress byte cap exceeded")
 
@@ -32,15 +35,12 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	}
 
 	outReq := buildWSUpgradeRequest(rc)
-	if err := outReq.Write(upConn); err != nil {
-		rc.auditCompleted(http.StatusBadGateway, 0, 0, err.Error())
-		http.Error(w, "upstream write failed", http.StatusBadGateway)
-		return
-	}
-
-	upReader := bufio.NewReader(upConn)
-	resp, err := http.ReadResponse(upReader, outReq)
+	upReader, resp, err := performWSHandshake(rc.r.Context(), upConn, outReq, wsHandshakeTimeout)
 	if err != nil {
+		if rc.r.Context().Err() != nil && !af.isTornDown() {
+			rc.auditCompleted(statusClientClosedRequest, 0, 0, "client-canceled")
+			return
+		}
 		rc.auditCompleted(http.StatusBadGateway, 0, 0, err.Error())
 		http.Error(w, "upstream response failed", http.StatusBadGateway)
 		return
@@ -118,6 +118,30 @@ func buildWSUpgradeRequest(rc *reqContext) *http.Request {
 	outReq.Header.Set("Connection", "Upgrade")
 	outReq.Header.Set("Upgrade", "websocket")
 	return outReq
+}
+
+func performWSHandshake(ctx context.Context, upConn net.Conn, outReq *http.Request, timeout time.Duration) (*bufio.Reader, *http.Response, error) {
+	stopCancel := context.AfterFunc(ctx, func() {
+		closeQuietly(upConn)
+	})
+	defer stopCancel()
+
+	if err := upConn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, nil, err
+	}
+	if err := outReq.Write(upConn); err != nil {
+		return nil, nil, err
+	}
+	upReader := bufio.NewReader(upConn)
+	resp, err := http.ReadResponse(upReader, outReq)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := upConn.SetDeadline(time.Time{}); err != nil {
+		closeQuietly(resp.Body)
+		return nil, nil, err
+	}
+	return upReader, resp, nil
 }
 
 func handleNonWSResponse(w http.ResponseWriter, rc *reqContext, resp *http.Response) {
