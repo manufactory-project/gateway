@@ -1,6 +1,7 @@
 package netsetup_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,5 +181,22 @@ func TestIPCommandsAndSysctlsAndDnsmasq(t *testing.T) {
 	}
 	if err := netsetup.VerifySysctls(procRoot, cfg); err == nil {
 		t.Fatal("VerifySysctls must fail when net.ipv4.ip_forward=1")
+	}
+}
+
+func TestApplyRemovesStaleReadyFileBeforeFailing(t *testing.T) {
+	cfg := loadExampleConfig(t)
+	staleReady := filepath.Join(t.TempDir(), "dataplane.ready")
+	if err := os.WriteFile(staleReady, []byte("stale\n"), 0o644); err != nil {
+		t.Fatalf("write stale ready file: %v", err)
+	}
+	cfg.Dataplane.ReadyFile = staleReady
+
+	// Apply fails as non-root (or missing sbx0 interface), and MUST have deleted staleReady first.
+	if err := netsetup.Apply(context.Background(), cfg); err == nil {
+		t.Fatal("expected Apply to fail in unprivileged test environment")
+	}
+	if _, err := os.Stat(staleReady); !os.IsNotExist(err) {
+		t.Fatalf("stale ready_file was not removed before Apply failed: stat err=%v", err)
 	}
 }

@@ -27,6 +27,7 @@ audit:
 metrics:
   listen: 127.0.0.1:9102
 dataplane:
+  ready_file: /run/gatewayd/dataplane.ready
   dhcp:
     user: dnsmasq
     lease_file: /var/lib/gatewayd/dnsmasq.leases
@@ -148,6 +149,16 @@ func TestConfigValidationInvariants(t *testing.T) {
 			name:      "reject cross-rule websocket on bound host",
 			yaml:      validYAML + "\n  - id: conflict-ws\n    principal: worker-claude\n    effect: allow\n    hosts: [forge.internal.example]\n    ports: [443]\n    allow_websocket: true\n",
 			wantError: "conflicts with binding",
+		},
+		{
+			name:      "reject duplicate placeholder across bindings",
+			yaml:      validYAML + "\n  - id: dup-ph\n    principal: worker-codex\n    effect: allow\n    hosts: [api.example.com]\n    ports: [443]\n    bindings:\n      - name: b2\n        host: api.example.com\n        header: Authorization\n        scheme: bearer\n        placeholder: mf_ph_forgejo\n        secret_file: /run/credentials/gatewayd/other\n",
+			wantError: "duplicate placeholder",
+		},
+		{
+			name:      "reject missing ready_file when Linux link exists",
+			yaml:      strings.Replace(validYAML, "  ready_file: /run/gatewayd/dataplane.ready\n", "", 1),
+			wantError: "dataplane.ready_file",
 		},
 	}
 

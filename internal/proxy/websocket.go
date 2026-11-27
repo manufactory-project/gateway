@@ -76,9 +76,14 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 		return
 	}
 
-	// Non-101 responses (including 3xx redirects) are returned directly without following.
+	// Non-WebSocket responses: never forward a non-WebSocket 101 Switching Protocols.
 	if resp.StatusCode != http.StatusSwitchingProtocols || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
 		defer closeQuietly(resp.Body)
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, "unexpected-101-non-websocket")
+			http.Error(w, "unexpected protocol upgrade", http.StatusBadGateway)
+			return
+		}
 		copyEndToEndHeaders(w.Header(), resp.Header, false)
 		w.WriteHeader(resp.StatusCode)
 		bytesIn, copyErr := copyStreaming(w, resp.Body)

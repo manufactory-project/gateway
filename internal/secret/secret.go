@@ -165,9 +165,10 @@ func SweepHeaders(hdr http.Header) {
 	}
 }
 
-// ResolveHostPairs resolves all bindings declared for a host so response scrubbing
+// ResolveHostPairs resolves every binding declared for a host so response scrubbing
 // catches echoed bound secrets even on requests that did not send an auth header.
-func ResolveHostPairs(bindings []config.BindingConfig, existing []Pair, resolver Resolver) []Pair {
+// It fails closed (returning an error) if any binding's secret cannot be resolved.
+func ResolveHostPairs(bindings []config.BindingConfig, existing []Pair, resolver Resolver) ([]Pair, error) {
 	if resolver == nil {
 		resolver = FileResolver{}
 	}
@@ -183,7 +184,7 @@ func ResolveHostPairs(bindings []config.BindingConfig, existing []Pair, resolver
 		}
 		val, err := resolver.Resolve(b.SecretFile)
 		if err != nil {
-			continue
+			return nil, &ResolveError{Name: b.Name, Cause: "resolve for response redaction failed", Err: err}
 		}
 		seen[b.Placeholder] = true
 		out = append(out, Pair{
@@ -192,7 +193,7 @@ func ResolveHostPairs(bindings []config.BindingConfig, existing []Pair, resolver
 			Value:       val,
 		})
 	}
-	return out
+	return out, nil
 }
 
 func matchesSchemeAndPlaceholder(val, scheme, placeholder string) bool {

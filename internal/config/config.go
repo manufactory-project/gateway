@@ -296,6 +296,9 @@ func validate(cfg *Config) error {
 		return err
 	}
 	if hasLinuxIf {
+		if cfg.Dataplane.ReadyFile == "" || !filepath.IsAbs(cfg.Dataplane.ReadyFile) {
+			return fmt.Errorf("dataplane.ready_file %q must be an absolute path when any Linux link interface is configured", cfg.Dataplane.ReadyFile)
+		}
 		if err := validateDHCP(cfg.Dataplane.DHCP); err != nil {
 			return err
 		}
@@ -518,6 +521,7 @@ func validateDHCP(d DHCPConfig) error {
 
 func validateRules(cfg *Config, declaredPrincipals map[string]bool) error {
 	seenIDs := make(map[string]bool, len(cfg.Rules))
+	seenPlaceholders := make(map[string]string)
 	type principalHost struct {
 		principal string
 		host      string
@@ -615,6 +619,10 @@ func validateRules(cfg *Config, declaredPrincipals map[string]bool) error {
 				return fmt.Errorf("rules[%s].bindings: duplicate binding name %q", r.ID, b.Name)
 			}
 			seenBindings[b.Name] = true
+			if prevRule, dup := seenPlaceholders[b.Placeholder]; dup {
+				return fmt.Errorf("rules[%s].bindings[%s]: duplicate placeholder %q (already used by rule %q)", r.ID, b.Name, b.Placeholder, prevRule)
+			}
+			seenPlaceholders[b.Placeholder] = r.ID
 			boundHosts[principalHost{principal: r.Principal, host: b.Host}] = r.ID
 		}
 	}

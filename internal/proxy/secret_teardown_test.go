@@ -176,7 +176,7 @@ func TestProxySecretsIdentityRedactionAndLiveTeardown(t *testing.T) {
 	upSrv.EnableHTTP2 = true
 	upSrv.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{makeSignedServerCert(t, upCA, []string{"code.lan.example", "unbound.example.com", "grant.example.com", "ws.example.com"})},
+		Certificates: []tls.Certificate{makeSignedServerCert(t, upCA, []string{"code.lan.example", "badsec.lan.example", "unbound.example.com", "grant.example.com", "ws.example.com"})},
 	}
 	upSrv.StartTLS()
 	t.Cleanup(upSrv.Close)
@@ -193,6 +193,7 @@ audit:
   dir: %s
 records:
   code.lan.example: 127.0.0.1
+  badsec.lan.example: 127.0.0.1
   unbound.example.com: 127.0.0.1
   grant.example.com: 127.0.0.1
   ws.example.com: 127.0.0.1
@@ -217,8 +218,14 @@ rules:
         scheme: basic
         placeholder: mf_ph_forge
         secret_file: %s
+  - id: allow-badsec
+    principal: worker-claude
+    effect: allow
+    hosts: [badsec.lan.example]
+    ports: [443]
+    bindings:
       - name: forge-bad
-        host: code.lan.example
+        host: badsec.lan.example
         header: X-Bad-Token
         scheme: raw
         placeholder: mf_ph_bad
@@ -403,12 +410,13 @@ rules:
 
 	// --- 3. Corrupt/interior-newline secret fails closed 403 WITHOUT dialing upstream ---
 	beforeBad := upReceived.Load()
-	reqBad, err := http.NewRequest(http.MethodGet, "https://code.lan.example/echo", nil)
+	cBad := makeClient("badsec.lan.example", false)
+	reqBad, err := http.NewRequest(http.MethodGet, "https://badsec.lan.example/echo", nil)
 	if err != nil {
 		t.Fatalf("NewRequest bad secret: %v", err)
 	}
 	reqBad.Header.Set("X-Bad-Token", "mf_ph_bad")
-	rBad, err := cForge.Do(reqBad)
+	rBad, err := cBad.Do(reqBad)
 	if err != nil {
 		t.Fatalf("Do bad secret: %v", err)
 	}

@@ -582,17 +582,22 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 		return
 	}
 
-	// 13. Bound-host response enforcement: fail closed 502 on compressed Content-Encoding,
-	// strip Content-Length, and scrub headers + streaming body + trailers (NOW.md:61).
+	// 13. Bound-host response enforcement: fail closed 502 on any non-identity
+	// Content-Encoding token or any unresolvable bound secret, strip Content-Length,
+	// and scrub headers + streaming body + trailers (NOW.md:61).
 	var redactor *secret.Redactor
 	if dec.HasBindings {
-		ce := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
-		if ce != "" && !strings.EqualFold(ce, "identity") {
+		if !isIdentityContentEncoding(resp.Header.Values("Content-Encoding")) {
 			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "compressed-response-on-bound-host")
 			http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
 			return
 		}
-		hostPairs := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, host), subPairs, s.secrets)
+		hostPairs, pairErr := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, host), subPairs, s.secrets)
+		if pairErr != nil {
+			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "redaction-secret-unresolved")
+			http.Error(w, "bound secret unavailable for response redaction", http.StatusBadGateway)
+			return
+		}
 		redactor = secret.NewRedactor(hostPairs)
 	}
 
@@ -664,6 +669,21 @@ func (s *Server) auditCompleted(srcIP string, r *http.Request, dstPort uint16, h
 	if s.onRequest != nil {
 		s.onRequest(s.link.Principal, string(audit.EffectAllow), status)
 	}
+}
+
+func isIdentityContentEncoding(vals []string) bool {
+	for _, v := range vals {
+		for _, tok := range strings.Split(v, ",") {
+			t := strings.TrimSpace(tok)
+			if t == "" {
+				continue
+			}
+			if !strings.EqualFold(t, "identity") {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validateOriginForm(r *http.Request) string {

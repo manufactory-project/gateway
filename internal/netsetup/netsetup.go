@@ -256,10 +256,17 @@ func VerifySysctls(procSysRoot string, cfg *config.Config) error {
 }
 
 // Apply executes netsetup as root (invoked from systemd ExecStartPre=+):
-// configures interfaces/routes/rules, writes sysctls, writes the dnsmasq config,
-// loads the nftables ruleset atomically via `nft -f -`, verifies table inet gw
-// and its chains exist, and writes ready_file if configured.
+// removes any stale ready_file first, configures interfaces/routes/rules, writes
+// sysctls, writes the dnsmasq config, loads the nftables ruleset atomically via
+// `nft -f -`, verifies table inet gw and its chains exist, and writes ready_file
+// last only after everything has succeeded.
 func Apply(ctx context.Context, cfg *config.Config) error {
+	if cfg.Dataplane.ReadyFile != "" {
+		if err := os.Remove(cfg.Dataplane.ReadyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("netsetup: remove stale ready_file %s: %w", cfg.Dataplane.ReadyFile, err)
+		}
+	}
+
 	ruleset, err := RenderNftables(cfg)
 	if err != nil {
 		return err
