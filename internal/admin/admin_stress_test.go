@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math/big"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -492,7 +494,7 @@ rules:
 	bgWG.Add(2)
 	go func() {
 		defer bgWG.Done()
-		store.WatchSIGHUP(bgCtx, func(_ *config.Snapshot, _ []string, reloadErr error) {
+		store.WatchSIGHUP(bgCtx, func(_ *config.Snapshot, _ []string, _ int, reloadErr error) {
 			col.ObserveReload(reloadErr == nil)
 		})
 	}()
@@ -820,5 +822,254 @@ links:
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("POST /v1/revoke %s status = %d, want 400", body, resp.StatusCode)
 		}
+	}
+}
+
+func readAuditEvents(t *testing.T, dir string) []audit.Event {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir audit: %v", err)
+	}
+	var events []audit.Event
+	for _, ent := range entries {
+		if !strings.HasSuffix(ent.Name(), ".jsonl") {
+			continue
+		}
+		raw, rErr := os.ReadFile(filepath.Join(dir, ent.Name()))
+		if rErr != nil {
+			t.Fatalf("read audit %s: %v", ent.Name(), rErr)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line == "" {
+				continue
+			}
+			var ev audit.Event
+			if uErr := json.Unmarshal([]byte(line), &ev); uErr != nil {
+				t.Fatalf("unmarshal audit line %q: %v", line, uErr)
+			}
+			events = append(events, ev)
+		}
+	}
+	return events
+}
+
+func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.CA, httpsAddr, upAddr string) (cfgPath string, admClient *admin.Client, openStream func(host, path string) *http.Response) {
+	t.Helper()
+	dir := filepath.Dir(auditDir)
+	cfgPath = filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(baseYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := aw.Close(); err != nil {
+			t.Errorf("audit.Close: %v", err)
+		}
+	})
+	flows := proxy.NewFlowRegistry()
+	pSrv, err := proxy.NewServer(proxy.Options{
+		Link: store.Current().Config.Links[0], Store: store, Evaluator: policy.NewEvaluator(store),
+		Leaves: ca.NewLeafCache(rootCA), Audit: aw, Flows: flows,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, upAddr)
+		},
+	})
+	if err != nil {
+		t.Fatalf("proxy.NewServer: %v", err)
+	}
+	if err := pSrv.Start(); err != nil {
+		t.Fatalf("proxy.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := pSrv.Shutdown(ctx); err != nil {
+			t.Errorf("proxy.Shutdown: %v", err)
+		}
+	})
+	sockPath := filepath.Join(dir, "admin.sock")
+	aSrv, err := admin.NewServer(admin.Options{
+		SocketPath: sockPath, Store: store, Flows: testFlowAdapter{flows: flows}, Audit: aw,
+	})
+	if err != nil {
+		t.Fatalf("admin.NewServer: %v", err)
+	}
+	if err := aSrv.Start(); err != nil {
+		t.Fatalf("admin.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := aSrv.Shutdown(ctx); err != nil {
+			t.Errorf("admin.Shutdown: %v", err)
+		}
+	})
+	mitmRoots := x509.NewCertPool()
+	if !mitmRoots.AppendCertsFromPEM(rootCA.CertPEM) {
+		t.Fatal("append MITM CA")
+	}
+	openStream = func(host, path string) *http.Response {
+		tr := &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, httpsAddr)
+			},
+			TLSClientConfig: &tls.Config{ServerName: host, RootCAs: mitmRoots, MinVersion: tls.VersionTLS12},
+		}
+		t.Cleanup(tr.CloseIdleConnections)
+		resp, gErr := (&http.Client{Transport: tr}).Get("https://" + host + path)
+		if gErr != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("openStream %s%s: resp=%+v err=%v", host, path, resp, gErr)
+		}
+		return resp
+	}
+	return cfgPath, admin.NewClient(sockPath), openStream
+}
+
+func drainStreamResp(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Logf("stream ended on teardown: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("close stream body: %v", err)
+	}
+}
+
+func TestGrantRevokeAndReloadAuditCompleteness(t *testing.T) {
+	dir := t.TempDir()
+	auditDir := filepath.Join(dir, "audit")
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	rootCA, err := ca.Init(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	holdRelease := make(chan struct{})
+	streamOpen := make(chan struct{}, 8)
+	upSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, "data: hold\n\n"); err != nil {
+			return
+		}
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return
+		}
+		streamOpen <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-holdRelease:
+		}
+	}))
+	upSrv.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{signLeaf(t, testUpstreamCA, []string{"grant.example.com", "rule.example.com"})},
+	}
+	upSrv.StartTLS()
+	t.Cleanup(upSrv.Close)
+	t.Cleanup(func() { close(holdRelease) })
+
+	ports := freePorts(t, "127.0.24.1", 3)
+	httpsAddr := fmt.Sprintf("127.0.24.1:%d", ports[0])
+	baseYAML := fmt.Sprintf(`ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+links:
+  - name: sbx0
+    principal: worker-a
+    subnet: 127.0.24.0/28
+    gateway_ip: 127.0.24.1
+    https_port: %d
+    http_port: %d
+    dns_port: %d
+rules:
+  - id: allow-rule
+    principal: worker-a
+    effect: allow
+    hosts: [rule.example.com]
+    ports: [443]
+`, certPath, keyPath, auditDir, ports[0], ports[1], ports[2])
+
+	cfgPath, admClient, openStream := startAdminAuditHarness(t, baseYAML, auditDir, rootCA, httpsAddr, upSrv.Listener.Addr().String())
+
+	// 1. Create grant with methods, paths, and allow_websocket; open stream; delete grant.
+	g, err := admClient.CreateGrant(context.Background(), admin.GrantRequest{
+		Principal: "worker-a", Host: "grant.example.com", Port: 443,
+		Methods: []string{"GET", "POST"}, Paths: []string{"/api/**"},
+		TTL: "5m", AllowWebSocket: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateGrant: %v", err)
+	}
+	r1 := openStream("grant.example.com", "/api/stream")
+	<-streamOpen
+	if _, err := admClient.DeleteGrant(context.Background(), g.ID); err != nil {
+		t.Fatalf("DeleteGrant: %v", err)
+	}
+	drainStreamResp(t, r1)
+
+	// 2. Open stream on allow-rule, then revoke principal.
+	r2 := openStream("rule.example.com", "/hold")
+	<-streamOpen
+	if _, err := admClient.Revoke(context.Background(), admin.RevokeRequest{Principal: "worker-a"}); err != nil {
+		t.Fatalf("Revoke principal: %v", err)
+	}
+	drainStreamResp(t, r2)
+
+	// 3. Open stream on allow-rule, then reload removing allow-rule.
+	r3 := openStream("rule.example.com", "/hold")
+	<-streamOpen
+	noRulesYAML := baseYAML[:strings.Index(baseYAML, "rules:\n")]
+	if err := os.WriteFile(cfgPath, []byte(noRulesYAML), 0o600); err != nil {
+		t.Fatalf("write no-rules config: %v", err)
+	}
+	if _, err := admClient.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	drainStreamResp(t, r3)
+
+	var sawCreated, sawDeleted, sawRevoke, sawReload bool
+	for _, ev := range readAuditEvents(t, auditDir) {
+		switch ev.Reason {
+		case "grant-created":
+			if ev.GrantID == g.ID {
+				sawCreated = true
+				if !slices.Equal(ev.Methods, []string{"GET", "POST"}) || !slices.Equal(ev.Paths, []string{"/api/**"}) || ev.AllowWebSocket == nil || !*ev.AllowWebSocket {
+					t.Fatalf("grant-created audit missing scope: methods=%v paths=%v allow_ws=%v", ev.Methods, ev.Paths, ev.AllowWebSocket)
+				}
+			}
+		case "grant-deleted":
+			if ev.GrantID == g.ID {
+				sawDeleted = true
+				if ev.Principal != "worker-a" || ev.Host != "grant.example.com" || ev.Port != 443 || ev.RevokedFlows == nil || *ev.RevokedFlows != 1 {
+					t.Fatalf("grant-deleted audit incomplete: %+v", ev)
+				}
+			}
+		case "revoke-principal":
+			sawRevoke = true
+			if ev.RevokedFlows == nil || *ev.RevokedFlows != 1 {
+				t.Fatalf("revoke-principal audit revoked_flows = %v, want 1", ev.RevokedFlows)
+			}
+		case "reload":
+			sawReload = true
+			if ev.RevokedFlows == nil || *ev.RevokedFlows != 1 {
+				t.Fatalf("reload audit revoked_flows = %v, want 1", ev.RevokedFlows)
+			}
+		}
+	}
+	if !sawCreated || !sawDeleted || !sawRevoke || !sawReload {
+		t.Fatalf("missing audit events: created=%v deleted=%v revoke=%v reload=%v", sawCreated, sawDeleted, sawRevoke, sawReload)
 	}
 }

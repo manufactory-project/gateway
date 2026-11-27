@@ -153,7 +153,7 @@ func TestLiveTeardownOnGrantExpiryRevokeAndReload(t *testing.T) {
 	if err := os.WriteFile(gw.CfgPath, []byte(updatedYAML), 0o600); err != nil {
 		t.Fatalf("write updated config: %v", err)
 	}
-	if _, _, err := gw.Store.Reload(); err != nil {
+	if _, _, _, err := gw.Store.Reload(); err != nil {
 		t.Fatalf("store.Reload: %v", err)
 	}
 	reloadDone := make(chan error, 1)
@@ -252,7 +252,7 @@ func TestRevocationMetricsOnTTLExpiryAndReload(t *testing.T) {
 	if err := os.WriteFile(gw.CfgPath, []byte(updated), 0o600); err != nil {
 		t.Fatalf("write updated config: %v", err)
 	}
-	if _, _, err := gw.Store.Reload(); err != nil {
+	if _, _, _, err := gw.Store.Reload(); err != nil {
 		t.Fatalf("store.Reload: %v", err)
 	}
 	if _, err := io.Copy(io.Discard, rRel.Body); err != nil {
@@ -693,7 +693,7 @@ func TestReloadWithUnprunedExpiredGrantDoesNotDeadlock(t *testing.T) {
 	}
 	reloadDone := make(chan reloadRes, 1)
 	go func() {
-		_, wiped, rErr := gw.Store.Reload()
+		_, wiped, _, rErr := gw.Store.Reload()
 		reloadDone <- reloadRes{wiped: wiped, err: rErr}
 	}()
 	select {
@@ -799,7 +799,7 @@ func TestAdmissionRecheckAfterFlowRegistrationBlocksRevokedRule(t *testing.T) {
 	if err := os.WriteFile(gw.CfgPath, []byte(gw.BaseYAML[:idx]), 0o600); err != nil {
 		t.Fatalf("write empty-rules config: %v", err)
 	}
-	if _, _, err := gw.Store.Reload(); err != nil {
+	if _, _, _, err := gw.Store.Reload(); err != nil {
 		t.Fatalf("Reload: %v", err)
 	}
 

@@ -217,7 +217,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
-	snap, wiped, err := s.store.Reload()
+	snap, wiped, revokedFlows, err := s.store.Reload()
 	if err != nil {
 		if s.metrics != nil {
 			s.metrics.ObserveReload(false)
@@ -237,9 +237,10 @@ func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
 		s.metrics.ObserveReload(true)
 	}
 	if aErr := s.audit.WriteSync(audit.Event{
-		Kind:       audit.KindLifecycle,
-		Reason:     "reload",
-		ConfigHash: snap.Hash,
+		Kind:         audit.KindLifecycle,
+		Reason:       "reload",
+		ConfigHash:   snap.Hash,
+		RevokedFlows: &revokedFlows,
 	}); aErr != nil {
 		writeError(w, http.StatusServiceUnavailable, "audit sink unavailable")
 		return
@@ -294,7 +295,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		revokedFlows = s.flows.RevokeByID(req.FlowID)
 		reason = "revoke-flow"
 	case req.GrantID != "":
-		revokedGrant = s.store.RevokeGrant(req.GrantID)
+		_, revokedGrant = s.store.RevokeGrant(req.GrantID)
 		revokedFlows = s.flows.RevokeByGrant(req.GrantID)
 		reason = "revoke-grant"
 	case req.Principal != "":
@@ -303,12 +304,13 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.audit.WriteSync(audit.Event{
-		Kind:      audit.KindRevoke,
-		Principal: req.Principal,
-		Host:      req.Host,
-		FlowID:    req.FlowID,
-		GrantID:   req.GrantID,
-		Reason:    reason,
+		Kind:         audit.KindRevoke,
+		Principal:    req.Principal,
+		Host:         req.Host,
+		FlowID:       req.FlowID,
+		GrantID:      req.GrantID,
+		RevokedFlows: &revokedFlows,
+		Reason:       reason,
 	}); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "audit sink unavailable")
 		return
@@ -340,16 +342,20 @@ func (s *Server) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	allowWS := g.AllowWebSocket
 	if err := s.audit.WriteSync(audit.Event{
-		Kind:      audit.KindGrant,
-		Principal: g.Principal,
-		Host:      g.Host,
-		Port:      int(g.Port),
-		GrantID:   g.ID,
-		TTL:       ttl.String(),
-		ExpiresAt: g.ExpiresAt.UTC().Format(time.RFC3339),
-		Effect:    audit.EffectAllow,
-		Reason:    "grant-created",
+		Kind:           audit.KindGrant,
+		Principal:      g.Principal,
+		Host:           g.Host,
+		Port:           int(g.Port),
+		Methods:        g.Methods,
+		Paths:          g.Paths,
+		AllowWebSocket: &allowWS,
+		GrantID:        g.ID,
+		TTL:            ttl.String(),
+		ExpiresAt:      g.ExpiresAt.UTC().Format(time.RFC3339),
+		Effect:         audit.EffectAllow,
+		Reason:         "grant-created",
 	}); err != nil {
 		s.store.RevokeGrant(g.ID)
 		writeError(w, http.StatusServiceUnavailable, "audit sink unavailable")
@@ -364,12 +370,16 @@ func (s *Server) handleDeleteGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing grant id")
 		return
 	}
-	existed := s.store.RevokeGrant(id)
+	deletedGrant, existed := s.store.RevokeGrant(id)
 	revokedFlows := s.flows.RevokeByGrant(id)
 	if err := s.audit.WriteSync(audit.Event{
-		Kind:    audit.KindRevoke,
-		GrantID: id,
-		Reason:  "grant-deleted",
+		Kind:         audit.KindRevoke,
+		Principal:    deletedGrant.Principal,
+		Host:         deletedGrant.Host,
+		Port:         int(deletedGrant.Port),
+		GrantID:      id,
+		RevokedFlows: &revokedFlows,
+		Reason:       "grant-deleted",
 	}); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "audit sink unavailable")
 		return

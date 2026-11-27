@@ -123,8 +123,8 @@ func NewServer(opts Options) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) {
-	s.flows.RevokeWhere(func(info FlowInfo) bool {
+func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) int {
+	revoked := s.flows.RevokeWhere(func(info FlowInfo) bool {
 		if info.Link != s.link.Name {
 			return false
 		}
@@ -141,6 +141,7 @@ func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) {
 		return false
 	})
 	s.transport.CloseIdleConnections()
+	return len(revoked)
 }
 
 // Start binds explicit HTTPS and HTTP TCP listeners on link.ParsedGatewayIP.

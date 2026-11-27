@@ -507,7 +507,7 @@ func TestSingleSnapshotRedactionOnReloadToggle(t *testing.T) {
 			if err := os.WriteFile(gwRace.CfgPath, []byte(prefixYAML+rules), 0o600); err != nil {
 				return
 			}
-			if _, _, err := gwRace.Store.Reload(); err != nil {
+			if _, _, _, err := gwRace.Store.Reload(); err != nil {
 				return
 			}
 		}
@@ -549,7 +549,7 @@ func TestSingleSnapshotRedactionOnReloadToggle(t *testing.T) {
 		if err := os.WriteFile(gwRace.CfgPath, []byte(prefixYAML+boundRules), 0o600); err != nil {
 			t.Fatalf("write bound config: %v", err)
 		}
-		if _, _, err := gwRace.Store.Reload(); err != nil {
+		if _, _, _, err := gwRace.Store.Reload(); err != nil {
 			t.Fatalf("Reload bound config: %v", err)
 		}
 		req, err := http.NewRequest(http.MethodGet, "https://race-bind.example.com/check", nil)

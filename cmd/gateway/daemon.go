@@ -235,7 +235,7 @@ func (rt *daemonRuntime) startControl(cfg *config.Config, store *config.Store, f
 	return nil
 }
 
-func handleSIGHUPReload(snap *config.Snapshot, reloadErr error, collector *metrics.Collector, auditWriter *audit.Writer, stderr io.Writer) {
+func handleSIGHUPReload(snap *config.Snapshot, revokedFlows int, reloadErr error, collector *metrics.Collector, auditWriter *audit.Writer, stderr io.Writer) {
 	if reloadErr != nil {
 		collector.ObserveReload(false)
 		if aErr := auditWriter.WriteSync(audit.Event{
@@ -255,9 +255,10 @@ func handleSIGHUPReload(snap *config.Snapshot, reloadErr error, collector *metri
 	}
 	collector.ObserveReload(true)
 	if aErr := auditWriter.WriteSync(audit.Event{
-		Kind:       audit.KindLifecycle,
-		Reason:     "sighup-reload",
-		ConfigHash: snap.Hash,
+		Kind:         audit.KindLifecycle,
+		Reason:       "sighup-reload",
+		ConfigHash:   snap.Hash,
+		RevokedFlows: &revokedFlows,
 	}); aErr != nil {
 		return
 	}
@@ -334,8 +335,8 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	}()
 	go func() {
 		defer bgWG.Done()
-		store.WatchSIGHUP(ctx, func(snap *config.Snapshot, _ []string, reloadErr error) {
-			handleSIGHUPReload(snap, reloadErr, collector, auditWriter, stderr)
+		store.WatchSIGHUP(ctx, func(snap *config.Snapshot, _ []string, revokedFlows int, reloadErr error) {
+			handleSIGHUPReload(snap, revokedFlows, reloadErr, collector, auditWriter, stderr)
 		})
 	}()
 

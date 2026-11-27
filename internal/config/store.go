@@ -50,7 +50,7 @@ type Store struct {
 	gen       uint64
 	grantGen  uint64
 	grants    map[string]Grant
-	onReload  []func(prev, next *Snapshot, wipedGrantIDs []string)
+	onReload  []func(prev, next *Snapshot, wipedGrantIDs []string) int
 	onExpired []func(grant Grant)
 }
 
@@ -96,8 +96,9 @@ func (s *Store) StateToken() (*Snapshot, uint64) {
 	return snap, gg
 }
 
-// OnReload registers a callback invoked after every successful reload.
-func (s *Store) OnReload(fn func(prev, next *Snapshot, wipedGrantIDs []string)) {
+// OnReload registers a callback invoked after every successful reload,
+// returning the number of active flows torn down by that callback.
+func (s *Store) OnReload(fn func(prev, next *Snapshot, wipedGrantIDs []string) int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onReload = append(s.onReload, fn)
@@ -120,13 +121,13 @@ func (s *Store) SetOnGrantExpired(fn func(grant Grant)) {
 // grants remain intact and an error is returned. On success, the snapshot is
 // atomically replaced and all in-memory TTL grants are wiped before reload
 // callbacks run.
-func (s *Store) Reload() (*Snapshot, []string, error) {
+func (s *Store) Reload() (*Snapshot, []string, int, error) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 
 	cfg, hash, err := LoadFile(s.path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	next := &Snapshot{
 		Config:   cfg,
@@ -139,7 +140,7 @@ func (s *Store) Reload() (*Snapshot, []string, error) {
 	if cur != nil && cur.Config != nil {
 		if diffErr := checkReloadImmutable(cur.Config, cfg); diffErr != nil {
 			s.mu.Unlock()
-			return nil, nil, diffErr
+			return nil, nil, 0, diffErr
 		}
 	}
 	prev := s.snap.Swap(next)
@@ -153,10 +154,11 @@ func (s *Store) Reload() (*Snapshot, []string, error) {
 	callbacks := slices.Clone(s.onReload)
 	s.mu.Unlock()
 
+	revokedFlows := 0
 	for _, fn := range callbacks {
-		fn(prev, next, wiped)
+		revokedFlows += fn(prev, next, wiped)
 	}
-	return next, wiped, nil
+	return next, wiped, revokedFlows, nil
 }
 
 func checkReloadImmutable(prev, next *Config) error {
@@ -198,7 +200,7 @@ func checkReloadImmutable(prev, next *Config) error {
 // WatchSIGHUP listens for syscall.SIGHUP until ctx is cancelled, calling Reload
 // on each signal and invoking onResult (if non-nil) with the outcome.
 // It returns only after unregistering its signal channel so callers can join cleanly.
-func (s *Store) WatchSIGHUP(ctx context.Context, onResult func(*Snapshot, []string, error)) {
+func (s *Store) WatchSIGHUP(ctx context.Context, onResult func(*Snapshot, []string, int, error)) {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, syscall.SIGHUP)
 	defer signal.Stop(ch)
@@ -208,9 +210,9 @@ func (s *Store) WatchSIGHUP(ctx context.Context, onResult func(*Snapshot, []stri
 		case <-ctx.Done():
 			return
 		case <-ch:
-			snap, wiped, err := s.Reload()
+			snap, wiped, revokedFlows, err := s.Reload()
 			if onResult != nil {
-				onResult(snap, wiped, err)
+				onResult(snap, wiped, revokedFlows, err)
 			}
 		}
 	}
@@ -305,16 +307,17 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 	return g, nil
 }
 
-// RevokeGrant removes a grant by ID and reports whether it existed.
-func (s *Store) RevokeGrant(id string) bool {
+// RevokeGrant removes a grant by ID and returns the removed grant and whether it existed.
+func (s *Store) RevokeGrant(id string) (Grant, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.grants[id]; !ok {
-		return false
+	g, ok := s.grants[id]
+	if !ok {
+		return Grant{}, false
 	}
 	delete(s.grants, id)
 	s.grantGen++
-	return true
+	return g, true
 }
 
 // ActiveGrants returns all non-expired grants without mutating state or firing callbacks.

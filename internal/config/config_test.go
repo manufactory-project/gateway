@@ -252,7 +252,7 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("invalid: [yaml\n"), 0o600); err != nil {
 		t.Fatalf("write broken yaml: %v", err)
 	}
-	if _, _, err := store.Reload(); err == nil {
+	if _, _, _, err := store.Reload(); err == nil {
 		t.Fatal("expected Reload on broken YAML to fail")
 	}
 	if store.Current().Hash != initialHash {
@@ -273,7 +273,7 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		store.WatchSIGHUP(ctx, func(_ *config.Snapshot, wiped []string, err error) {
+		store.WatchSIGHUP(ctx, func(_ *config.Snapshot, wiped []string, _ int, err error) {
 			if err != nil {
 				t.Errorf("SIGHUP reload error: %v", err)
 				return
@@ -401,7 +401,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 			if err := os.WriteFile(cfgPath, []byte(tc.yaml), 0o600); err != nil {
 				t.Fatalf("write %s yaml: %v", tc.name, err)
 			}
-			if _, _, err := store.Reload(); err == nil {
+			if _, _, _, err := store.Reload(); err == nil {
 				t.Fatalf("expected Reload to refuse %s change", tc.name)
 			}
 			if store.Current().Hash != origHash {
@@ -419,7 +419,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	if err := os.WriteFile(cfgPath, []byte(ruleUpdated), 0o600); err != nil {
 		t.Fatalf("write ruleUpdated: %v", err)
 	}
-	if _, wiped, err := store.Reload(); err != nil || len(wiped) != 1 {
+	if _, wiped, _, err := store.Reload(); err != nil || len(wiped) != 1 {
 		t.Fatalf("rule reload = (wiped=%v, err=%v), want 1 wiped grant and nil err", wiped, err)
 	}
 
@@ -477,12 +477,12 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		}
 	}()
 	for i := 0; i < 15; i++ {
-		if _, _, rErr := store.Reload(); rErr != nil {
+		if _, _, _, rErr := store.Reload(); rErr != nil {
 			t.Fatalf("concurrent Reload %d: %v", i, rErr)
 		}
 	}
 	<-done
-	if _, _, err := store.Reload(); err != nil {
+	if _, _, _, err := store.Reload(); err != nil {
 		t.Fatalf("final Reload: %v", err)
 	}
 	if rem := store.ActiveGrants(); len(rem) != 0 {
@@ -509,7 +509,7 @@ func TestConcurrentReloadsAreSerialized(t *testing.T) {
 		lastMu        sync.Mutex
 		lastFinishedH string
 	)
-	store.OnReload(func(_, next *config.Snapshot, _ []string) {
+	store.OnReload(func(_, next *config.Snapshot, _ []string) int {
 		if inFlight.Add(1) > 1 {
 			overlapped.Store(true)
 		}
@@ -518,6 +518,7 @@ func TestConcurrentReloadsAreSerialized(t *testing.T) {
 		lastFinishedH = next.Hash
 		lastMu.Unlock()
 		inFlight.Add(-1)
+		return 0
 	})
 
 	atomicWrite := func(content string) error {
@@ -551,7 +552,7 @@ func TestConcurrentReloadsAreSerialized(t *testing.T) {
 				t.Errorf("atomicWrite: %v", wErr)
 				return
 			}
-			if _, _, rErr := store.Reload(); rErr != nil {
+			if _, _, _, rErr := store.Reload(); rErr != nil {
 				t.Errorf("Reload: %v", rErr)
 			}
 		}(body)

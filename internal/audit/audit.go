@@ -68,16 +68,20 @@ type Event struct {
 	Host       string    `json:"host,omitempty"`
 	Address    string    `json:"address,omitempty"`
 	Port       int       `json:"port,omitempty"`
-	QType      string    `json:"qtype,omitempty"`
-	Method     string    `json:"method,omitempty"`
-	Path       string    `json:"path,omitempty"`
-	HasQuery   bool      `json:"has_query,omitempty"`
-	Status     int       `json:"status,omitempty"`
-	Effect     Effect    `json:"effect,omitempty"`
-	Reason     string    `json:"reason,omitempty"`
-	RuleID     string    `json:"rule_id,omitempty"`
-	GrantID    string    `json:"grant_id,omitempty"`
-	TTL        string    `json:"ttl,omitempty"`
+	QType          string    `json:"qtype,omitempty"`
+	Method         string    `json:"method,omitempty"`
+	Methods        []string  `json:"methods,omitempty"`
+	Path           string    `json:"path,omitempty"`
+	Paths          []string  `json:"paths,omitempty"`
+	HasQuery       bool      `json:"has_query,omitempty"`
+	Status         int       `json:"status,omitempty"`
+	Effect         Effect    `json:"effect,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	RuleID         string    `json:"rule_id,omitempty"`
+	GrantID        string    `json:"grant_id,omitempty"`
+	AllowWebSocket *bool     `json:"allow_websocket,omitempty"`
+	RevokedFlows   *int      `json:"revoked_flows,omitempty"`
+	TTL            string    `json:"ttl,omitempty"`
 	ExpiresAt  string    `json:"expires_at,omitempty"`
 	FlowID     string    `json:"flow_id,omitempty"`
 	Secrets    []string  `json:"secrets,omitempty"`
