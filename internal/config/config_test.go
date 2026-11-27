@@ -200,7 +200,7 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	initialHash := store.Current().Hash
 
 	// Positive control: ephemeral TTL grant is active before reload and expires when clock passes TTL.
-	g1, err := store.AddGrant("worker-claude", "login.anthropic.com", 443, []string{"GET"}, []string{"/oauth/**"}, 5*time.Minute)
+	g1, err := store.AddGrant("worker-claude", "login.anthropic.com", 443, []string{"GET"}, []string{"/oauth/**"}, 5*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	// Verify grant TTL expiry fires callback cleanly.
 	var expiredID string
 	store.SetOnGrantExpired(func(id string) { expiredID = id })
-	g2, err := store.AddGrant("worker-codex", "auth.openai.com", 443, nil, nil, 1*time.Minute)
+	g2, err := store.AddGrant("worker-codex", "auth.openai.com", 443, nil, nil, 1*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant g2: %v", err)
 	}
@@ -303,9 +303,12 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	origHash := store.Current().Hash
 
 	// Every restart-only section change must be refused and keep the old snapshot + grants.
-	gKeep, err := store.AddGrant("worker-claude", "keep.example.com", 443, nil, nil, 5*time.Minute)
+	gKeep, err := store.AddGrant("worker-claude", "keep.example.com", 443, nil, nil, 5*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant: %v", err)
+	}
+	if _, err := store.AddGrant("worker-claude", "forge.internal.example", 443, nil, nil, time.Minute, true); err == nil {
+		t.Fatal("expected AddGrant with allow_websocket on bound host to fail")
 	}
 
 	immutableChanges := []struct {
@@ -356,7 +359,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	cb2Ch := make(chan string, 2)
 	store.SetOnGrantExpired(func(id string) { cb1Ch <- id })
 	store.SetOnGrantExpired(func(id string) { cb2Ch <- id })
-	gExp, err := store.AddGrant("worker-claude", "exp.example.com", 443, nil, nil, time.Minute)
+	gExp, err := store.AddGrant("worker-claude", "exp.example.com", 443, nil, nil, time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant exp: %v", err)
 	}
@@ -399,7 +402,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	go func() {
 		defer close(done)
 		for i := 0; i < 40; i++ {
-			if _, gErr := store.AddGrant("worker-claude", "race.example.com", 443, nil, nil, time.Minute); gErr != nil {
+			if _, gErr := store.AddGrant("worker-claude", "race.example.com", 443, nil, nil, time.Minute, false); gErr != nil {
 				continue
 			}
 		}

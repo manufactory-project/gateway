@@ -78,12 +78,13 @@ type RevokeResponse struct {
 
 // GrantRequest is accepted by POST /v1/grants.
 type GrantRequest struct {
-	Principal string   `json:"principal"`
-	Host      string   `json:"host"`
-	Port      uint16   `json:"port,omitempty"`
-	Methods   []string `json:"methods,omitempty"`
-	Paths     []string `json:"paths,omitempty"`
-	TTL       string   `json:"ttl"`
+	Principal      string   `json:"principal"`
+	Host           string   `json:"host"`
+	Port           uint16   `json:"port,omitempty"`
+	Methods        []string `json:"methods,omitempty"`
+	Paths          []string `json:"paths,omitempty"`
+	TTL            string   `json:"ttl"`
+	AllowWebSocket bool     `json:"allow_websocket,omitempty"`
 }
 
 // Options configures the Unix-socket Admin Server.
@@ -314,7 +315,7 @@ func (s *Server) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid ttl duration")
 		return
 	}
-	g, err := s.store.AddGrant(req.Principal, req.Host, req.Port, req.Methods, req.Paths, ttl)
+	g, err := s.store.AddGrant(req.Principal, req.Host, req.Port, req.Methods, req.Paths, ttl, req.AllowWebSocket)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

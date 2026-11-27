@@ -26,14 +26,15 @@ type Snapshot struct {
 // Grant is an ephemeral in-memory allow rule with a TTL.
 // Grants are never persisted to disk and are wiped on every SIGHUP/reload.
 type Grant struct {
-	ID        string    `json:"id"`
-	Principal string    `json:"principal"`
-	Host      string    `json:"host"`
-	Port      uint16    `json:"port"`
-	Methods   []string  `json:"methods,omitempty"`
-	Paths     []string  `json:"paths,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
+	ID             string    `json:"id"`
+	Principal      string    `json:"principal"`
+	Host           string    `json:"host"`
+	Port           uint16    `json:"port"`
+	Methods        []string  `json:"methods,omitempty"`
+	Paths          []string  `json:"paths,omitempty"`
+	AllowWebSocket bool      `json:"allow_websocket,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 // Store holds the active configuration Snapshot and ephemeral in-memory TTL grants.
@@ -195,7 +196,7 @@ func (s *Store) WatchSIGHUP(ctx context.Context, onResult func(*Snapshot, []stri
 
 // AddGrant validates and inserts an ephemeral in-memory TTL grant.
 // Grants accept exact hostnames only (no wildcards), ports 80 or 443, and positive TTLs.
-func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths []string, ttl time.Duration) (Grant, error) {
+func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths []string, ttl time.Duration, allowWebSocket bool) (Grant, error) {
 	if ttl <= 0 {
 		return Grant{}, errors.New("grant: ttl must be > 0")
 	}
@@ -251,16 +252,30 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 		s.mu.Unlock()
 		return Grant{}, fmt.Errorf("grant: principal %q does not match any declared link", principal)
 	}
+	if allowWebSocket {
+		for _, r := range snap.Config.Rules {
+			if r.Principal != principal {
+				continue
+			}
+			for _, b := range r.Bindings {
+				if b.Host == host {
+					s.mu.Unlock()
+					return Grant{}, fmt.Errorf("grant: allow_websocket is forbidden on host %q with a secret binding", host)
+				}
+			}
+		}
+	}
 	now := s.now().UTC()
 	g := Grant{
-		ID:        id,
-		Principal: principal,
-		Host:      host,
-		Port:      port,
-		Methods:   normMethods,
-		Paths:     normPaths,
-		CreatedAt: now,
-		ExpiresAt: now.Add(ttl),
+		ID:             id,
+		Principal:      principal,
+		Host:           host,
+		Port:           port,
+		Methods:        normMethods,
+		Paths:          normPaths,
+		AllowWebSocket: allowWebSocket,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(ttl),
 	}
 	s.grants[g.ID] = g
 	s.mu.Unlock()

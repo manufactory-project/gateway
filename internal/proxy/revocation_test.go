@@ -3,12 +3,14 @@ package proxy_test
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -77,7 +79,7 @@ func TestLiveTeardownOnGrantExpiryRevokeAndReload(t *testing.T) {
 	})
 
 	// 1. Ephemeral TTL grant tears down an open H2 SSE stream when TTL expires.
-	gTTL, err := gw.Store.AddGrant("worker-test", "grant.example.com", 443, []string{"GET"}, []string{"/hold"}, 120*time.Millisecond)
+	gTTL, err := gw.Store.AddGrant("worker-test", "grant.example.com", 443, []string{"GET"}, []string{"/hold"}, 120*time.Millisecond, false)
 	if err != nil {
 		t.Fatalf("AddGrant TTL: %v", err)
 	}
@@ -218,7 +220,7 @@ func TestRevocationMetricsOnTTLExpiryAndReload(t *testing.T) {
 	}
 
 	// 1. TTL expiry teardown increments gatewayd_revocations_total.
-	if _, err := gw.Store.AddGrant("worker-test", "ttl.example.com", 443, []string{"GET"}, []string{"/hold"}, 100*time.Millisecond); err != nil {
+	if _, err := gw.Store.AddGrant("worker-test", "ttl.example.com", 443, []string{"GET"}, []string{"/hold"}, 100*time.Millisecond, false); err != nil {
 		t.Fatalf("AddGrant TTL: %v", err)
 	}
 	rTTL, err := gw.H1Client(t, "ttl.example.com").Get("https://ttl.example.com/hold")
@@ -393,7 +395,7 @@ func TestSIGHUPWipesGrantsAndTearsDownStream(t *testing.T) {
 	})
 	time.Sleep(25 * time.Millisecond)
 
-	gHUP, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-hup"}, 5*time.Minute)
+	gHUP, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-hup"}, 5*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant gHUP: %v", err)
 	}
@@ -422,4 +424,181 @@ func TestSIGHUPWipesGrantsAndTearsDownStream(t *testing.T) {
 	if active := gw.Store.ActiveGrants(); len(active) != 0 {
 		t.Fatalf("SIGHUP did not wipe grants, still active: %+v", active)
 	}
+}
+
+func TestWebSocketRevokedDuringHandshake(t *testing.T) {
+	runCase := func(t *testing.T, byGrantExpiry bool) {
+		t.Helper()
+
+		reqReceived := make(chan struct{}, 2)
+		upClosed := make(chan struct{}, 2)
+
+		rawLn, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen silent ws upstream: %v", err)
+		}
+		silentPort := tcpPort(t, rawLn.Addr())
+
+		host := "ws-hs.example.com"
+		rulesYAML := `
+  - id: allow-ws-hs
+    principal: worker-test
+    effect: allow
+    hosts: [ws-hs.example.com]
+    ports: [443]
+    allow_websocket: true
+`
+		if byGrantExpiry {
+			host = "ws-grant.example.com"
+			rulesYAML = ""
+		}
+
+		var (
+			upMu    sync.Mutex
+			upConns []net.Conn
+			upWG    sync.WaitGroup
+			tlsLn   net.Listener
+		)
+
+		gw := newTestGateway(t, testGatewaySpec{
+			StartGrantPruner: byGrantExpiry,
+			Hosts:            []string{host},
+			RulesYAML:        rulesYAML,
+			DialOverride: func(guard *netguard.Dialer, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return func(ctx context.Context, network, addr string) (net.Conn, error) {
+					h, _, err := net.SplitHostPort(addr)
+					if err != nil {
+						return nil, err
+					}
+					return guard.DialHost(ctx, network, h, silentPort)
+				}
+			},
+		})
+
+		tlsLn = tls.NewListener(rawLn, &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{makeSignedServerCert(t, gw.UpCA, []string{host})},
+		})
+		upWG.Add(1)
+		go func() {
+			defer upWG.Done()
+			for {
+				c, err := tlsLn.Accept()
+				if err != nil {
+					return
+				}
+				upMu.Lock()
+				upConns = append(upConns, c)
+				upMu.Unlock()
+				upWG.Add(1)
+				go func(conn net.Conn) {
+					defer upWG.Done()
+					defer func() {
+						if cErr := conn.Close(); cErr != nil {
+							return
+						}
+					}()
+					br := bufio.NewReader(conn)
+					if _, err := http.ReadRequest(br); err != nil {
+						return
+					}
+					// Upgrade request received; intentionally never send any response.
+					reqReceived <- struct{}{}
+					if _, err := io.Copy(io.Discard, br); err != nil {
+						upClosed <- struct{}{}
+						return
+					}
+					upClosed <- struct{}{}
+				}(c)
+			}
+		}()
+		// Registered AFTER newTestGateway so LIFO closes silent upstream first on exit/failure.
+		t.Cleanup(func() {
+			if err := tlsLn.Close(); err != nil {
+				t.Errorf("close silent tlsLn: %v", err)
+			}
+			upMu.Lock()
+			for _, c := range upConns {
+				if cErr := c.Close(); cErr != nil {
+					continue
+				}
+			}
+			upMu.Unlock()
+			upWG.Wait()
+		})
+
+		var grantID string
+		if byGrantExpiry {
+			g, err := gw.Store.AddGrant("worker-test", host, 443, []string{"GET"}, []string{"/ws-hs"}, 120*time.Millisecond, true)
+			if err != nil {
+				t.Fatalf("AddGrant ws: %v", err)
+			}
+			grantID = g.ID
+		}
+
+		guestConn := gw.DialTLS(t, host)
+		t.Cleanup(func() {
+			if cErr := guestConn.Close(); cErr != nil {
+				return
+			}
+		})
+		if _, err := io.WriteString(guestConn, "GET /ws-hs HTTP/1.1\r\nHost: "+host+"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"); err != nil {
+			t.Fatalf("write WS upgrade: %v", err)
+		}
+
+		select {
+		case <-reqReceived:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for upstream to receive WS upgrade request")
+		}
+
+		active := gw.Flows.List()
+		if len(active) != 1 || active[0].Protocol != "websocket" {
+			t.Fatalf("expected 1 active websocket flow, got %+v", active)
+		}
+		if byGrantExpiry {
+			if active[0].GrantID != grantID {
+				t.Fatalf("active flow grant_id = %q, want %q", active[0].GrantID, grantID)
+			}
+		} else {
+			if n := gw.Flows.RevokeByID(active[0].ID); n != 1 {
+				t.Fatalf("RevokeByID(%s) = %d, want 1", active[0].ID, n)
+			}
+		}
+
+		bound := 600 * time.Millisecond
+		if byGrantExpiry {
+			bound = time.Second
+		}
+
+		// 1. Upstream connection must be closed by gatewayd within bound.
+		select {
+		case <-upClosed:
+		case <-time.After(bound):
+			t.Fatal("upstream connection remained open after WS handshake revocation")
+		}
+
+		// 2. Guest connection must close within bound.
+		if err := guestConn.SetReadDeadline(time.Now().Add(bound)); err != nil {
+			t.Fatalf("set guest deadline: %v", err)
+		}
+		var one [1]byte
+		if _, rErr := guestConn.Read(one[:]); rErr == nil {
+			t.Fatal("expected guest connection to close, read succeeded")
+		} else if ne, ok := rErr.(net.Error); ok && ne.Timeout() {
+			t.Fatal("guest connection remained open (timed out instead of closing)")
+		}
+
+		// 3. Flow must leave the registry within bound.
+		deadline := time.Now().Add(bound)
+		for gw.Flows.Count() != 0 && time.Now().Before(deadline) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if cnt := gw.Flows.Count(); cnt != 0 {
+			t.Fatalf("flow remained in registry after revocation: count=%d", cnt)
+		}
+	}
+
+	t.Run("by_flow_id", func(t *testing.T) { runCase(t, false) })
+	t.Run("by_grant_expiry", func(t *testing.T) { runCase(t, true) })
 }

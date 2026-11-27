@@ -206,15 +206,15 @@ func TestHTTP2GrantIsolationAcrossConnections(t *testing.T) {
 		}),
 	})
 
-	gA, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-a"}, 5*time.Minute)
+	gA, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-a"}, 5*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant gA: %v", err)
 	}
-	gB, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-b"}, 5*time.Minute)
+	gB, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-b"}, 5*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant gB: %v", err)
 	}
-	gC, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-c"}, 5*time.Minute)
+	gC, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-c"}, 5*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant gC: %v", err)
 	}

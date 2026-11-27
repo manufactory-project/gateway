@@ -193,9 +193,11 @@ func (e *Evaluator) DecideHost(principal, rawHost string, port uint16) Decision 
 			continue
 		}
 		c := candidate{
-			rank:    rankKey{hostRank: exactHostRank},
-			allow:   true,
-			grantID: g.ID,
+			rank:             rankKey{hostRank: exactHostRank},
+			allow:            true,
+			grantID:          g.ID,
+			allowWebSocket:   g.AllowWebSocket,
+			wsMaxEgressBytes: cs.wsDefault,
 		}
 		if !hasBest || c.beats(best) {
 			best = c
@@ -301,9 +303,11 @@ func (e *Evaluator) DecideRequest(principal, rawHost string, port uint16, method
 			pathSpecificity: pathSpec,
 		}
 		c := candidate{
-			rank:    rk,
-			allow:   true,
-			grantID: g.ID,
+			rank:             rk,
+			allow:            true,
+			grantID:          g.ID,
+			allowWebSocket:   g.AllowWebSocket,
+			wsMaxEgressBytes: cs.wsDefault,
 		}
 		if !hasBest || c.beats(best) {
 			best = c

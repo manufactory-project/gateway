@@ -159,7 +159,7 @@ func TestPolicySpecificityDenyTiesAndIsolation(t *testing.T) {
 	}
 
 	// Ephemeral TTL grant lifecycle: allow while active, deny beats grant on tie, deny after expiry.
-	g, err := st.AddGrant("worker-b", "login.openai.com", 443, []string{"GET"}, []string{"/oauth/**"}, 2*time.Minute)
+	g, err := st.AddGrant("worker-b", "login.openai.com", 443, []string{"GET"}, []string{"/oauth/**"}, 2*time.Minute, false)
 	if err != nil {
 		t.Fatalf("AddGrant: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestPolicySpecificityDenyTiesAndIsolation(t *testing.T) {
 	}
 
 	// Explicit YAML deny still beats an ephemeral grant on the exact same host.
-	if _, err := st.AddGrant("worker-a", "secret.example.com", 443, nil, nil, 5*time.Minute); err != nil {
+	if _, err := st.AddGrant("worker-a", "secret.example.com", 443, nil, nil, 5*time.Minute, false); err != nil {
 		t.Fatalf("AddGrant on denied host: %v", err)
 	}
 	if d := ev.DecideRequest("worker-a", "secret.example.com", 443, "GET", "/"); d.Allow {
