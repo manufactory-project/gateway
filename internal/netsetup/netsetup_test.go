@@ -210,3 +210,22 @@ func TestApplyRemovesStaleReadyFileBeforeFailing(t *testing.T) {
 		t.Fatalf("stale ready_file was not removed before Apply failed: stat err=%v", err)
 	}
 }
+
+func TestExampleConfigsParseAndRenderNftables(t *testing.T) {
+	for _, name := range []string{"workers.yaml", "two-links.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join("..", "..", "examples", name)
+			cfg, _, err := config.LoadFile(path)
+			if err != nil {
+				t.Fatalf("config.LoadFile(%s): %v", path, err)
+			}
+			nft, err := netsetup.RenderNftables(cfg)
+			if err != nil {
+				t.Fatalf("netsetup.RenderNftables(%s): %v", name, err)
+			}
+			if err := netsetup.VerifyNftTableOutput(nft); err != nil {
+				t.Fatalf("netsetup.VerifyNftTableOutput(%s): %v", name, err)
+			}
+		})
+	}
+}
