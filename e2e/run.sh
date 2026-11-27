@@ -153,7 +153,7 @@ if [[ -n "$RPREFIX" ]]; then
   CLUSTER_LIST_CMD=(incus cluster list "$RPREFIX" --format csv)
 fi
 if cluster_members="$("${CLUSTER_LIST_CMD[@]}" 2>/dev/null)" && [[ -n "$cluster_members" ]]; then
-  echo "clustered Incus is not supported; use a standalone Incus such as standalone-host" >&2
+  echo "clustered Incus is not supported; use a standalone Incus host" >&2
   exit 1
 fi
 

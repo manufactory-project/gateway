@@ -2,12 +2,14 @@ package netsetup_test
 
 import (
 	"context"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"go.uber.org/goleak"
+	"gopkg.in/yaml.v3"
 
 	"github.com/manufactory-project/gateway/internal/config"
 	"github.com/manufactory-project/gateway/internal/netsetup"
@@ -23,12 +25,20 @@ func loadExampleConfig(t *testing.T) *config.Config {
 	if err != nil {
 		t.Fatalf("read examples/gatewayd.yaml: %v", err)
 	}
-	// Example config must use <forge-ip> placeholder and never hardcode the lab Caddy IP.
+	// Example config must use <forge-ip> placeholder and never hardcode a literal IPv4 in records:.
 	if !strings.Contains(string(raw), "<forge-ip>") {
 		t.Fatal("examples/gatewayd.yaml must contain <forge-ip> placeholder")
 	}
-	if strings.Contains(string(raw), "192.0.2.47") {
-		t.Fatal("examples/gatewayd.yaml must not contain 192.0.2.47")
+	var doc struct {
+		Records map[string]string `yaml:"records"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal records from examples/gatewayd.yaml: %v", err)
+	}
+	for host, val := range doc.Records {
+		if addr, err := netip.ParseAddr(strings.TrimSpace(val)); err == nil && addr.Is4() {
+			t.Fatalf("examples/gatewayd.yaml records[%q] must not contain literal IPv4 address %q", host, val)
+		}
 	}
 	replaced := strings.ReplaceAll(string(raw), "<forge-ip>", "10.10.20.5")
 	cfg, err := config.Parse([]byte(replaced))
