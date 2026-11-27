@@ -190,19 +190,9 @@ func TestMockChecksAndSameIPMode(t *testing.T) {
 		<-dnsDone
 	}()
 
-	// Pick a free loopback port for same-IP fixed source port test.
-	probeSock, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pick free port: %v", err)
-	}
-	udpAddr, ok := probeSock.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		t.Fatalf("expected *net.UDPAddr, got %T", probeSock.LocalAddr())
-	}
-	srcPort := udpAddr.Port
-	if err := probeSock.Close(); err != nil {
-		t.Fatalf("close probeSock: %v", err)
-	}
+	// Reserve a loopback port on both TCP and UDP for the whole test so
+	// concurrent tests cannot claim it before runSameIPChecks binds it.
+	srcPort := reserveSameIPPort(t, [4]byte{127, 0, 0, 1})
 
 	prefix := netip.MustParsePrefix("198.18.0.0/15")
 	customClient := &http.Client{
@@ -422,16 +412,10 @@ func TestDirectHTTPSNoSNIBypassFails(t *testing.T) {
 }
 
 func TestTCPBlockedRefusedFails(t *testing.T) {
-	// Bind on 127.0.0.2 (not 127.0.0.1) so parallel package tests binding 127.0.0.1:0
-	// cannot reclaim the closed port and Linux cannot TCP self-connect.
-	ln, err := net.Listen("tcp4", "127.0.0.2:0")
-	if err != nil {
-		t.Fatalf("listen tcp: %v", err)
-	}
-	closedAddr := ln.Addr().String()
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close listener: %v", err)
-	}
+	// Reserve an unlistened TCP port for the whole test: the kernel rejects
+	// incoming SYNs with ECONNREFUSED while preventing any other test from
+	// reclaiming the port.
+	closedAddr := reserveUnlistenedTCP(t, [4]byte{127, 0, 0, 2})
 
 	res := checkTCPBlocked(context.Background(), "blocked_tcp_22", closedAddr, 2*time.Second)
 	t.Logf("bypass result: %+v", res)
