@@ -1,0 +1,63 @@
+table inet gw
+delete table inet gw
+
+table inet gw {
+    set sandbox_ifs {
+        type ifname
+        elements = { "sbx0", "sbx1" }
+    }
+
+    chain raw_prerouting {
+        type filter hook prerouting priority raw; policy accept;
+        iifname "sbx0" ct zone set 101
+        iifname "sbx1" ct zone set 102
+    }
+
+    chain raw_output {
+        type filter hook output priority raw; policy accept;
+        ip saddr 10.200.0.1 ct zone set 101
+        ip saddr 10.200.0.17 ct zone set 102
+    }
+
+    chain prerouting_guard {
+        type filter hook prerouting priority dstnat - 10; policy accept;
+        iifname @sandbox_ifs meta nfproto ipv6 drop
+        iifname "sbx0" fib daddr type local ip daddr 10.200.0.1 udp dport { 53, 67 } accept
+        iifname "sbx0" fib daddr type local ip daddr 10.200.0.1 tcp dport 53 accept
+        iifname "sbx1" fib daddr type local ip daddr 10.200.0.17 udp dport { 53, 67 } accept
+        iifname "sbx1" fib daddr type local ip daddr 10.200.0.17 tcp dport 53 accept
+        iifname @sandbox_ifs fib daddr type local drop
+    }
+
+    chain prerouting_nat {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "sbx0" udp dport 53 dnat ip to 10.200.0.1:10053
+        iifname "sbx0" tcp dport 53 dnat ip to 10.200.0.1:10053
+        iifname "sbx0" tcp dport 443 dnat ip to 10.200.0.1:10443
+        iifname "sbx0" tcp dport 80 dnat ip to 10.200.0.1:10080
+        iifname "sbx1" udp dport 53 dnat ip to 10.200.0.17:10053
+        iifname "sbx1" tcp dport 53 dnat ip to 10.200.0.17:10053
+        iifname "sbx1" tcp dport 443 dnat ip to 10.200.0.17:10443
+        iifname "sbx1" tcp dport 80 dnat ip to 10.200.0.17:10080
+    }
+
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname @sandbox_ifs meta nfproto ipv6 drop
+        iifname @sandbox_ifs ct state invalid drop
+        iifname @sandbox_ifs ct status dnat accept
+        iifname @sandbox_ifs udp sport 68 udp dport 67 accept
+        iifname @sandbox_ifs drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        iifname @sandbox_ifs drop
+        oifname @sandbox_ifs drop
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+        oifname @sandbox_ifs meta nfproto ipv6 drop
+    }
+}

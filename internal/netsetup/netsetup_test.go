@@ -229,3 +229,40 @@ func TestExampleConfigsParseAndRenderNftables(t *testing.T) {
 		})
 	}
 }
+
+// TestRenderNftablesGoldenTwoLinks compares RenderNftables(examples/two-links.yaml)
+// byte for byte against internal/netsetup/testdata/two-links.nft.
+//
+// To regenerate the golden file deliberately after an intentional ruleset change, run:
+//
+//	UPDATE_NFT_GOLDEN=1 go test -run TestRenderNftablesGoldenTwoLinks ./internal/netsetup
+func TestRenderNftablesGoldenTwoLinks(t *testing.T) {
+	cfgPath := filepath.Join("..", "..", "examples", "two-links.yaml")
+	cfg, _, err := config.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("config.LoadFile(%s): %v", cfgPath, err)
+	}
+	got, err := netsetup.RenderNftables(cfg)
+	if err != nil {
+		t.Fatalf("RenderNftables: %v", err)
+	}
+
+	goldenPath := filepath.Join("testdata", "two-links.nft")
+	if os.Getenv("UPDATE_NFT_GOLDEN") == "1" {
+		if err := os.MkdirAll(filepath.Dir(goldenPath), 0o755); err != nil {
+			t.Fatalf("mkdir testdata: %v", err)
+		}
+		if err := os.WriteFile(goldenPath, []byte(got), 0o644); err != nil {
+			t.Fatalf("write golden %s: %v", goldenPath, err)
+		}
+	}
+
+	wantBytes, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden %s: %v", goldenPath, err)
+	}
+	want := string(wantBytes)
+	if got != want {
+		t.Fatalf("RenderNftables(examples/two-links.yaml) drifted from %s:\n--- want ---\n%s\n--- got ---\n%s", goldenPath, want, got)
+	}
+}
