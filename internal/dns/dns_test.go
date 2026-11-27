@@ -2,11 +2,14 @@ package dns_test
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -240,10 +243,7 @@ rules:
 	}
 
 	// Audit completeness check: every query above (incl. malformed/opcode/class) produced an audit record.
-	events, _, err := audit.QueryWithCursor(auditDir, audit.QueryOptions{})
-	if err != nil {
-		t.Fatalf("audit.QueryWithCursor: %v", err)
-	}
+	events := readAuditEvents(t, auditDir)
 	// 2 (A udp+tcp) + 3 (AAAA/HTTPS/SVCB) + 15 (5 qtypes * 3 hosts) + 2 (blocked A/AAAA) + 4 (0q, 2q, update, chaos) = 26.
 	if len(events) != 26 {
 		t.Fatalf("expected 26 audited DNS events, got %d", len(events))
@@ -265,4 +265,37 @@ rules:
 	if rFail.Rcode != mdns.RcodeServerFailure || len(rFail.Answer) != 0 {
 		t.Fatalf("expected SERVFAIL with 0 answers on unwritable audit sink, got rcode=%d answers=%d", rFail.Rcode, len(rFail.Answer))
 	}
+}
+
+func readAuditEvents(t *testing.T, dir string) []audit.Event {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir %s: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	var out []audit.Event
+	for _, name := range names {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", name, err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var ev audit.Event
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("unmarshal %s: %v", name, err)
+			}
+			out = append(out, ev)
+		}
+	}
+	return out
 }

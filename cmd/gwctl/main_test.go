@@ -140,15 +140,12 @@ rules:
 		t.Fatal("grant revoke did not report revoked_grant=true")
 	}
 
-	// flows + revoke + reload + audit
+	// flows + revoke + reload
 	_ = runCLI("flows")
 	if !strings.Contains(runCLI("revoke", "--principal", "worker-claude"), `"revoked_flows":0`) {
 		t.Fatal("revoke output mismatch")
 	}
 	if !strings.Contains(runCLI("reload"), `"config_hash"`) {
 		t.Fatal("reload output mismatch")
-	}
-	if !strings.Contains(runCLI("audit", "--tail", "5"), `"kind":"grant"`) {
-		t.Fatal("audit output missing grant event")
 	}
 }

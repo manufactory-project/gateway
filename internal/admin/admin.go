@@ -149,7 +149,6 @@ func (s *Server) Start() error {
 	mux.HandleFunc("GET /v1/grants", s.handleListGrants)
 	mux.HandleFunc("POST /v1/grants", s.handleCreateGrant)
 	mux.HandleFunc("DELETE /v1/grants/{id}", s.handleDeleteGrant)
-	mux.HandleFunc("GET /v1/audit", s.handleAudit)
 
 	s.ln = ln
 	s.srv = &http.Server{
@@ -337,85 +336,6 @@ func (s *Server) handleDeleteGrant(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	opts := audit.QueryOptions{
-		Principal: q.Get("principal"),
-		Host:      q.Get("host"),
-		Effect:    audit.Effect(q.Get("effect")),
-	}
-	if tailStr := q.Get("tail"); tailStr != "" {
-		n, err := strconv.Atoi(tailStr)
-		if err != nil || n < 0 {
-			writeError(w, http.StatusBadRequest, "invalid tail parameter")
-			return
-		}
-		opts.Tail = n
-	}
-	if sinceStr := q.Get("since"); sinceStr != "" {
-		if dur, err := time.ParseDuration(sinceStr); err == nil {
-			opts.Since = time.Now().UTC().Add(-dur)
-		} else if ts, err := time.Parse(time.RFC3339, sinceStr); err == nil {
-			opts.Since = ts.UTC()
-		} else {
-			writeError(w, http.StatusBadRequest, "invalid since parameter")
-			return
-		}
-	}
-	follow := q.Get("follow") == "1" || strings.EqualFold(q.Get("follow"), "true")
-
-	seqBefore := s.audit.WriteSeq()
-	events, cursor, err := audit.QueryWithCursor(s.audit.Dir(), opts)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.WriteHeader(http.StatusOK)
-	rc := http.NewResponseController(w)
-	enc := json.NewEncoder(w)
-
-	for _, ev := range events {
-		if err := enc.Encode(ev); err != nil {
-			return
-		}
-	}
-	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		return
-	}
-	if !follow {
-		return
-	}
-
-	followOpts := opts
-	followOpts.Tail = 0
-	lastSeq := seqBefore
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-s.audit.WaitWrite(lastSeq):
-			lastSeq = s.audit.WriteSeq()
-			more, nextCursor, err := audit.ReadAfter(s.audit.Dir(), cursor, followOpts)
-			if err != nil {
-				return
-			}
-			cursor = nextCursor
-			if len(more) > 0 {
-				for _, ev := range more {
-					if err := enc.Encode(ev); err != nil {
-						return
-					}
-				}
-				if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
-					return
-				}
-			}
-		}
-	}
-}
-
 func decodeStrictJSON(body io.Reader, dst any) error {
 	dec := json.NewDecoder(io.LimitReader(body, 1<<20))
 	dec.DisallowUnknownFields()
@@ -509,77 +429,6 @@ func (c *Client) DeleteGrant(ctx context.Context, id string) (RevokeResponse, er
 	var out RevokeResponse
 	err := c.doJSON(ctx, http.MethodDelete, "/v1/grants/"+url.PathEscape(id), nil, &out)
 	return out, err
-}
-
-// AuditParams selects audit records from GET /v1/audit.
-type AuditParams struct {
-	Tail      int
-	Follow    bool
-	Principal string
-	Host      string
-	Effect    string
-	Since     string
-}
-
-// StreamAudit calls GET /v1/audit and invokes fn for each received audit.Event.
-func (c *Client) StreamAudit(ctx context.Context, params AuditParams, fn func(audit.Event) error) error {
-	q := url.Values{}
-	if params.Tail > 0 {
-		q.Set("tail", strconv.Itoa(params.Tail))
-	}
-	if params.Follow {
-		q.Set("follow", "1")
-	}
-	if params.Principal != "" {
-		q.Set("principal", params.Principal)
-	}
-	if params.Host != "" {
-		q.Set("host", params.Host)
-	}
-	if params.Effect != "" {
-		q.Set("effect", params.Effect)
-	}
-	if params.Since != "" {
-		q.Set("since", params.Since)
-	}
-
-	u := "http://unix/v1/audit"
-	if enc := q.Encode(); enc != "" {
-		u += "?" + enc
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			return
-		}
-	}()
-	if resp.StatusCode >= 400 {
-		msg, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return fmt.Errorf("admin: GET /v1/audit status %d (read err: %w)", resp.StatusCode, readErr)
-		}
-		return fmt.Errorf("admin: GET /v1/audit status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
-	}
-	dec := json.NewDecoder(resp.Body)
-	for {
-		var ev audit.Event
-		if err := dec.Decode(&ev); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
-				return nil
-			}
-			return err
-		}
-		if err := fn(ev); err != nil {
-			return err
-		}
-	}
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any) error {

@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/admin"
-	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/ca"
 	"github.com/manufactory-project/gateway/internal/config"
 	"github.com/manufactory-project/gateway/internal/netsetup"
@@ -45,7 +44,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	jsonOut := *asJSON || trailingJSON
 	rest := fs.Args()
 	if len(rest) == 0 {
-		return errors.New("usage: gwctl [--socket PATH] [--json] <status|reload|flows|revoke|grants|grant|audit|ca|dataplane>")
+		return errors.New("usage: gwctl [--socket PATH] [--json] <status|reload|flows|revoke|grants|grant|ca|dataplane>")
 	}
 
 	cmd := rest[0]
@@ -188,34 +187,6 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		_, err = fmt.Fprintf(stdout, "granted %s principal=%s host=%s:%d expires=%s\n",
 			g.ID, g.Principal, g.Host, g.Port, g.ExpiresAt.Format(time.RFC3339))
 		return err
-
-	case "audit":
-		afs := flag.NewFlagSet("gwctl audit", flag.ContinueOnError)
-		afs.SetOutput(stderr)
-		tail := afs.Int("tail", 0, "return last N matching records")
-		follow := afs.Bool("follow", false, "stream new records")
-		principal := afs.String("principal", "", "filter by principal")
-		host := afs.String("host", "", "filter by host")
-		effect := afs.String("effect", "", "filter by effect (allow|deny)")
-		since := afs.String("since", "", "filter by duration or RFC3339 timestamp")
-		if err := afs.Parse(cmdArgs); err != nil {
-			return err
-		}
-		return client.StreamAudit(ctx, admin.AuditParams{
-			Tail:      *tail,
-			Follow:    *follow,
-			Principal: *principal,
-			Host:      *host,
-			Effect:    *effect,
-			Since:     *since,
-		}, func(ev audit.Event) error {
-			if jsonOut {
-				return printJSON(stdout, ev)
-			}
-			_, err := fmt.Fprintf(stdout, "%s kind=%s principal=%s host=%s effect=%s reason=%s status=%d\n",
-				ev.Time.Format(time.RFC3339), ev.Kind, ev.Principal, ev.Host, ev.Effect, ev.Reason, ev.Status)
-			return err
-		})
 
 	default:
 		return fmt.Errorf("unknown subcommand %q", cmd)

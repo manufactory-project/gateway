@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -307,10 +309,7 @@ rules:
 	}
 
 	// Confirm redaction error and non-WS 101 were both audited.
-	events, _, err := audit.QueryWithCursor(auditDir, audit.QueryOptions{})
-	if err != nil {
-		t.Fatalf("audit.QueryWithCursor: %v", err)
-	}
+	events := readProxyAuditEvents(t, auditDir)
 	var sawRedactErr, sawNonWS101 bool
 	for _, ev := range events {
 		if ev.Error == "redaction-secret-unresolved" && ev.Status == 502 {
@@ -323,4 +322,37 @@ rules:
 	if !sawRedactErr || !sawNonWS101 {
 		t.Fatalf("missing expected audit records: sawRedactErr=%v sawNonWS101=%v", sawRedactErr, sawNonWS101)
 	}
+}
+
+func readProxyAuditEvents(t *testing.T, dir string) []audit.Event {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir %s: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	var out []audit.Event
+	for _, name := range names {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", name, err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var ev audit.Event
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("unmarshal %s: %v", name, err)
+			}
+			out = append(out, ev)
+		}
+	}
+	return out
 }

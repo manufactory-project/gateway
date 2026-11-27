@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,41 @@ import (
 
 	"github.com/manufactory-project/gateway/internal/audit"
 )
+
+func readAuditEvents(t *testing.T, dir string) []audit.Event {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir %s: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".jsonl") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Slice(names, func(i, j int) bool {
+		return strings.TrimSuffix(names[i], ".jsonl") < strings.TrimSuffix(names[j], ".jsonl")
+	})
+	var out []audit.Event
+	for _, name := range names {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", name, err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var ev audit.Event
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("unmarshal %s line: %v", name, err)
+			}
+			out = append(out, ev)
+		}
+	}
+	return out
+}
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
@@ -91,10 +128,7 @@ func TestAuditQueryRedactionAndPeerEscaping(t *testing.T) {
 		t.Fatalf("expected exactly 2 JSONL lines (no forged newline break), got %d:\n%s", len(lines), raw)
 	}
 
-	events, _, err := audit.QueryWithCursor(dir, audit.QueryOptions{})
-	if err != nil {
-		t.Fatalf("QueryWithCursor: %v", err)
-	}
+	events := readAuditEvents(t, dir)
 	if len(events) != 2 {
 		t.Fatalf("expected 2 events, got %d", len(events))
 	}
@@ -184,7 +218,7 @@ func TestAuditFailClosedOnUnwritableSink(t *testing.T) {
 	}
 }
 
-func TestAuditRotationRetentionAndQueryFilters(t *testing.T) {
+func TestAuditRotationAndRetention(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
 	w, err := audit.NewWriter(audit.Options{
@@ -233,24 +267,12 @@ func TestAuditRotationRetentionAndQueryFilters(t *testing.T) {
 		t.Fatalf("write new deny event: %v", err)
 	}
 
-	all, _, err := audit.QueryWithCursor(dir, audit.QueryOptions{})
-	if err != nil {
-		t.Fatalf("QueryWithCursor all: %v", err)
-	}
+	all := readAuditEvents(t, dir)
 	if len(all) != 2 {
 		t.Fatalf("expected 2 retained events after pruning old day, got %d: %+v", len(all), all)
 	}
-
-	filtered, _, err := audit.QueryWithCursor(dir, audit.QueryOptions{
-		Principal: "p2",
-		Effect:    audit.EffectDeny,
-		Tail:      1,
-	})
-	if err != nil {
-		t.Fatalf("QueryWithCursor filtered: %v", err)
-	}
-	if len(filtered) != 1 || filtered[0].Host != "blocked.example.com" {
-		t.Fatalf("unexpected filtered events: %+v", filtered)
+	if all[0].Host != "api.anthropic.com" || all[1].Host != "blocked.example.com" {
+		t.Fatalf("unexpected retained events: %+v", all)
 	}
 
 	// Overflow guard on RetainDays.
