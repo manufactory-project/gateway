@@ -97,7 +97,7 @@ type testGateway struct {
 	CASigns   *countingSigner
 }
 
-func newTestGateway(t *testing.T, spec testGatewaySpec) *testGateway {
+func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -313,17 +313,17 @@ func newTestGateway(t *testing.T, spec testGatewaySpec) *testGateway {
 	}
 }
 
-func (g *testGateway) H1Client(t *testing.T, sni string) *http.Client {
+func (g *testGateway) H1Client(t testing.TB, sni string) *http.Client {
 	t.Helper()
 	return g.makeClient(t, sni, false, 0)
 }
 
-func (g *testGateway) H2Client(t *testing.T, sni string) *http.Client {
+func (g *testGateway) H2Client(t testing.TB, sni string) *http.Client {
 	t.Helper()
 	return g.makeClient(t, sni, true, 1)
 }
 
-func (g *testGateway) makeClient(t *testing.T, sni string, h2 bool, maxConns int) *http.Client {
+func (g *testGateway) makeClient(t testing.TB, sni string, h2 bool, maxConns int) *http.Client {
 	t.Helper()
 	protos := new(http.Protocols)
 	protos.SetHTTP1(!h2)
@@ -432,7 +432,7 @@ func (g *testGateway) AssertAuditNotContains(t *testing.T, tokens ...string) {
 	}
 }
 
-func writeSecretFile(t *testing.T, dir, name, content string) string {
+func writeSecretFile(t testing.TB, dir, name, content string) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
 	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
@@ -441,7 +441,7 @@ func writeSecretFile(t *testing.T, dir, name, content string) string {
 	return p
 }
 
-func tcpPort(t *testing.T, addr net.Addr) uint16 {
+func tcpPort(t testing.TB, addr net.Addr) uint16 {
 	t.Helper()
 	ta, ok := addr.(*net.TCPAddr)
 	if !ok {
@@ -450,7 +450,7 @@ func tcpPort(t *testing.T, addr net.Addr) uint16 {
 	return uint16(ta.Port)
 }
 
-func freePorts(t *testing.T, ip string, n int) []uint16 {
+func freePorts(t testing.TB, ip string, n int) []uint16 {
 	t.Helper()
 	lns := make([]net.Listener, 0, n)
 	ports := make([]uint16, 0, n)
@@ -475,7 +475,7 @@ func freePorts(t *testing.T, ip string, n int) []uint16 {
 	return ports
 }
 
-func randHex(t *testing.T) string {
+func randHex(t testing.TB) string {
 	t.Helper()
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -484,7 +484,7 @@ func randHex(t *testing.T) string {
 	return hex.EncodeToString(b[:])
 }
 
-func makeSignedServerCert(t *testing.T, root ca.CA, dnsNames []string) tls.Certificate {
+func makeSignedServerCert(t testing.TB, root ca.CA, dnsNames []string) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
