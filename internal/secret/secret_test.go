@@ -102,7 +102,7 @@ func TestApplyRequestSubstitutionAndUnconditionalPostSubSweep(t *testing.T) {
 	hdr.Set("Proxy-Authorization", "Basic dXNlcjpwYXNz")
 	hdr.Set("X-Normal", "keep-me")
 
-	names, pairs, err := secret.ApplyRequest(hdr, []config.BindingConfig{bindingBasic}, 443, secret.FileResolver{})
+	names, pairs, err := secret.ApplyRequest(hdr, []config.BindingConfig{bindingBasic}, 443)
 	if err != nil {
 		t.Fatalf("ApplyRequest: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestApplyRequestSubstitutionAndUnconditionalPostSubSweep(t *testing.T) {
 	hdr80 := make(http.Header)
 	hdr80.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("git:mf_ph_A")))
 	hdr80.Set("Proxy-Authorization", "Bearer abc")
-	names80, _, err := secret.ApplyRequest(hdr80, []config.BindingConfig{bindingBasic}, 80, secret.FileResolver{})
+	names80, _, err := secret.ApplyRequest(hdr80, []config.BindingConfig{bindingBasic}, 80)
 	if err != nil {
 		t.Fatalf("ApplyRequest port 80: %v", err)
 	}

@@ -24,7 +24,6 @@ metrics:
   listen: 127.0.0.1:9102
 
 dataplane:
-  verify_sysctls: true
   ready_file: /run/gateway-dataplane/dataplane.ready
   dhcp:
     user: dnsmasq

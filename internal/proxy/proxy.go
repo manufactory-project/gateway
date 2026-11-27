@@ -507,7 +507,7 @@ func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
 		return true
 	}
 
-	secretNames, subPairs, subErr := secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, rc.dstPort, secret.FileResolver{})
+	secretNames, subPairs, subErr := secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, rc.dstPort)
 	if subErr != nil {
 		var resErr *secret.ResolveError
 		if errors.As(subErr, &resErr) && resErr.Name != "" {
@@ -675,7 +675,7 @@ func (s *Server) prepareResponseRedactor(w http.ResponseWriter, rc *reqContext, 
 		http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
 		return nil, false
 	}
-	hostPairs, pairErr := secret.ResolveHostPairs(rc.dec.HostBindings, rc.subPairs, secret.FileResolver{})
+	hostPairs, pairErr := secret.ResolveHostPairs(rc.dec.HostBindings, rc.subPairs)
 	if pairErr != nil {
 		rc.auditCompleted(http.StatusBadGateway, bytesOut, 0, "redaction-secret-unresolved")
 		http.Error(w, "bound secret unavailable for response redaction", http.StatusBadGateway)

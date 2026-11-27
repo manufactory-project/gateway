@@ -94,7 +94,6 @@ func runDaemon(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("gateway run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to gateway YAML config")
-	procSysRoot := fs.String("proc-sys-root", "/proc/sys", "root directory for sysctl verification")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -107,7 +106,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return serveDaemon(ctx, *cfgPath, *procSysRoot, stdout, stderr)
+	return serveDaemon(ctx, *cfgPath, "/proc/sys", stdout, stderr)
 }
 
 type daemonRuntime struct {
@@ -142,7 +141,7 @@ func (rt *daemonRuntime) shutdownAll() error {
 
 func verifyStartupDataplane(cfg *config.Config, procSysRoot string) error {
 	// Startup dataplane checks (unprivileged; zero CAP_NET_ADMIN required).
-	if cfg.ShouldVerifySysctls() {
+	if cfg.HasLinuxLinks() {
 		if err := netsetup.VerifySysctls(procSysRoot, cfg); err != nil {
 			return fmt.Errorf("startup sysctl check failed: %w", err)
 		}

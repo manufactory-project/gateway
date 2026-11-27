@@ -31,11 +31,6 @@ func (e *ResolveError) Error() string {
 
 func (e *ResolveError) Unwrap() error { return e.Err }
 
-// Resolver loads a secret's raw value on demand.
-type Resolver interface {
-	Resolve(path string) (string, error)
-}
-
 // FileResolver reads secret values from files on demand (tmpfs / systemd LoadCredential).
 type FileResolver struct{}
 
@@ -80,10 +75,8 @@ type Pair struct {
 // HTTPS (:443) ONLY, then unconditionally sweeps Proxy-Authorization and any
 // remaining mf_ph_* placeholders (literal or inside decoded Basic Auth) from EVERY
 // header on EVERY request — including bound hosts and cleartext port 80.
-func ApplyRequest(hdr http.Header, bindings []config.BindingConfig, dstPort uint16, resolver Resolver) ([]string, []Pair, error) {
-	if resolver == nil {
-		resolver = FileResolver{}
-	}
+func ApplyRequest(hdr http.Header, bindings []config.BindingConfig, dstPort uint16) ([]string, []Pair, error) {
+	resolver := FileResolver{}
 
 	var (
 		secretNames []string
@@ -168,10 +161,8 @@ func SweepHeaders(hdr http.Header) {
 // ResolveHostPairs resolves every binding declared for a host so response scrubbing
 // catches echoed bound secrets even on requests that did not send an auth header.
 // It fails closed (returning an error) if any binding's secret cannot be resolved.
-func ResolveHostPairs(bindings []config.BindingConfig, existing []Pair, resolver Resolver) ([]Pair, error) {
-	if resolver == nil {
-		resolver = FileResolver{}
-	}
+func ResolveHostPairs(bindings []config.BindingConfig, existing []Pair) ([]Pair, error) {
+	resolver := FileResolver{}
 	seen := make(map[string]bool, len(existing))
 	out := make([]Pair, 0, len(bindings)+len(existing))
 	for _, p := range existing {

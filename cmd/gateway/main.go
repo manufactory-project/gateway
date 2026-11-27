@@ -313,7 +313,6 @@ func runDataplane(ctx context.Context, args []string, asJSON bool, stdout, stder
 	fs := flag.NewFlagSet("gateway dataplane check", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to gateway YAML config")
-	procSysRoot := fs.String("proc-sys-root", "/proc/sys", "root directory for sysctl check")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -323,15 +322,19 @@ func runDataplane(ctx context.Context, args []string, asJSON bool, stdout, stder
 	if *cfgPath == "" {
 		return errors.New("dataplane check: --config is required")
 	}
-	cfg, _, err := config.LoadFile(*cfgPath)
+	return runDataplaneCheck(ctx, *cfgPath, "/proc/sys", asJSON, stdout)
+}
+
+func runDataplaneCheck(ctx context.Context, cfgPath, procSysRoot string, asJSON bool, stdout io.Writer) error {
+	cfg, _, err := config.LoadFile(cfgPath)
 	if err != nil {
 		return err
 	}
 	if err := netsetup.CheckNftTable(ctx); err != nil {
 		return err
 	}
-	if cfg.ShouldVerifySysctls() {
-		if err := netsetup.VerifySysctls(*procSysRoot, cfg); err != nil {
+	if cfg.HasLinuxLinks() {
+		if err := netsetup.VerifySysctls(procSysRoot, cfg); err != nil {
 			return err
 		}
 	}

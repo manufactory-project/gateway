@@ -115,7 +115,6 @@ admin:
 metrics:
   listen: 127.0.0.1:%d
 dataplane:
-  verify_sysctls: false
   ready_file: %s
 links:
   - name: sbx0
@@ -327,7 +326,6 @@ audit:
 admin:
   socket: %s
 dataplane:
-  verify_sysctls: false
   ready_file: %s
 links:
   - name: sbx0
@@ -451,7 +449,6 @@ ca:
 audit:
   dir: /var/log/gateway/audit
 dataplane:
-  verify_sysctls: true
   ready_file: %s
   dhcp:
     user: dnsmasq
@@ -503,15 +500,22 @@ links:
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	var out, errBuf bytes.Buffer
-	if err := run(context.Background(), []string{"dataplane", "check", "--config", cfgPath, "--proc-sys-root", procSysRoot, "--json"}, &out, &errBuf); err != nil {
-		t.Fatalf("gateway dataplane check failed: %v (stderr=%s)", err, errBuf.String())
+	var out bytes.Buffer
+	if err := runDataplaneCheck(context.Background(), cfgPath, procSysRoot, true, &out); err != nil {
+		t.Fatalf("runDataplaneCheck failed: %v", err)
 	}
 	if !strings.Contains(out.String(), `"status":"ok"`) {
 		t.Fatalf("unexpected dataplane check output: %s", out.String())
 	}
 	if _, err := os.Stat(readyFile); !os.IsNotExist(err) {
 		t.Fatalf("gateway dataplane check must be read-only and not create ready_file %s (stat err=%v)", readyFile, err)
+	}
+	// --proc-sys-root CLI flag was removed; passing it must fail with a flag error.
+	if err := run(context.Background(), []string{"dataplane", "check", "--config", cfgPath, "--proc-sys-root", procSysRoot}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("expected gateway dataplane check --proc-sys-root to be rejected")
+	}
+	if err := run(context.Background(), []string{"run", "--config", cfgPath, "--proc-sys-root", procSysRoot}, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("expected gateway run --proc-sys-root to be rejected")
 	}
 }
 
