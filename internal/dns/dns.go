@@ -236,6 +236,37 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 		proto = "tcp"
 	}
 
+	if r.Response {
+		qname := ""
+		qtypeName := ""
+		if len(r.Question) > 0 {
+			qname = strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
+			qtypeName = mdns.TypeToString[r.Question[0].Qtype]
+		}
+		ev := audit.Event{
+			Kind:      audit.KindDNS,
+			Principal: s.link.Principal,
+			Link:      s.link.Name,
+			SrcIP:     srcIP,
+			Protocol:  proto,
+			Host:      qname,
+			Port:      53,
+			QType:     qtypeName,
+			Effect:    audit.EffectDeny,
+			Reason:    "response-packet-ignored",
+		}
+		if err := s.audit.WriteSync(ev); err != nil {
+			if s.onQuery != nil {
+				s.onQuery(s.link.Principal, "audit_error")
+			}
+			return
+		}
+		if s.onQuery != nil {
+			s.onQuery(s.link.Principal, string(ev.Effect))
+		}
+		return
+	}
+
 	if r.Opcode != mdns.OpcodeQuery {
 		qname := ""
 		qtypeName := ""

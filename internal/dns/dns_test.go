@@ -242,11 +242,71 @@ rules:
 		t.Fatalf("ClassCHAOS query: rcode=%v err=%v, want REFUSED", rChaos, err)
 	}
 
-	// Audit completeness check: every query above (incl. malformed/opcode/class) produced an audit record.
-	events := readAuditEvents(t, auditDir)
-	// 2 (A udp+tcp) + 3 (AAAA/HTTPS/SVCB) + 15 (5 qtypes * 3 hosts) + 2 (blocked A/AAAA) + 4 (0q, 2q, update, chaos) = 26.
-	if len(events) != 26 {
-		t.Fatalf("expected 26 audited DNS events, got %d", len(events))
+	// DNS response packet (QR=1) must NOT be answered, and must still be audited.
+	mResp := new(mdns.Msg)
+	mResp.Id = mdns.Id()
+	mResp.Response = true
+	mResp.Opcode = mdns.OpcodeQuery
+	mResp.Question = []mdns.Question{{Name: "api.anthropic.com.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET}}
+	rawRespPkt, err := mResp.Pack()
+	if err != nil {
+		t.Fatalf("pack QR=1 msg: %v", err)
+	}
+	rawUDP, err := net.Dial("udp4", dnsAddr)
+	if err != nil {
+		t.Fatalf("dial udp4 for QR=1: %v", err)
+	}
+	if _, err := rawUDP.Write(rawRespPkt); err != nil {
+		if cErr := rawUDP.Close(); cErr != nil {
+			t.Errorf("close rawUDP: %v", cErr)
+		}
+		t.Fatalf("write QR=1 packet: %v", err)
+	}
+	if err := rawUDP.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		if cErr := rawUDP.Close(); cErr != nil {
+			t.Errorf("close rawUDP: %v", cErr)
+		}
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	var replyBuf [512]byte
+	if n, rErr := rawUDP.Read(replyBuf[:]); rErr == nil {
+		if cErr := rawUDP.Close(); cErr != nil {
+			t.Errorf("close rawUDP: %v", cErr)
+		}
+		t.Fatalf("expected DNS server to ignore QR=1 response packet, got %d-byte reply", n)
+	} else if ne, ok := rErr.(net.Error); !ok || !ne.Timeout() {
+		if cErr := rawUDP.Close(); cErr != nil {
+			t.Errorf("close rawUDP: %v", cErr)
+		}
+		t.Fatalf("unexpected read error waiting on ignored QR=1 packet: %v", rErr)
+	}
+	if err := rawUDP.Close(); err != nil {
+		t.Fatalf("close rawUDP: %v", err)
+	}
+
+	// Audit completeness check: every packet above (incl. malformed/opcode/class/QR=1) produced an audit record.
+	var events []audit.Event
+	var sawQRIgnored bool
+	deadline := time.Now().Add(time.Second)
+	for {
+		events = readAuditEvents(t, auditDir)
+		for _, ev := range events {
+			if ev.Reason == "response-packet-ignored" && ev.Effect == audit.EffectDeny {
+				sawQRIgnored = true
+				break
+			}
+		}
+		if sawQRIgnored && len(events) == 27 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// 2 (A udp+tcp) + 3 (AAAA/HTTPS/SVCB) + 15 (5 qtypes * 3 hosts) + 2 (blocked A/AAAA) + 5 (0q, 2q, update, chaos, QR=1) = 27.
+	if len(events) != 27 || !sawQRIgnored {
+		t.Fatalf("expected 27 audited DNS events including response-packet-ignored, got len=%d sawQRIgnored=%v", len(events), sawQRIgnored)
 	}
 
 	// Containment: fail closed when audit sink becomes unwritable (must NOT return an A answer).
