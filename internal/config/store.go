@@ -293,26 +293,16 @@ func (s *Store) RevokeGrant(id string) bool {
 	return true
 }
 
-// ActiveGrants returns all non-expired grants (pruning expired ones and firing onExpired callbacks).
+// ActiveGrants returns all non-expired grants without mutating state or firing callbacks.
+// Expired grants are removed and their callbacks invoked only by PruneExpiredGrants.
 func (s *Store) ActiveGrants() []Grant {
 	now := s.now().UTC()
-	s.mu.Lock()
-	var expired []Grant
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]Grant, 0, len(s.grants))
-	for id, g := range s.grants {
-		if !g.ExpiresAt.After(now) {
-			delete(s.grants, id)
-			expired = append(expired, g)
-			continue
-		}
-		out = append(out, g)
-	}
-	cbs := slices.Clone(s.onExpired)
-	s.mu.Unlock()
-
-	for _, g := range expired {
-		for _, cb := range cbs {
-			cb(g)
+	for _, g := range s.grants {
+		if g.ExpiresAt.After(now) {
+			out = append(out, g)
 		}
 	}
 	return out

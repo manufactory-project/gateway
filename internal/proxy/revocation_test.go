@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/netguard"
+	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
 func TestLiveTeardownOnGrantExpiryRevokeAndReload(t *testing.T) {
@@ -601,4 +603,117 @@ func TestWebSocketRevokedDuringHandshake(t *testing.T) {
 
 	t.Run("by_flow_id", func(t *testing.T) { runCase(t, false) })
 	t.Run("by_grant_expiry", func(t *testing.T) { runCase(t, true) })
+}
+
+func TestReloadWithUnprunedExpiredGrantDoesNotDeadlock(t *testing.T) {
+	streamOpenCh := make(chan struct{}, 2)
+	releaseHold := make(chan struct{})
+
+	gw := newTestGateway(t, testGatewaySpec{
+		OnCleanupFirst:   func() { close(releaseHold) },
+		StartGrantPruner: false,
+		Hosts:            []string{"reload-exp.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			rc := http.NewResponseController(w)
+			if _, err := io.WriteString(w, "data: open\n\n"); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+			streamOpenCh <- struct{}{}
+			<-releaseHold
+		}),
+	})
+
+	g, err := gw.Store.AddGrant("worker-test", "reload-exp.example.com", 443, []string{"GET"}, []string{"/stream"}, 40*time.Millisecond, false)
+	if err != nil {
+		t.Fatalf("AddGrant: %v", err)
+	}
+
+	resp, err := gw.H1Client(t, "reload-exp.example.com").Get("https://reload-exp.example.com/stream")
+	if err != nil {
+		t.Fatalf("GET /stream: %v", err)
+	}
+	t.Cleanup(func() {
+		if cErr := resp.Body.Close(); cErr != nil {
+			t.Logf("close resp: %v", cErr)
+		}
+	})
+	select {
+	case <-streamOpenCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for SSE stream to open")
+	}
+
+	// Wait past grant expiry without running the pruner.
+	time.Sleep(70 * time.Millisecond)
+
+	// ActiveGrants must be a pure read: filters out expired grant without firing expiry callbacks.
+	if active := gw.Store.ActiveGrants(); len(active) != 0 {
+		t.Fatalf("expected 0 active grants after expiry, got %+v", active)
+	}
+	if cnt := gw.Flows.Count(); cnt != 1 {
+		t.Fatalf("ActiveGrants must not fire expiry teardown; expected 1 active flow, got %d", cnt)
+	}
+
+	// teardownWhere must not hold r.mu while invoking pred (re-entering RevokeByGrant must not deadlock).
+	reenterDone := make(chan struct{})
+	go func() {
+		defer close(reenterDone)
+		gw.Flows.RevokeWhere(func(_ proxy.FlowInfo) bool {
+			_ = gw.Store.ActiveGrants()
+			_ = gw.Flows.RevokeByGrant("nonexistent")
+			return false
+		})
+	}()
+	select {
+	case <-reenterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RevokeWhere deadlocked on re-entrant predicate")
+	}
+
+	// Reload while flow is open and grant is expired-but-unpruned must complete within 2s and tear down the flow.
+	type reloadRes struct {
+		wiped []string
+		err   error
+	}
+	reloadDone := make(chan reloadRes, 1)
+	go func() {
+		_, wiped, rErr := gw.Store.Reload()
+		reloadDone <- reloadRes{wiped: wiped, err: rErr}
+	}()
+	select {
+	case res := <-reloadDone:
+		if res.err != nil {
+			t.Fatalf("Reload failed: %v", res.err)
+		}
+		if !slices.Contains(res.wiped, g.ID) {
+			t.Fatalf("expected Reload to wipe unpruned expired grant %s, got wiped=%v", g.ID, res.wiped)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Reload deadlocked or timed out with unpruned expired grant")
+	}
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		if _, rErr := io.Copy(io.Discard, resp.Body); rErr != nil {
+			return
+		}
+	}()
+	select {
+	case <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("open flow was not torn down after Reload")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for gw.Flows.Count() != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if cnt := gw.Flows.Count(); cnt != 0 {
+		t.Fatalf("flow remained in registry after reload teardown: count=%d", cnt)
+	}
 }

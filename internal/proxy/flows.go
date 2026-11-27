@@ -201,12 +201,29 @@ func (r *FlowRegistry) drainLink(linkName string) {
 }
 
 func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool) []FlowInfo {
-	r.mu.Lock()
-	var targets []*activeFlow
-	for id, af := range r.flows {
+	r.mu.RLock()
+	snapshot := make([]*activeFlow, 0, len(r.flows))
+	for _, af := range r.flows {
+		snapshot = append(snapshot, af)
+	}
+	r.mu.RUnlock()
+
+	var matched []*activeFlow
+	for _, af := range snapshot {
 		if pred(af.info) {
+			matched = append(matched, af)
+		}
+	}
+	if len(matched) == 0 {
+		return nil
+	}
+
+	r.mu.Lock()
+	targets := make([]*activeFlow, 0, len(matched))
+	for _, af := range matched {
+		if cur, ok := r.flows[af.info.ID]; ok && cur == af {
+			delete(r.flows, af.info.ID)
 			targets = append(targets, af)
-			delete(r.flows, id)
 		}
 	}
 	r.mu.Unlock()

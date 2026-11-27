@@ -280,7 +280,13 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	}
 	nowNano.Add(int64(2 * time.Minute))
 	if got := store.ActiveGrants(); len(got) != 0 {
-		t.Fatalf("expected expired grant to be pruned, got %+v", got)
+		t.Fatalf("expected expired grant to be filtered out, got %+v", got)
+	}
+	if expiredID != "" {
+		t.Fatalf("ActiveGrants must not fire expiry callback, got %q", expiredID)
+	}
+	if pruned := store.PruneExpiredGrants(); len(pruned) != 1 || pruned[0] != g2.ID {
+		t.Fatalf("PruneExpiredGrants() = %v, want [%s]", pruned, g2.ID)
 	}
 	if expiredID != g2.ID {
 		t.Fatalf("expired callback id = %q, want %q", expiredID, g2.ID)
