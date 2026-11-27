@@ -443,8 +443,8 @@ func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
 		rec := httptest.NewRecorder()
 		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 		mText := rec.Body.String()
-		if !strings.Contains(mText, `gateway_requests_total{effect="allow",principal="worker-test",status="499"} 1`) {
-			t.Fatalf("metrics missing status=499 counter:\n%s", mText)
+		if !strings.Contains(mText, `gateway_requests_total{effect="allow",principal="worker-test",reason="client-canceled",status="499"} 1`) {
+			t.Fatalf("metrics missing status=499 reason=client-canceled counter:\n%s", mText)
 		}
 		if strings.Contains(mText, `status="502"`) {
 			t.Fatalf("metrics unexpectedly counted client-canceled request as 502:\n%s", mText)
@@ -538,8 +538,9 @@ func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
 		rec := httptest.NewRecorder()
 		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 		mText := rec.Body.String()
-		if !strings.Contains(mText, `gateway_requests_total{effect="allow",principal="worker-test",status="502"} 2`) {
-			t.Fatalf("metrics missing status=502 count 2:\n%s", mText)
+		if !strings.Contains(mText, `gateway_requests_total{effect="allow",principal="worker-test",reason="upstream-error",status="502"} 1`) ||
+			!strings.Contains(mText, `gateway_requests_total{effect="allow",principal="worker-test",reason="revoked",status="502"} 1`) {
+			t.Fatalf("metrics missing bounded status=502 reason counters:\n%s", mText)
 		}
 		if strings.Contains(mText, `status="499"`) {
 			t.Fatalf("metrics unexpectedly recorded status=499:\n%s", mText)
@@ -886,5 +887,83 @@ rules:
 	}
 	if blockedAudits != 3 {
 		t.Fatalf("audited SSRF-blocked 502 events = %d, want 3", blockedAudits)
+	}
+}
+
+func TestMetricsReasonLabelAndCompletionAuditFailureCounts(t *testing.T) {
+	inUpstream := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	gw := newTestGateway(t, testGatewaySpec{
+		AuditMaxFileBytes: 180,
+		OnCleanupFirst:    func() { close(releaseUpstream) },
+		Hosts:             []string{"met.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/fail-complete-audit" {
+				close(inUpstream)
+				<-releaseUpstream
+			}
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.WriteString(w, "ok"); err != nil {
+				return
+			}
+		}),
+		RulesYAML: `
+  - id: allow-met
+    principal: worker-test
+    effect: allow
+    hosts: [met.example.com]
+    ports: [443]
+    methods: [GET]
+    paths: ["/ok", "/fail-complete-audit"]
+`,
+	})
+
+	// 1. Denied request gets bounded reason="default-deny".
+	rDeny, err := gw.H1Client(t, "met.example.com").Get("https://met.example.com/denied")
+	if err != nil {
+		t.Fatalf("GET /denied: %v", err)
+	}
+	if err := rDeny.Body.Close(); err != nil {
+		t.Fatalf("close /denied: %v", err)
+	}
+	if rDeny.StatusCode != http.StatusForbidden {
+		t.Fatalf("/denied status = %d, want 403", rDeny.StatusCode)
+	}
+
+	// 2. Break the audit sink AFTER admission so completion audit write fails on rotation.
+	doneCh := make(chan error, 1)
+	go func() {
+		resp, gErr := gw.H1Client(t, "met.example.com").Get("https://met.example.com/fail-complete-audit")
+		if gErr == nil {
+			if cErr := resp.Body.Close(); cErr != nil {
+				doneCh <- cErr
+				return
+			}
+		}
+		doneCh <- gErr
+	}()
+	<-inUpstream
+	if err := os.RemoveAll(gw.AuditDir); err != nil {
+		t.Fatalf("remove AuditDir: %v", err)
+	}
+	if err := os.WriteFile(gw.AuditDir, []byte("blocked"), 0o600); err != nil {
+		t.Fatalf("replace AuditDir with file: %v", err)
+	}
+	releaseUpstream <- struct{}{}
+	if err := <-doneCh; err != nil {
+		t.Fatalf("GET /fail-complete-audit: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	mText := rec.Body.String()
+	for _, want := range []string{
+		`gateway_requests_total{effect="deny",principal="worker-test",reason="default-deny",status="403"} 1`,
+		`gateway_requests_total{effect="allow",principal="worker-test",reason="rule-allow",status="200"} 1`,
+		"gateway_audit_write_errors_total 1",
+	} {
+		if !strings.Contains(mText, want) {
+			t.Fatalf("/metrics missing %q:\n%s", want, mText)
+		}
 	}
 }

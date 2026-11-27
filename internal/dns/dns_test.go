@@ -327,6 +327,115 @@ rules:
 	}
 }
 
+func TestMalformedDNSPacketAuditedAsDenyMalformed(t *testing.T) {
+	dir := t.TempDir()
+	auditDir := filepath.Join(dir, "audit")
+	ports := freePorts(t, "127.0.12.1", 3)
+	dnsPort, httpsPort, httpPort := ports[0], ports[1], ports[2]
+	dnsAddr := net.JoinHostPort("127.0.12.1", strconv.Itoa(int(dnsPort)))
+
+	cfgYAML := `
+ca:
+  cert_path: /tmp/ca.crt
+  key_path: /tmp/ca.key
+audit:
+  dir: ` + auditDir + `
+links:
+  - name: sbx0
+    principal: worker-malformed
+    subnet: 127.0.12.0/28
+    gateway_ip: 127.0.12.1
+    dns_port: ` + strconv.Itoa(int(dnsPort)) + `
+    https_port: ` + strconv.Itoa(int(httpsPort)) + `
+    http_port: ` + strconv.Itoa(int(httpPort)) + `
+`
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := aw.Close(); err != nil {
+			t.Errorf("audit close: %v", err)
+		}
+	})
+	alloc, err := gwdns.NewAllocator(netip.MustParsePrefix("198.18.0.0/15"))
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+	srv, err := gwdns.NewServer(gwdns.ServerOptions{
+		Link:      store.Current().Config.Links[0],
+		Store:     store,
+		Evaluator: policy.NewEvaluator(store),
+		Audit:     aw,
+		Allocator: alloc,
+	})
+	if err != nil {
+		t.Fatalf("dns.NewServer: %v", err)
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("dns.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Errorf("dns.Shutdown: %v", err)
+		}
+	})
+
+	// Send truncated/corrupt DNS header over UDP (too short to unpack).
+	uc, err := net.DialTimeout("udp4", dnsAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial udp4: %v", err)
+	}
+	if _, err := uc.Write([]byte{0xde, 0xad, 0xbe, 0xef}); err != nil {
+		t.Fatalf("write malformed udp: %v", err)
+	}
+	if err := uc.Close(); err != nil {
+		t.Fatalf("close udp: %v", err)
+	}
+
+	// Send truncated DNS message over TCP (2-byte length prefix = 4, followed by 4 garbage bytes).
+	tc, err := net.DialTimeout("tcp4", dnsAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial tcp4: %v", err)
+	}
+	if _, err := tc.Write([]byte{0x00, 0x04, 0xde, 0xad, 0xbe, 0xef}); err != nil {
+		t.Fatalf("write malformed tcp: %v", err)
+	}
+	if err := tc.Close(); err != nil {
+		t.Fatalf("close tcp: %v", err)
+	}
+
+	var sawUDP, sawTCP bool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, ev := range readAuditEvents(t, auditDir) {
+			if ev.Kind == audit.KindDNS && ev.Effect == audit.EffectDeny && ev.Reason == "malformed" {
+				if ev.Protocol == "udp" {
+					sawUDP = true
+				}
+				if ev.Protocol == "tcp" {
+					sawTCP = true
+				}
+			}
+		}
+		if sawUDP && sawTCP {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("expected malformed DNS audit events for both udp and tcp, got udp=%v tcp=%v", sawUDP, sawTCP)
+}
+
 func readAuditEvents(t *testing.T, dir string) []audit.Event {
 	t.Helper()
 	entries, err := os.ReadDir(dir)

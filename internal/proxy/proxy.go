@@ -41,7 +41,7 @@ type Options struct {
 	Dialer      *netguard.Dialer
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	Flows          *FlowRegistry
-	OnRequest      func(principal, effect string, status int)
+	OnRequest      func(principal, effect string, status int, reason string)
 	OnConnRejected func(link string)
 }
 
@@ -55,7 +55,7 @@ type Server struct {
 	leaves         *ca.LeafCache
 	dialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
 	flows          *FlowRegistry
-	onRequest      func(principal, effect string, status int)
+	onRequest      func(principal, effect string, status int, reason string)
 	onConnRejected func(link string)
 
 	transport *http.Transport
@@ -321,6 +321,9 @@ func (s *Server) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 }
 
 func (s *Server) auditDeniedSNI(srcIP, sni, reason, ruleID string) {
+	if s.onRequest != nil {
+		s.onRequest(s.link.Principal, string(audit.EffectDeny), 0, reason)
+	}
 	ev := audit.Event{
 		Kind:      audit.KindRequest,
 		Principal: s.link.Principal,
@@ -335,9 +338,6 @@ func (s *Server) auditDeniedSNI(srcIP, sni, reason, ruleID string) {
 	}
 	if err := s.audit.WriteSync(ev); err != nil {
 		return
-	}
-	if s.onRequest != nil {
-		s.onRequest(s.link.Principal, string(audit.EffectDeny), 0)
 	}
 }
 
@@ -385,11 +385,14 @@ func (rc *reqContext) deny(w http.ResponseWriter, status int, reason string) {
 	ev.Effect = audit.EffectDeny
 	ev.Reason = reason
 	if err := rc.srv.audit.WriteSync(ev); err != nil {
+		if rc.srv.onRequest != nil {
+			rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectDeny), http.StatusServiceUnavailable, "audit-unavailable")
+		}
 		http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if rc.srv.onRequest != nil {
-		rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectDeny), status)
+		rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectDeny), status, reason)
 	}
 	http.Error(w, "egress denied: "+reason, status)
 }
@@ -400,7 +403,30 @@ func (rc *reqContext) auditAdmitted() error {
 	return rc.srv.audit.WriteSync(ev)
 }
 
+func completionMetricReason(admitReason, errText string) string {
+	if errText == "" {
+		if admitReason != "" {
+			return admitReason
+		}
+		return "ok"
+	}
+	if strings.HasPrefix(errText, "ws-egress-cap-exceeded:") {
+		return "ws-egress-cap-exceeded"
+	}
+	switch errText {
+	case TeardownRevoked, TeardownGrantExpired, TeardownReload, TeardownClientCanceled,
+		"compressed-response-on-bound-host", "redaction-secret-unresolved",
+		"unexpected-101", "unexpected-101-non-websocket":
+		return errText
+	default:
+		return "upstream-error"
+	}
+}
+
 func (rc *reqContext) auditCompleted(status int, bytesOut, bytesIn int64, errText string) {
+	if rc.srv.onRequest != nil {
+		rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectAllow), status, completionMetricReason(rc.dec.Reason, errText))
+	}
 	kind := audit.KindRequest
 	if rc.wantWS {
 		kind = audit.KindWebSocket
@@ -413,9 +439,6 @@ func (rc *reqContext) auditCompleted(status int, bytesOut, bytesIn int64, errTex
 	ev.Error = errText
 	if err := rc.srv.audit.WriteSync(ev); err != nil {
 		return
-	}
-	if rc.srv.onRequest != nil {
-		rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectAllow), status)
 	}
 }
 

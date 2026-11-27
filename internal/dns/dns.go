@@ -172,12 +172,14 @@ func (s *Server) Start() error {
 		PacketConn:        pc,
 		Handler:           handler,
 		MsgAcceptFunc:     acceptAll,
+		MsgInvalidFunc:    func(_ []byte, _ error) { s.auditMalformed("udp") },
 		NotifyStartedFunc: func() { close(udpReady) },
 	}
 	s.tcpSrv = &mdns.Server{
 		Listener:          ln,
 		Handler:           handler,
 		MsgAcceptFunc:     acceptAll,
+		MsgInvalidFunc:    func(_ []byte, _ error) { s.auditMalformed("tcp") },
 		NotifyStartedFunc: func() { close(tcpReady) },
 	}
 
@@ -360,6 +362,21 @@ func (s *Server) auditAndReply(w mdns.ResponseWriter, resp *mdns.Msg, rcode int,
 		s.onQuery(s.link.Principal, string(ev.Effect))
 	}
 	s.writeResponse(w, resp)
+}
+
+func (s *Server) auditMalformed(proto string) {
+	ev := s.newEvent("", proto, "", "")
+	ev.Effect = audit.EffectDeny
+	ev.Reason = "malformed"
+	if err := s.audit.WriteSync(ev); err != nil {
+		if s.onQuery != nil {
+			s.onQuery(s.link.Principal, "audit_error")
+		}
+		return
+	}
+	if s.onQuery != nil {
+		s.onQuery(s.link.Principal, string(audit.EffectDeny))
+	}
 }
 
 func (s *Server) writeResponse(w mdns.ResponseWriter, msg *mdns.Msg) {

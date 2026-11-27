@@ -52,7 +52,7 @@ func NewCollector(opts Options) *Collector {
 		requestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_requests_total",
 			Help: "Total HTTP/TLS/WebSocket requests handled by gateway.",
-		}, []string{"principal", "effect", "status"}),
+		}, []string{"principal", "effect", "status", "reason"}),
 		dnsQueriesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_dns_queries_total",
 			Help: "Total fake-IP DNS queries handled by gateway.",
@@ -113,9 +113,65 @@ func (c *Collector) IncConnRejected(link string) {
 	c.connsRejectedTotal.WithLabelValues(link).Inc()
 }
 
-// ObserveRequest increments gateway_requests_total.
-func (c *Collector) ObserveRequest(principal, effect string, status int) {
-	c.requestsTotal.WithLabelValues(principal, effect, strconv.Itoa(status)).Inc()
+// knownRequestReasons bounds the Prometheus reason label to a fixed set of
+// deny and completion reason tokens so free-form text can never explode cardinality.
+var knownRequestReasons = map[string]struct{}{
+	"ok":                               {},
+	"rule-allow":                       {},
+	"grant-allow":                      {},
+	"rule-deny":                        {},
+	"default-deny":                     {},
+	"port-denied":                      {},
+	"invalid-host":                     {},
+	"invalid-path":                     {},
+	"missing-sni":                      {},
+	"ip-literal-sni":                   {},
+	"connect-forbidden":                {},
+	"asterisk-target-forbidden":        {},
+	"absolute-uri-forbidden":           {},
+	"non-origin-form-target":           {},
+	"escaped-path-separator":           {},
+	"backslash-in-path":                {},
+	"path-traversal":                   {},
+	"non-canonical-path":               {},
+	"h2-host-header":                   {},
+	"missing-host":                     {},
+	"host-port-mismatch":               {},
+	"ip-literal-host":                  {},
+	"missing-tls":                      {},
+	"sni-host-mismatch":                {},
+	"invalid-websocket-upgrade":        {},
+	"upgrade-forbidden":                {},
+	"websocket-not-allowed":            {},
+	"websocket-upgrade-with-body":      {},
+	"body-too-large":                   {},
+	"secret-unresolved":                {},
+	"build-request-failed":             {},
+	"grant-revoked":                    {},
+	"binding-rule-changed":             {},
+	"audit-unavailable":                {},
+	"revoked":                          {},
+	"grant-expired":                    {},
+	"reload":                           {},
+	"client-canceled":                  {},
+	"ws-egress-cap-exceeded":           {},
+	"compressed-response-on-bound-host": {},
+	"redaction-secret-unresolved":      {},
+	"unexpected-101":                   {},
+	"unexpected-101-non-websocket":     {},
+	"upstream-error":                   {},
+}
+
+func boundedRequestReason(reason string) string {
+	if _, ok := knownRequestReasons[reason]; ok {
+		return reason
+	}
+	return "other"
+}
+
+// ObserveRequest increments gateway_requests_total with a bounded reason label.
+func (c *Collector) ObserveRequest(principal, effect string, status int, reason string) {
+	c.requestsTotal.WithLabelValues(principal, effect, strconv.Itoa(status), boundedRequestReason(reason)).Inc()
 }
 
 // ObserveDNSQuery increments gateway_dns_queries_total.

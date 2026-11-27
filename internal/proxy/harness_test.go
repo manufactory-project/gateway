@@ -234,20 +234,21 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	aw, err := audit.NewWriter(audit.Options{
-		Dir:          auditDir,
-		MaxFileBytes: spec.AuditMaxFileBytes,
-	})
-	if err != nil {
-		t.Fatalf("audit.NewWriter: %v", err)
-	}
-
 	flows := proxy.NewFlowRegistry()
 	col := metrics.NewCollector(metrics.Options{
 		ActiveFlows:  flows.Count,
 		ActiveGrants: func() int { return len(store.ActiveGrants()) },
 	})
 	flows.SetOnRevoke(col.AddRevocations)
+
+	aw, err := audit.NewWriter(audit.Options{
+		Dir:          auditDir,
+		MaxFileBytes: spec.AuditMaxFileBytes,
+		OnWriteError: col.IncAuditWriteError,
+	})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
 
 	var cs *countingSigner
 	leafCA := mitmCA

@@ -67,7 +67,8 @@ func TestMetricsExplicitBindAndExposition(t *testing.T) {
 	})
 
 	col.IncAuditWriteError()
-	col.ObserveRequest("worker-claude", "allow", 200)
+	col.ObserveRequest("worker-claude", "allow", 200, "rule-allow")
+	col.ObserveRequest("worker-claude", "allow", 502, "free-form error: dial tcp 1.2.3.4:443 i/o timeout")
 	col.ObserveDNSQuery("worker-claude", "deny")
 	col.ObserveReload(true)
 	col.AddRevocations(2)
@@ -93,7 +94,8 @@ func TestMetricsExplicitBindAndExposition(t *testing.T) {
 	text := string(body)
 	for _, want := range []string{
 		"gateway_audit_write_errors_total 1",
-		`gateway_requests_total{effect="allow",principal="worker-claude",status="200"} 1`,
+		`gateway_requests_total{effect="allow",principal="worker-claude",reason="rule-allow",status="200"} 1`,
+		`gateway_requests_total{effect="allow",principal="worker-claude",reason="other",status="502"} 1`,
 		`gateway_dns_queries_total{effect="deny",principal="worker-claude"} 1`,
 		`gateway_reloads_total{result="ok"} 1`,
 		"gateway_revocations_total 2",
