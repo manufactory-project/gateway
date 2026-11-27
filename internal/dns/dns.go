@@ -23,20 +23,16 @@ import (
 	"github.com/manufactory-project/gateway/internal/policy"
 )
 
-// Allocator assigns stable fake IPv4 addresses from a configured CIDR range,
-// skipping network and broadcast addresses.
+// Allocator deterministically maps normalized hostnames into usable IPv4 addresses
+// in a configured CIDR range (excluding network and broadcast addresses).
+// It is stateless and concurrency-safe: nothing reverse-resolves fake IPs because
+// the proxy routes by TLS SNI and HTTP Host/:authority.
 type Allocator struct {
-	prefix netip.Prefix
-	first  uint32
-	count  uint32
-
-	mu         sync.Mutex
-	hostToIP   map[string]netip.Addr
-	ipToHost   map[netip.Addr]string
-	nextOffset uint32
+	first uint32
+	count uint32
 }
 
-// NewAllocator constructs a fake-IPv4 Allocator for prefix (must be IPv4, <= /30).
+// NewAllocator constructs a stateless fake-IPv4 Allocator for prefix (must be IPv4, <= /30).
 func NewAllocator(prefix netip.Prefix) (*Allocator, error) {
 	prefix = prefix.Masked()
 	if !prefix.Addr().Is4() || prefix.Bits() > 30 {
@@ -48,52 +44,20 @@ func NewAllocator(prefix netip.Prefix) (*Allocator, error) {
 	total := uint32(1) << hostBits
 	usable := total - 2 // exclude network and broadcast
 	return &Allocator{
-		prefix:   prefix,
-		first:    base + 1,
-		count:    usable,
-		hostToIP: make(map[string]netip.Addr),
-		ipToHost: make(map[netip.Addr]string),
+		first: base + 1,
+		count: usable,
 	}, nil
 }
 
-// Allocate returns the fake IPv4 address for normalized host, assigning a new one
-// from the pool if not yet seen.
+// Allocate returns the deterministic fake IPv4 address for normalized host.
 func (a *Allocator) Allocate(host string) netip.Addr {
 	host = config.NormalizeHost(host)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if ip, ok := a.hostToIP[host]; ok {
-		return ip
-	}
-
 	h := fnv.New32a()
 	// hash.Hash.Write never returns an error.
 	if _, err := h.Write([]byte(host)); err != nil {
 		return uint32ToIPv4(a.first)
 	}
-	start := h.Sum32() % a.count
-
-	for i := uint32(0); i < a.count; i++ {
-		off := (start + i) % a.count
-		cand := uint32ToIPv4(a.first + off)
-		if _, used := a.ipToHost[cand]; !used {
-			a.hostToIP[host] = cand
-			a.ipToHost[cand] = host
-			return cand
-		}
-	}
-
-	// Pool exhausted: deterministically reuse next slot cleanly.
-	off := a.nextOffset % a.count
-	a.nextOffset++
-	cand := uint32ToIPv4(a.first + off)
-	if oldHost, exists := a.ipToHost[cand]; exists {
-		delete(a.hostToIP, oldHost)
-	}
-	a.hostToIP[host] = cand
-	a.ipToHost[cand] = host
-	return cand
+	return uint32ToIPv4(a.first + (h.Sum32() % a.count))
 }
 
 func uint32ToIPv4(v uint32) netip.Addr {

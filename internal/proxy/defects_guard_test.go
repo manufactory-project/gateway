@@ -621,3 +621,97 @@ func TestHostWideDenyWithPathScopedAllowEndToEnd(t *testing.T) {
 		t.Fatalf("GET /other status = %d, want 403", rOther.StatusCode)
 	}
 }
+
+func TestSharedFakeIPDoesNotBreakProxying(t *testing.T) {
+	// /30 has only 2 usable host IPs (.1 and .2); among 3 names, at least 2 deterministically collide.
+	prefix := netip.MustParsePrefix("198.18.0.0/30")
+	alloc, err := gwdns.NewAllocator(prefix)
+	if err != nil {
+		t.Fatalf("NewAllocator(/30): %v", err)
+	}
+	candidates := []string{"a.collide.example", "b.collide.example", "c.collide.example"}
+	byIP := make(map[netip.Addr]string)
+	var hostA, hostB string
+	var sharedIP netip.Addr
+	for _, h := range candidates {
+		ip := alloc.Allocate(h)
+		if ip == netip.MustParseAddr("198.18.0.0") || ip == netip.MustParseAddr("198.18.0.3") || !prefix.Contains(ip) {
+			t.Fatalf("Allocate(%s) = %s, outside usable /30 range", h, ip)
+		}
+		if again := alloc.Allocate(strings.ToUpper(h) + "."); again != ip {
+			t.Fatalf("Allocate not stable for %s: %s != %s", h, again, ip)
+		}
+		if prev, ok := byIP[ip]; ok {
+			hostA, hostB, sharedIP = prev, h, ip
+			break
+		}
+		byIP[ip] = h
+	}
+	if hostA == "" || hostB == "" {
+		t.Fatal("pigeonhole invariant violated: 3 names in /30 produced no shared IP")
+	}
+
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{hostA, hostB},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.WriteString(w, "host="+r.Host); err != nil {
+				return
+			}
+		}),
+		RulesYAML: fmt.Sprintf(`
+  - id: allow-colliding
+    principal: worker-test
+    effect: allow
+    hosts: [%s, %s]
+    ports: [443]
+`, hostA, hostB),
+	})
+
+	link := gw.Store.Current().Config.Links[0]
+	dnsSrv, err := gwdns.NewServer(gwdns.ServerOptions{
+		Link:      link,
+		Store:     gw.Store,
+		Evaluator: policy.NewEvaluator(gw.Store),
+		Audit:     gw.Audit,
+		Allocator: alloc,
+	})
+	if err != nil {
+		t.Fatalf("dns.NewServer: %v", err)
+	}
+	if err := dnsSrv.Start(); err != nil {
+		t.Fatalf("dns.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := dnsSrv.Shutdown(ctx); err != nil {
+			t.Errorf("dns.Shutdown: %v", err)
+		}
+	})
+	dnsAddr := net.JoinHostPort(link.ParsedGatewayIP.String(), strconv.Itoa(int(link.DNSPort)))
+	for _, h := range []string{hostA, hostB} {
+		q := new(mdns.Msg)
+		q.SetQuestion(mdns.Fqdn(h), mdns.TypeA)
+		ans, _, qErr := (&mdns.Client{Net: "udp", Timeout: 2 * time.Second}).Exchange(q, dnsAddr)
+		if qErr != nil || ans.Rcode != mdns.RcodeSuccess || len(ans.Answer) != 1 {
+			t.Fatalf("DNS %s failed: ans=%+v err=%v", h, ans, qErr)
+		}
+		aRec, ok := ans.Answer[0].(*mdns.A)
+		if !ok || aRec.A.String() != sharedIP.String() {
+			t.Fatalf("DNS %s returned %v, want shared IP %s", h, ans.Answer[0], sharedIP)
+		}
+
+		resp, rErr := gw.H1Client(t, h).Get("https://" + h + "/check")
+		if rErr != nil {
+			t.Fatalf("GET %s: %v", h, rErr)
+		}
+		body, bErr := io.ReadAll(resp.Body)
+		if cErr := resp.Body.Close(); cErr != nil {
+			t.Fatalf("close %s: %v", h, cErr)
+		}
+		if bErr != nil || resp.StatusCode != http.StatusOK || string(body) != "host="+h {
+			t.Fatalf("GET %s got status=%d body=%q err=%v, want 200 host=%s", h, resp.StatusCode, string(body), bErr, h)
+		}
+	}
+}
