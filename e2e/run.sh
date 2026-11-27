@@ -14,6 +14,8 @@ REMOTE=""
 TARGET=""
 IMAGE="images:ubuntu/24.04"
 MGMT_NET="incusbr0"
+MGMT_NET_EXPLICIT=0
+CREATE_MGMT_NET=0
 STORAGE_POOL="default"
 UPSTREAM_HOST="httpbingo.org"
 LAN_ADDR=""
@@ -35,7 +37,8 @@ Options:
   --remote <name>           Incus remote prefix (empty = local default)
   --target <member>         Incus cluster member for all bridges and instances (required on clusters)
   --image <image>           Container image (default: images:ubuntu/24.04)
-  --mgmt-network <name>     Management/upstream bridge for gw eth0 (default: incusbr0)
+  --mgmt-network <name>     Existing management/upstream bridge for gw eth0 (default: incusbr0)
+  --create-mgmt-network     Create a dedicated NAT bridge gwdm-<tag> for gw eth0 and delete on cleanup
   --storage-pool <name>     Storage pool for project default profile (default: default)
   --upstream-host <host>    Allowlisted test upstream host (default: httpbingo.org)
   --lan-addr <ip:port>      LAN ip:port expected unreachable (default: gw upstream gateway:22)
@@ -56,7 +59,8 @@ while [[ $# -gt 0 ]]; do
     --remote) REMOTE="${2:?missing value for --remote}"; shift 2 ;;
     --target) TARGET="${2:?missing value for --target}"; shift 2 ;;
     --image) IMAGE="${2:?missing value for --image}"; shift 2 ;;
-    --mgmt-network) MGMT_NET="${2:?missing value for --mgmt-network}"; shift 2 ;;
+    --mgmt-network) MGMT_NET="${2:?missing value for --mgmt-network}"; MGMT_NET_EXPLICIT=1; shift 2 ;;
+    --create-mgmt-network) CREATE_MGMT_NET=1; shift ;;
     --storage-pool) STORAGE_POOL="${2:?missing value for --storage-pool}"; shift 2 ;;
     --upstream-host) UPSTREAM_HOST="${2:?missing value for --upstream-host}"; shift 2 ;;
     --lan-addr) LAN_ADDR="${2:?missing value for --lan-addr}"; shift 2 ;;
@@ -104,36 +108,48 @@ PROJ_TAG="$(printf '%s' "$PROJECT" | sha256sum | cut -c1-6)"
 NET0="sbx0-${PROJ_TAG}"
 NET1="sbx1-${PROJ_TAG}"
 
+if [[ "$CREATE_MGMT_NET" -eq 1 ]]; then
+  if [[ "$MGMT_NET_EXPLICIT" -eq 1 ]]; then
+    echo "error: --create-mgmt-network cannot be combined with --mgmt-network" >&2
+    exit 2
+  fi
+  MGMT_NET="gwdm-${PROJ_TAG}"
+fi
+
 GW_INST="${RPREFIX}gw"
 G0_INST="${RPREFIX}guest0"
 G1_INST="${RPREFIX}guest1"
 
 # Exact Incus provisioning commands printed before confirmation.
 print_plan() {
-  cat <<EOF
-Planned Incus commands (throwaway project '${PROJECT}', remote '${REMOTE:-local}', target '${TARGET:-none (standalone)}'):
-  incus project create ${RPREFIX}${PROJECT} -c features.images=false -c features.profiles=true -c features.networks=false -c features.storage.volumes=false
-  incus profile device add ${RPREFIX}default root disk path=/ pool=${STORAGE_POOL} --project ${PROJECT}
-  incus network create ${RPREFIX}${NET0} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}
-  incus network create ${RPREFIX}${NET1} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}
-  incus init ${IMAGE} ${GW_INST} --project ${PROJECT}${TARGET_FLAG}
-  incus config device add ${GW_INST} eth0 nic network=${MGMT_NET} name=eth0 --project ${PROJECT}
-  incus config device add ${GW_INST} sbx0 nic network=${NET0} name=sbx0 --project ${PROJECT}
-  incus config device add ${GW_INST} sbx1 nic network=${NET1} name=sbx1 --project ${PROJECT}
-  incus start ${GW_INST} --project ${PROJECT}
-  incus init ${IMAGE} ${G0_INST} --project ${PROJECT}${TARGET_FLAG}
-  incus config device add ${G0_INST} eth0 nic network=${NET0} name=eth0 --project ${PROJECT}
-  incus start ${G0_INST} --project ${PROJECT}
-  incus init ${IMAGE} ${G1_INST} --project ${PROJECT}${TARGET_FLAG}
-  incus config device add ${G1_INST} eth0 nic network=${NET1} name=eth0 --project ${PROJECT}
-  incus start ${G1_INST} --project ${PROJECT}
-
-Planned cleanup commands (unless --keep is given):
-  incus delete --force ${G0_INST} ${G1_INST} ${GW_INST} --project ${PROJECT}
-  incus network delete ${RPREFIX}${NET0}
-  incus network delete ${RPREFIX}${NET1}
-  incus project delete ${RPREFIX}${PROJECT}
-EOF
+  echo "Planned Incus commands (throwaway project '${PROJECT}', remote '${REMOTE:-local}', target '${TARGET:-none (standalone)}'):"
+  echo "  incus project create ${RPREFIX}${PROJECT} -c features.images=false -c features.profiles=true -c features.networks=false -c features.storage.volumes=false"
+  echo "  incus profile device add ${RPREFIX}default root disk path=/ pool=${STORAGE_POOL} --project ${PROJECT}"
+  if [[ "$CREATE_MGMT_NET" -eq 1 ]]; then
+    echo "  incus network create ${RPREFIX}${MGMT_NET} --type=bridge ipv4.address=auto ipv4.nat=true ipv6.address=none${TARGET_FLAG}"
+  fi
+  echo "  incus network create ${RPREFIX}${NET0} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}"
+  echo "  incus network create ${RPREFIX}${NET1} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}"
+  echo "  incus init ${IMAGE} ${GW_INST} --project ${PROJECT}${TARGET_FLAG}"
+  echo "  incus config device add ${GW_INST} eth0 nic network=${MGMT_NET} name=eth0 --project ${PROJECT}"
+  echo "  incus config device add ${GW_INST} sbx0 nic network=${NET0} name=sbx0 --project ${PROJECT}"
+  echo "  incus config device add ${GW_INST} sbx1 nic network=${NET1} name=sbx1 --project ${PROJECT}"
+  echo "  incus start ${GW_INST} --project ${PROJECT}"
+  echo "  incus init ${IMAGE} ${G0_INST} --project ${PROJECT}${TARGET_FLAG}"
+  echo "  incus config device add ${G0_INST} eth0 nic network=${NET0} name=eth0 --project ${PROJECT}"
+  echo "  incus start ${G0_INST} --project ${PROJECT}"
+  echo "  incus init ${IMAGE} ${G1_INST} --project ${PROJECT}${TARGET_FLAG}"
+  echo "  incus config device add ${G1_INST} eth0 nic network=${NET1} name=eth0 --project ${PROJECT}"
+  echo "  incus start ${G1_INST} --project ${PROJECT}"
+  echo ""
+  echo "Planned cleanup commands (unless --keep is given):"
+  echo "  incus delete --force ${G0_INST} ${G1_INST} ${GW_INST} --project ${PROJECT}"
+  echo "  incus network delete ${RPREFIX}${NET0}"
+  echo "  incus network delete ${RPREFIX}${NET1}"
+  if [[ "$CREATE_MGMT_NET" -eq 1 ]]; then
+    echo "  incus network delete ${RPREFIX}${MGMT_NET}"
+  fi
+  echo "  incus project delete ${RPREFIX}${PROJECT}"
 }
 
 print_plan
@@ -153,12 +169,16 @@ if cluster_members="$("${CLUSTER_LIST_CMD[@]}" 2>/dev/null)" && [[ -n "$cluster_
   fi
 fi
 
-# Refuse if the project or either bridge network already exists.
+# Refuse if the project or any managed bridge network already exists.
 if incus project show "${RPREFIX}${PROJECT}" >/dev/null 2>&1; then
   echo "error: Incus project '${RPREFIX}${PROJECT}' already exists; refusing to touch it" >&2
   exit 1
 fi
-for net in "$NET0" "$NET1"; do
+NETS_TO_CHECK=("$NET0" "$NET1")
+if [[ "$CREATE_MGMT_NET" -eq 1 ]]; then
+  NETS_TO_CHECK+=("$MGMT_NET")
+fi
+for net in "${NETS_TO_CHECK[@]}"; do
   if incus network show "${RPREFIX}${net}" >/dev/null 2>&1; then
     echo "error: Incus network '${RPREFIX}${net}' already exists; refusing to touch it" >&2
     exit 1
@@ -172,6 +192,7 @@ if [[ "$reply" != "y" && "$reply" != "Y" ]]; then
 fi
 
 CREATED_PROJECT=0
+CREATED_MGMT_NET=0
 CREATED_NET0=0
 CREATED_NET1=0
 TMPDIR_WORK="$(mktemp -d)"
@@ -195,6 +216,14 @@ cleanup() {
   fi
   if [[ "$CREATED_NET1" -eq 1 ]]; then
     incus network delete "${RPREFIX}${NET1}" 2>/dev/null || true
+  fi
+  if [[ "$CREATED_MGMT_NET" -eq 1 ]]; then
+    incus network delete "${RPREFIX}${MGMT_NET}" 2>/dev/null || true
+    if incus network show "${RPREFIX}${MGMT_NET}" >/dev/null 2>&1; then
+      echo "[cleanup] WARNING: management network '${RPREFIX}${MGMT_NET}' still exists" >&2
+    else
+      echo "[cleanup] verified management network '${RPREFIX}${MGMT_NET}' is gone"
+    fi
   fi
   if [[ "$CREATED_PROJECT" -eq 1 ]]; then
     incus project delete "${RPREFIX}${PROJECT}" 2>/dev/null || true
@@ -237,6 +266,11 @@ incus project create "${RPREFIX}${PROJECT}" \
 CREATED_PROJECT=1
 
 incus profile device add "${RPREFIX}default" root disk path=/ "pool=${STORAGE_POOL}" --project "$PROJECT"
+
+if [[ "$CREATE_MGMT_NET" -eq 1 ]]; then
+  incus network create "${RPREFIX}${MGMT_NET}" --type=bridge ipv4.address=auto ipv4.nat=true ipv6.address=none "${TARGET_ARGS[@]}"
+  CREATED_MGMT_NET=1
+fi
 
 incus network create "${RPREFIX}${NET0}" --type=bridge ipv4.address=none ipv6.address=none "${TARGET_ARGS[@]}"
 CREATED_NET0=1
@@ -583,7 +617,14 @@ start_guest_peer_listener() {
   "
 }
 
-echo "==> Step 2.4: Starting guest :8080 listeners (positive controls) and running gatewayd-probe"
+echo "==> Step 2.4: Verifying LAN control from gateway, guest :8080 controls, and running gatewayd-probe"
+lan_host="${LAN_ADDR%:*}"
+lan_port="${LAN_ADDR##*:}"
+if ! gw_exec bash -ceu "timeout 5s bash -c 'exec 3<>/dev/tcp/${lan_host}/${lan_port}'"; then
+  echo "FAIL: LAN control ${LAN_ADDR} did not accept TCP from gateway container (guest unreachable check would be vacuous)" >&2
+  exit 1
+fi
+echo "    PASS: LAN control ${LAN_ADDR} accepts TCP from gateway container"
 start_guest_peer_listener "$G0_INST" "$G0_IP"
 start_guest_peer_listener "$G1_INST" "$G1_IP"
 run_probe_guest0
