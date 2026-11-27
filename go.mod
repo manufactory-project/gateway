@@ -1,4 +1,4 @@
-module github.com/manufactory-project/gatewayd
+module github.com/manufactory-project/gateway
 
 go 1.26
 
