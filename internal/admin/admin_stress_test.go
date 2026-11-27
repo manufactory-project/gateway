@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -67,9 +68,12 @@ func TestMain(m *testing.M) {
 		}
 		panic(fmt.Sprintf("admin TestMain setenv: %v", err))
 	}
+	sighupSink := make(chan os.Signal, 1)
+	signal.Notify(sighupSink, syscall.SIGHUP)
 	goleak.VerifyTestMain(cleanupTestingM{
 		M: m,
 		cleanup: func() {
+			signal.Stop(sighupSink)
 			if rmErr := os.RemoveAll(dir); rmErr != nil {
 				panic(fmt.Sprintf("admin TestMain cleanup: %v", rmErr))
 			}
@@ -500,7 +504,6 @@ rules:
 		bgCancel()
 		bgWG.Wait()
 	})
-	time.Sleep(20 * time.Millisecond)
 
 	makeClient := func(sni string, h2 bool) *http.Client {
 		protos := new(http.Protocols)
@@ -535,7 +538,7 @@ rules:
 		completedOK atomic.Int32
 		revokedHits atomic.Int32
 	)
-	stressCtx, stressCancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	stressCtx, stressCancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer stressCancel()
 
 	// 4 H1 keep-alive workers
@@ -544,12 +547,15 @@ rules:
 		go func() {
 			defer wg.Done()
 			for stressCtx.Err() == nil {
-				r, err := cH1.Get("https://stress.example.com/fast")
+				req, err := http.NewRequestWithContext(stressCtx, http.MethodGet, "https://stress.example.com/fast", nil)
+				if err != nil {
+					continue
+				}
+				r, err := cH1.Do(req)
 				if err != nil {
 					continue
 				}
 				if _, err := io.Copy(io.Discard, r.Body); err != nil {
-					// Torn down mid-flight by revoke.
 					if cErr := r.Body.Close(); cErr != nil {
 						continue
 					}
@@ -575,7 +581,11 @@ rules:
 				target = "https://stress.example.com/fast"
 			}
 			for stressCtx.Err() == nil {
-				r, err := cH2.Get(target)
+				req, err := http.NewRequestWithContext(stressCtx, http.MethodGet, target, nil)
+				if err != nil {
+					continue
+				}
+				r, err := cH2.Do(req)
 				if err != nil {
 					continue
 				}
@@ -595,21 +605,38 @@ rules:
 		}(i)
 	}
 
-	// Control-plane hammer: SIGHUP + rule edits + Admin Reload + Add/Delete/Expire grants + Admin Revoke
+	writeCfgAtomic := func(content string) error {
+		tmp, err := os.CreateTemp(dir, "stress-cfg-*")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		if _, err := tmp.WriteString(content); err != nil {
+			if cErr := tmp.Close(); cErr != nil {
+				return cErr
+			}
+			return err
+		}
+		if err := tmp.Close(); err != nil {
+			return err
+		}
+		return os.Rename(tmpName, cfgPath)
+	}
+
+	// Control-plane hammer: run until workload conditions (completedOK, revokedHits, and >=3 rounds) are met or deadline passes.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer stressCancel()
 		altYAML := strings.Replace(cfgYAML, "hosts: [stress.example.com]", "hosts: [stress.example.com, ephemeral.example.com]", 1)
-		for i := 0; i < 6 && stressCtx.Err() == nil; i++ {
-			// Flip YAML rule set back and forth while requests are in flight.
+		for round := 0; stressCtx.Err() == nil; round++ {
 			nextCfg := altYAML
-			if i%2 == 1 {
+			if round%2 == 1 {
 				nextCfg = cfgYAML
 			}
-			if err := os.WriteFile(cfgPath, []byte(nextCfg), 0o600); err != nil {
+			if err := writeCfgAtomic(nextCfg); err != nil {
 				t.Errorf("write toggled config: %v", err)
 			}
-			// Add a grant, delete it, and add a short-TTL grant that expires mid-flight.
 			if gDel, err := cAdmin.CreateGrant(context.Background(), admin.GrantRequest{
 				Principal: "worker-stress",
 				Host:      "ephemeral.example.com",
@@ -628,7 +655,12 @@ rules:
 			}); err != nil {
 				t.Logf("CreateGrant short TTL raced with reload: %v", err)
 			}
-			time.Sleep(20 * time.Millisecond)
+
+			// Wait until at least one flow is active (or short poll timeout) before revoking.
+			waitFlow := time.Now().Add(200 * time.Millisecond)
+			for flows.Count() == 0 && time.Now().Before(waitFlow) && stressCtx.Err() == nil {
+				time.Sleep(5 * time.Millisecond)
+			}
 			if res, err := cAdmin.Revoke(context.Background(), admin.RevokeRequest{Principal: "worker-stress"}); err != nil {
 				t.Errorf("Admin Revoke: %v", err)
 			} else {
@@ -640,10 +672,12 @@ rules:
 			if _, err := cAdmin.Reload(context.Background()); err != nil {
 				t.Errorf("Admin Reload: %v", err)
 			}
-			time.Sleep(25 * time.Millisecond)
+			if round >= 2 && completedOK.Load() >= 5 && revokedHits.Load() > 0 {
+				break
+			}
 		}
 		// Restore base config cleanly for subsequent header-flood check.
-		if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		if err := writeCfgAtomic(cfgYAML); err != nil {
 			t.Errorf("restore base config: %v", err)
 		}
 		if _, err := cAdmin.Reload(context.Background()); err != nil {

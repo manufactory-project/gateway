@@ -18,11 +18,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -69,9 +71,12 @@ func TestMain(m *testing.M) {
 		}
 		panic(fmt.Sprintf("proxy TestMain setenv: %v", err))
 	}
+	sighupSink := make(chan os.Signal, 1)
+	signal.Notify(sighupSink, syscall.SIGHUP)
 	goleak.VerifyTestMain(cleanupTestingM{
 		M: m,
 		cleanup: func() {
+			signal.Stop(sighupSink)
 			if rmErr := os.RemoveAll(dir); rmErr != nil {
 				panic(fmt.Sprintf("proxy TestMain cleanup: %v", rmErr))
 			}

@@ -397,7 +397,6 @@ func TestSIGHUPWipesGrantsAndTearsDownStream(t *testing.T) {
 		sigCancel()
 		<-sigDone
 	})
-	time.Sleep(25 * time.Millisecond)
 
 	gHUP, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-hup"}, 5*time.Minute, false)
 	if err != nil {
@@ -409,18 +408,28 @@ func TestSIGHUPWipesGrantsAndTearsDownStream(t *testing.T) {
 	}
 	<-streamOpenCh
 
-	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
-		t.Fatalf("send SIGHUP: %v", err)
-	}
 	hupDone := make(chan error, 1)
 	go func() {
 		_, rErr := io.ReadAll(rHUP.Body)
 		hupDone <- rErr
 	}()
-	select {
-	case <-hupDone:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("stream under grant %s was not torn down on SIGHUP", gHUP.ID)
+	sigTicker := time.NewTicker(15 * time.Millisecond)
+	defer sigTicker.Stop()
+	deadline := time.After(2 * time.Second)
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("send SIGHUP: %v", err)
+	}
+	for tornDown := false; !tornDown; {
+		select {
+		case <-hupDone:
+			tornDown = true
+		case <-sigTicker.C:
+			if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+				t.Fatalf("send SIGHUP retry: %v", err)
+			}
+		case <-deadline:
+			t.Fatalf("stream under grant %s was not torn down on SIGHUP", gHUP.ID)
+		}
 	}
 	if err := rHUP.Body.Close(); err != nil {
 		t.Logf("close rHUP: %v", err)

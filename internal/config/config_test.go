@@ -3,6 +3,7 @@ package config_test
 import (
 	"context"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	sighupSink := make(chan os.Signal, 1)
+	signal.Notify(sighupSink, syscall.SIGHUP)
+	defer signal.Stop(sighupSink)
 	goleak.VerifyTestMain(m)
 }
 
@@ -274,27 +278,41 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 				t.Errorf("SIGHUP reload error: %v", err)
 				return
 			}
-			reloaded <- wiped
+			select {
+			case reloaded <- wiped:
+			default:
+			}
 		})
 	}()
-	// Brief yield so signal.Notify is registered before raising SIGHUP.
-	time.Sleep(25 * time.Millisecond)
 
+	sigTicker := time.NewTicker(15 * time.Millisecond)
+	defer sigTicker.Stop()
+	deadline := time.After(2 * time.Second)
 	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
 		cancel()
 		<-done
 		t.Fatalf("send SIGHUP: %v", err)
 	}
 
-	select {
-	case wiped := <-reloaded:
-		if len(wiped) != 1 || wiped[0] != g1.ID {
-			t.Fatalf("wiped grants = %v, want [%s]", wiped, g1.ID)
+	var wiped []string
+	for got := false; !got; {
+		select {
+		case wiped = <-reloaded:
+			got = true
+		case <-sigTicker.C:
+			if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+				cancel()
+				<-done
+				t.Fatalf("send SIGHUP retry: %v", err)
+			}
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("timed out waiting for SIGHUP reload")
 		}
-	case <-time.After(2 * time.Second):
-		cancel()
-		<-done
-		t.Fatal("timed out waiting for SIGHUP reload")
+	}
+	if len(wiped) != 1 || wiped[0] != g1.ID {
+		t.Fatalf("wiped grants = %v, want [%s]", wiped, g1.ID)
 	}
 
 	cancel()
