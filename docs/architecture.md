@@ -199,5 +199,5 @@ Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
   fails. In normal deployment, the guards against a stale ready file are systemd always re-running
   `ExecStartPre=+ gateway netsetup` (which deletes any stale ready file first and reloads
   `table inet gw`), `RuntimeDirectory=gateway` deleting `/run/gateway` on service stop, and
-  `net.ipv4.ip_forward=0` keeping forwarding disabled. Note that `gateway dataplane check` also writes
-  `dataplane.ready` when it succeeds, making it a second writer alongside `gateway netsetup`.
+  `net.ipv4.ip_forward=0` keeping forwarding disabled. `gateway dataplane check` is strictly
+  read-only; only `gateway netsetup` writes `dataplane.ready`.

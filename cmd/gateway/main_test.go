@@ -19,6 +19,7 @@ import (
 	"github.com/manufactory-project/gateway/internal/ca"
 	"github.com/manufactory-project/gateway/internal/config"
 	"github.com/manufactory-project/gateway/internal/metrics"
+	"github.com/manufactory-project/gateway/internal/netsetup"
 	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
@@ -431,5 +432,79 @@ rules:
 	ee := expiredEvents[0]
 	if ee.Principal != "worker-claude" || ee.Host != "login.example.test" || ee.Port != 443 || ee.ExpiresAt != wantExpires {
 		t.Fatalf("unexpected grant-expired event: %+v", ee)
+	}
+}
+
+func TestDataplaneCheckIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	readyFile := filepath.Join(dir, "dataplane.ready")
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: /etc/gateway/ca/ca.crt
+  key_path: /etc/gateway/ca/ca.key
+audit:
+  dir: /var/log/gateway/audit
+dataplane:
+  verify_sysctls: true
+  ready_file: %s
+  dhcp:
+    user: dnsmasq
+    lease_file: /var/lib/gateway/dnsmasq.leases
+links:
+  - name: sbx0
+    interface: sbx0
+    principal: worker-claude
+    subnet: 10.200.0.0/28
+    gateway_ip: 10.200.0.1
+    ct_zone: 101
+    route_table: 101
+`, readyFile)
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, _, err := config.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	nftOut, err := netsetup.RenderNftables(cfg)
+	if err != nil {
+		t.Fatalf("RenderNftables: %v", err)
+	}
+	procSysRoot := filepath.Join(dir, "proc-sys")
+	for _, sc := range netsetup.DesiredSysctls(cfg) {
+		p := filepath.Join(procSysRoot, strings.ReplaceAll(sc.Key, ".", string(os.PathSeparator)))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir sysctl %s: %v", p, err)
+		}
+		if err := os.WriteFile(p, []byte(sc.Value+"\n"), 0o644); err != nil {
+			t.Fatalf("write sysctl %s: %v", p, err)
+		}
+	}
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	nftOutPath := filepath.Join(dir, "nft.out")
+	if err := os.WriteFile(nftOutPath, []byte(nftOut), 0o600); err != nil {
+		t.Fatalf("write nft.out: %v", err)
+	}
+	fakeNFT := filepath.Join(binDir, "nft")
+	script := fmt.Sprintf("#!/bin/sh\ncat %q\n", nftOutPath)
+	if err := os.WriteFile(fakeNFT, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake nft: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var out, errBuf bytes.Buffer
+	if err := run(context.Background(), []string{"dataplane", "check", "--config", cfgPath, "--proc-sys-root", procSysRoot, "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("gateway dataplane check failed: %v (stderr=%s)", err, errBuf.String())
+	}
+	if !strings.Contains(out.String(), `"status":"ok"`) {
+		t.Fatalf("unexpected dataplane check output: %s", out.String())
+	}
+	if _, err := os.Stat(readyFile); !os.IsNotExist(err) {
+		t.Fatalf("gateway dataplane check must be read-only and not create ready_file %s (stat err=%v)", readyFile, err)
 	}
 }

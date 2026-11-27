@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -288,14 +287,6 @@ func runDataplane(ctx context.Context, args []string, asJSON bool, stdout, stder
 	}
 	if cfg.ShouldVerifySysctls() {
 		if err := netsetup.VerifySysctls(*procSysRoot, cfg); err != nil {
-			return err
-		}
-	}
-	if cfg.Dataplane.ReadyFile != "" {
-		if err := os.MkdirAll(filepath.Dir(cfg.Dataplane.ReadyFile), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(cfg.Dataplane.ReadyFile, []byte("ok\n"), 0o644); err != nil {
 			return err
 		}
 	}
