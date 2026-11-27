@@ -3,6 +3,7 @@ package proxy_test
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
@@ -11,7 +12,89 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/manufactory-project/gateway/internal/audit"
 )
+
+func sendRawTLSClientHello(t *testing.T, addr, sni string) {
+	t.Helper()
+	var body bytes.Buffer
+	body.Write([]byte{0x03, 0x03}) // TLS 1.2
+	body.Write(make([]byte, 32))   // Random
+	body.WriteByte(0x00)           // SessionID length = 0
+	body.Write([]byte{0x00, 0x02, 0xc0, 0x2f})
+	body.Write([]byte{0x01, 0x00}) // Compression methods: null
+	if sni != "" {
+		var ext bytes.Buffer
+		var sniList bytes.Buffer
+		sniList.WriteByte(0x00) // host_name
+		if err := binary.Write(&sniList, binary.BigEndian, uint16(len(sni))); err != nil {
+			t.Fatalf("encode sni len: %v", err)
+		}
+		sniList.WriteString(sni)
+
+		ext.Write([]byte{0x00, 0x00}) // extension_type: server_name
+		if err := binary.Write(&ext, binary.BigEndian, uint16(2+sniList.Len())); err != nil {
+			t.Fatalf("encode ext len: %v", err)
+		}
+		if err := binary.Write(&ext, binary.BigEndian, uint16(sniList.Len())); err != nil {
+			t.Fatalf("encode sniList len: %v", err)
+		}
+		ext.Write(sniList.Bytes())
+
+		if err := binary.Write(&body, binary.BigEndian, uint16(ext.Len())); err != nil {
+			t.Fatalf("encode exts len: %v", err)
+		}
+		body.Write(ext.Bytes())
+	} else {
+		body.Write([]byte{0x00, 0x00}) // no extensions
+	}
+
+	bLen := body.Len()
+	hs := make([]byte, 4+bLen)
+	hs[0] = 0x01 // ClientHello
+	hs[1] = byte(bLen >> 16)
+	hs[2] = byte(bLen >> 8)
+	hs[3] = byte(bLen)
+	copy(hs[4:], body.Bytes())
+
+	rec := make([]byte, 5+len(hs))
+	rec[0] = 0x16 // Handshake record
+	rec[1] = 0x03
+	rec[2] = 0x01
+	binary.BigEndian.PutUint16(rec[3:5], uint16(len(hs)))
+	copy(rec[5:], hs)
+
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("dial %s for raw ClientHello (sni=%q): %v", addr, sni, err)
+	}
+	if _, err := conn.Write(rec); err != nil {
+		if cErr := conn.Close(); cErr != nil {
+			t.Errorf("close raw conn: %v", cErr)
+		}
+		t.Fatalf("write ClientHello (sni=%q): %v", sni, err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		if cErr := conn.Close(); cErr != nil {
+			t.Errorf("close raw conn: %v", cErr)
+		}
+		t.Fatalf("set deadline: %v", err)
+	}
+	// Wait for TLS alert / close so synchronous audit write completes before returning.
+	var reply [64]byte
+	if _, err := conn.Read(reply[:]); err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			if cErr := conn.Close(); cErr != nil {
+				t.Errorf("close raw conn: %v", cErr)
+			}
+			t.Fatalf("timed out waiting for TLS rejection (sni=%q)", sni)
+		}
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close raw conn: %v", err)
+	}
+}
 
 func TestDeniedSNINoLeafMintAndSSHRejected(t *testing.T) {
 	gw := newTestGateway(t, testGatewaySpec{
@@ -26,13 +109,35 @@ func TestDeniedSNINoLeafMintAndSSHRejected(t *testing.T) {
 `,
 	})
 
-	// Denied SNI fails TLS handshake and never mints or caches a leaf.
+	// 1. Denied SNI fails TLS handshake, never mints/caches a leaf, and writes one audit record.
 	if _, err := gw.H1Client(t, "blocked.example.com").Get("https://blocked.example.com/"); err == nil {
 		t.Fatal("expected TLS handshake failure for denied SNI")
 	}
+
+	// 2. Missing SNI and IP-literal SNI fail TLS handshake without minting leaves and are audited.
+	sendRawTLSClientHello(t, gw.HTTPSAddr, "")
+	sendRawTLSClientHello(t, gw.HTTPSAddr, "1.2.3.4")
+
 	if gw.CASigns.signs.Load() != 0 {
-		t.Fatalf("denied SNI must never mint or cache a leaf, got %d CA signs", gw.CASigns.signs.Load())
+		t.Fatalf("denied/missing/IP SNIs must never mint or cache a leaf, got %d CA signs", gw.CASigns.signs.Load())
 	}
+
+	events := gw.AuditEvents(t)
+	assertOneTLSDeny := func(wantHost, wantReason string) {
+		t.Helper()
+		count := 0
+		for _, ev := range events {
+			if ev.Protocol == "tls" && ev.Effect == audit.EffectDeny && ev.Host == wantHost && ev.Reason == wantReason {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("expected exactly 1 tls deny audit event for host=%q reason=%q, got %d (events=%+v)", wantHost, wantReason, count, events)
+		}
+	}
+	assertOneTLSDeny("blocked.example.com", "default-deny")
+	assertOneTLSDeny("", "missing-sni")
+	assertOneTLSDeny("1.2.3.4", "ip-literal-sni")
 
 	// Non-TLS SSH traffic over port 443 fails TLS handshake (no raw-TCP fallback).
 	sshConn, err := net.DialTimeout("tcp", gw.HTTPSAddr, time.Second)
