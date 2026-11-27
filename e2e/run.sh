@@ -294,10 +294,11 @@ gw_exec bash -ceu '
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq nftables dnsmasq-base conntrack iproute2 jq ca-certificates curl sudo >/dev/null
-  id -u gatewayd >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin gatewayd
+  getent group gatewayd >/dev/null 2>&1 || groupadd --system gatewayd
+  id -u gatewayd >/dev/null 2>&1 || useradd --system --gid gatewayd --no-create-home --shell /usr/sbin/nologin gatewayd
   id -u dnsmasq  >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin dnsmasq
   install -d -o root -g gatewayd -m 0750 /etc/gatewayd /etc/gatewayd/ca
-  install -d -o dnsmasq -g dnsmasq -m 0750 /var/lib/gatewayd
+  install -d -o dnsmasq -g "$(id -gn dnsmasq)" -m 0750 /var/lib/gatewayd
 '
 
 sed "s|httpbingo\.org|${UPSTREAM_HOST}|g" "$REPO_ROOT/examples/two-links.yaml" > "$TMPDIR_WORK/gatewayd.yaml"
