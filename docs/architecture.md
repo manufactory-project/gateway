@@ -78,9 +78,11 @@ Guest packet on sandbox interface (sbxN)
   success, the snapshot swaps atomically, all ephemeral TTL grants are wiped, and per-link
   `onConfigReload` callbacks tear down flows that are no longer allowed and WebSockets on hosts
   that gained a secret binding.
-- **Grant TTL expiry:** One `config.Store.RunGrantPruner` goroutine owned by `cmd/gatewayd`
+- **Grant TTL expiry & WebSocket grants:** One `config.Store.RunGrantPruner` goroutine owned by `cmd/gatewayd`
   periodically prunes expired grants and invokes all registered `SetOnGrantExpired` callbacks
-  across links so expired grant flows tear down immediately.
+  across links so expired grant flows tear down immediately. Ephemeral grants (`POST /v1/grants`)
+  may carry `allow_websocket`, using the default egress cap (`http.ws_max_egress_bytes`, 64 MiB
+  by default), and are refused on any host with a secret binding for that principal.
 - **Audit sink:** One `audit.Writer` owned by `cmd/gatewayd` is shared across all link DNS/proxy
   servers and the Admin server, and closed last during graceful shutdown.
 
@@ -105,9 +107,10 @@ Service packages:
   internal/proxy   -> audit, ca, config, netguard, policy, secret   (uses OnRequest callback; never imports metrics)
 
 Binaries:
-  cmd/gwctl        -> admin, ca, config, netsetup
-                      (lint-enforced: transitive deps must NEVER include proxy, secret, policy, netguard)
-  cmd/gatewayd     -> wires all internal packages + adminFlowAdapter
+  cmd/gwctl          -> admin, ca, config, netsetup
+                        (lint-enforced: transitive deps must NEVER include proxy, secret, policy, netguard)
+  cmd/gatewayd       -> wires all internal packages + adminFlowAdapter
+  cmd/gatewayd-probe -> static stdlib-only guest probe (lint-enforced: stdlib-only, no proxy/secret/policy/netguard)
 ```
 
 ## 5. Fail-Closed Points
@@ -156,3 +159,31 @@ Loki.
   HTTP/H2/SSE requests, teardown calls `reqCancel()` + `guestConn.Close()` instead of poking into
   `http.Transport`'s connection pool to close upstream sockets directly. Direct `upConn.Close()` is
   used only for WebSockets, where `gatewayd` owns the raw socket.
+
+## 8. Deploying
+
+Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
+
+- **`deploy/gatewayd.service`:** `Type=simple` under `User=gatewayd` / `Group=gatewayd` with
+  `ExecStartPre=+/usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml` (privileged
+  one-shot setup), `CapabilityBoundingSet=` and `AmbientCapabilities=` both empty,
+  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
+  `RuntimeDirectory=gatewayd` (admin socket, `dataplane.ready`, and generated `dnsmasq.conf`), and
+  `ReadWritePaths=/var/log/gatewayd/audit` only.
+- **`deploy/gatewayd-dhcp.service`:** Ordered `After=gatewayd.service` and
+  `Requires=gatewayd.service`. Runs
+  `/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gatewayd/dnsmasq.conf` with no flags
+  duplicated from the config `netsetup` generates. Starts as root (no `User=`, no empty
+  `CapabilityBoundingSet=`) so `dnsmasq` can bind UDP `:67` and then drop privileges itself via
+  `user=`.
+- **Non-root / `CapEff` guarantee:** Once running, `gatewayd`'s `/proc/<pid>/status` shows a
+  non-root `Uid` and `CapEff`, `CapPrm`, and `CapAmb` all `0000000000000000`. Because `netsetup`
+  emits unconditional `dhcp-broadcast` and `no-ping`, `dnsmasq` drops to its non-root `user=` with
+  `CapEff` and `CapPrm` both `0000000000000000` and opens only UDP `:67` (zero `:53` sockets).
+- **Stale-ready-file behaviour:** Under systemd, `ExecStartPre=+ gatewayd netsetup` always deletes
+  any stale `dataplane.ready` first and only writes it back after `nft -f` and `CheckNftTable`
+  succeed. Because unprivileged `gatewayd` has zero `CAP_NET_ADMIN`, it verifies
+  `dataplane.ready` existence and sysctls at startup rather than reading `table inet gw` directly,
+  whereas root `gwctl dataplane check` inspects `table inet gw` directly and fails if the table is
+  missing. *(Observed direct-restart behaviour with a deleted table and stale `dataplane.ready`:
+  pending Step 2.1 E2E run.)*
