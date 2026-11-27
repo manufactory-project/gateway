@@ -79,7 +79,7 @@ func TestMain(m *testing.M) {
 	})
 }
 
-var nextTestLinkOctet atomic.Int32
+var nextTestLinkIndex atomic.Uint64
 
 type countingSigner struct {
 	crypto.Signer
@@ -177,9 +177,11 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		upPlainPort = tcpPort(t, upPlain.Listener.Addr())
 	}
 
-	octet := 40 + nextTestLinkOctet.Add(1)
-	linkIP := fmt.Sprintf("127.0.%d.1", octet)
-	linkSubnet := fmt.Sprintf("127.0.%d.0/28", octet)
+	idx := nextTestLinkIndex.Add(1) - 1
+	b2 := 1 + (idx/254)%254
+	b3 := 1 + (idx % 254)
+	linkIP := fmt.Sprintf("127.%d.%d.1", b2, b3)
+	linkSubnet := fmt.Sprintf("127.%d.%d.0/28", b2, b3)
 	ports := freePorts(t, linkIP, 3)
 	httpsPort, httpPort, dnsPort := ports[0], ports[1], ports[2]
 	httpsAddr := net.JoinHostPort(linkIP, strconv.Itoa(int(httpsPort)))
