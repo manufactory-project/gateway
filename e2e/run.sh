@@ -379,21 +379,52 @@ gw_exec bash -ceu '
   nft delete table inet gw 2>/dev/null || true
   rm -f /run/gatewayd/dataplane.ready
 '
-gw_exec bash -ceu '
+gw_exec bash -eu <<'EOF'
   set +e
-  timeout 5s sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/tmp/fc.out 2>/tmp/fc.err
+  timeout 5s sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/tmp/fc-sysctl.out 2>/tmp/fc-sysctl.err
   rc=$?
+  set -e
+  err_msg="$(cat /tmp/fc-sysctl.err)"
+  rm -f /tmp/fc-sysctl.out /tmp/fc-sysctl.err
   if [[ "$rc" -eq 0 ]]; then
-    echo "FAIL: gatewayd exited 0 without table inet gw or ready_file" >&2
+    echo "FAIL: gatewayd exited 0 with unconfigured sysctls" >&2
     exit 1
   fi
   if [[ "$rc" -eq 124 ]]; then
-    echo "FAIL: gatewayd stayed running (timeout 5s) without table inet gw or ready_file" >&2
+    echo "FAIL: gatewayd stayed running (timeout 5s) with unconfigured sysctls" >&2
     exit 1
   fi
-  echo "    PASS: gatewayd exited non-zero (rc=${rc}) without table inet gw or ready_file: $(head -n 1 /tmp/fc.err)"
-  rm -f /tmp/fc.out /tmp/fc.err
-'
+  if ! echo "$err_msg" | grep -q "sysctl"; then
+    echo "FAIL: expected sysctl error on stderr, got: ${err_msg}" >&2
+    exit 1
+  fi
+  echo "    PASS (sysctl): gatewayd exited non-zero (rc=${rc}): ${err_msg}"
+EOF
+
+gw_exec bash -eu <<'EOF'
+  /usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml
+  nft delete table inet gw
+  rm -f /run/gatewayd/dataplane.ready
+  set +e
+  timeout 5s sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/tmp/fc-ready.out 2>/tmp/fc-ready.err
+  rc=$?
+  set -e
+  err_msg="$(cat /tmp/fc-ready.err)"
+  rm -f /tmp/fc-ready.out /tmp/fc-ready.err
+  if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL: gatewayd exited 0 without table inet gw or ready_file (valid sysctls)" >&2
+    exit 1
+  fi
+  if [[ "$rc" -eq 124 ]]; then
+    echo "FAIL: gatewayd stayed running (timeout 5s) without table inet gw or ready_file (valid sysctls)" >&2
+    exit 1
+  fi
+  if ! echo "$err_msg" | grep -q "ready_file"; then
+    echo "FAIL: expected ready_file error on stderr, got: ${err_msg}" >&2
+    exit 1
+  fi
+  echo "    PASS (ready_file): gatewayd exited non-zero (rc=${rc}): ${err_msg}"
+EOF
 
 start_gatewayd_service
 
