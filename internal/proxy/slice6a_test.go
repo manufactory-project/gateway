@@ -103,6 +103,7 @@ func TestSlice6ARequestGuards(t *testing.T) {
 
 	ports := freePorts(t, "127.0.31.1", 3)
 	httpsPort, httpPort, dnsPort := ports[0], ports[1], ports[2]
+	httpsAddr := fmt.Sprintf("127.0.31.1:%d", httpsPort)
 
 	cfgYAML := fmt.Sprintf(`
 ca:
@@ -211,7 +212,7 @@ rules:
 		tr := &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, network, srv.HTTPSAddr())
+				return d.DialContext(ctx, network, httpsAddr)
 			},
 			TLSClientConfig: &tls.Config{
 				ServerName: sni,
@@ -291,7 +292,7 @@ rules:
 			raw:  "GET /ws HTTP/1.1\r\nHost: ws.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
 		},
 	} {
-		conn, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+		conn, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 			ServerName: "ws.example.com",
 			RootCAs:    mitmRoots,
 			MinVersion: tls.VersionTLS12,
@@ -321,7 +322,7 @@ rules:
 	}
 
 	// Positive control: bodyless WS upgrade succeeds (101).
-	wsConn, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+	wsConn, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 		ServerName: "ws.example.com",
 		RootCAs:    mitmRoots,
 		MinVersion: tls.VersionTLS12,

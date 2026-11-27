@@ -21,21 +21,33 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func freePort(t *testing.T, ip string) uint16 {
+func freePorts(t *testing.T, ip string, n int) []uint16 {
 	t.Helper()
-	ln, err := net.Listen("tcp4", ip+":0")
-	if err != nil {
-		t.Fatalf("freePort %s: %v", ip, err)
+	lns := make([]net.Listener, 0, n)
+	ports := make([]uint16, 0, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp4", ip+":0")
+		if err != nil {
+			for _, prev := range lns {
+				if cErr := prev.Close(); cErr != nil {
+					t.Errorf("close prev listener: %v", cErr)
+				}
+			}
+			t.Fatalf("freePorts %s[%d]: %v", ip, i, err)
+		}
+		ta, ok := ln.Addr().(*net.TCPAddr)
+		if !ok {
+			t.Fatalf("unexpected addr type %T", ln.Addr())
+		}
+		lns = append(lns, ln)
+		ports = append(ports, uint16(ta.Port))
 	}
-	ta, ok := ln.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("unexpected addr type %T", ln.Addr())
+	for _, ln := range lns {
+		if err := ln.Close(); err != nil {
+			t.Fatalf("close freePorts: %v", err)
+		}
 	}
-	p := uint16(ta.Port)
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close freePort: %v", err)
-	}
-	return p
+	return ports
 }
 
 func TestGatewaydNetsetupDryRunAndStartupGuards(t *testing.T) {
@@ -76,10 +88,9 @@ func TestGatewaydNetsetupDryRunAndStartupGuards(t *testing.T) {
 	sockPath := filepath.Join(dir, "admin.sock")
 	readyFile := filepath.Join(dir, "dataplane.ready")
 
-	httpsPort := freePort(t, "127.0.26.1")
-	httpPort := freePort(t, "127.0.26.1")
-	dnsPort := freePort(t, "127.0.26.1")
-	metricsPort := freePort(t, "127.0.0.1")
+	linkPorts := freePorts(t, "127.0.26.1", 3)
+	httpsPort, httpPort, dnsPort := linkPorts[0], linkPorts[1], linkPorts[2]
+	metricsPort := freePorts(t, "127.0.0.1", 1)[0]
 
 	daemonYAML := fmt.Sprintf(`
 ca:

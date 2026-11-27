@@ -98,6 +98,7 @@ func TestSlice6CRevocationMetricsAndTeardownRace(t *testing.T) {
 
 	ports := freePorts(t, "127.0.33.1", 3)
 	httpsPort, httpPort, dnsPort := ports[0], ports[1], ports[2]
+	httpsAddr := fmt.Sprintf("127.0.33.1:%d", httpsPort)
 
 	baseYAML := fmt.Sprintf(`
 ca:
@@ -220,7 +221,7 @@ rules:
 		tr := &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, network, srv.HTTPSAddr())
+				return d.DialContext(ctx, network, httpsAddr)
 			},
 			TLSClientConfig: &tls.Config{
 				ServerName: sni,
@@ -300,7 +301,7 @@ rules:
 	}
 
 	// --- Item 13b: WebSocket path teardown racing before setUpstreamConn closes upstream socket & never writes ---
-	wsConn, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+	wsConn, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 		ServerName: "race-ws.example.com",
 		RootCAs:    mitmRoots,
 		MinVersion: tls.VersionTLS12,

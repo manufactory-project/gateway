@@ -364,7 +364,8 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	follow := q.Get("follow") == "1" || strings.EqualFold(q.Get("follow"), "true")
 
-	events, err := audit.Query(s.audit.Dir(), opts)
+	seqBefore := s.audit.WriteSeq()
+	events, cursor, err := audit.QueryWithCursor(s.audit.Dir(), opts)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -375,13 +376,9 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	rc := http.NewResponseController(w)
 	enc := json.NewEncoder(w)
 
-	var lastTime time.Time
 	for _, ev := range events {
 		if err := enc.Encode(ev); err != nil {
 			return
-		}
-		if ev.Time.After(lastTime) {
-			lastTime = ev.Time
 		}
 	}
 	if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
@@ -391,27 +388,26 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	seenCount := len(events)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	followOpts := opts
+	followOpts.Tail = 0
+	lastSeq := seqBefore
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-ticker.C:
-			allOpts := opts
-			allOpts.Tail = 0
-			all, err := audit.Query(s.audit.Dir(), allOpts)
+		case <-s.audit.WaitWrite(lastSeq):
+			lastSeq = s.audit.WriteSeq()
+			more, nextCursor, err := audit.ReadAfter(s.audit.Dir(), cursor, followOpts)
 			if err != nil {
 				return
 			}
-			if len(all) > seenCount {
-				for _, ev := range all[seenCount:] {
+			cursor = nextCursor
+			if len(more) > 0 {
+				for _, ev := range more {
 					if err := enc.Encode(ev); err != nil {
 						return
 					}
 				}
-				seenCount = len(all)
 				if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
 					return
 				}

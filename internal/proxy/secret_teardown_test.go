@@ -270,6 +270,8 @@ rules:
 		return guardDialer.DialHost(ctx, network, host, upPort)
 	}
 
+	flows := proxy.NewFlowRegistry()
+	httpsAddr := fmt.Sprintf("127.0.13.1:%d", httpsPort)
 	srv, err := proxy.NewServer(proxy.Options{
 		Link:               store.Current().Config.Links[0],
 		Store:              store,
@@ -278,6 +280,7 @@ rules:
 		Leaves:             ca.NewLeafCache(mitmCA),
 		DialContext:        dialUpstream,
 		UpstreamRoots:      upstreamRoots,
+		Flows:              flows,
 		GrantPruneInterval: 20 * time.Millisecond,
 	})
 	if err != nil {
@@ -301,7 +304,7 @@ rules:
 		tr := &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, network, srv.HTTPSAddr())
+				return d.DialContext(ctx, network, httpsAddr)
 			},
 			TLSClientConfig: &tls.Config{
 				ServerName: sni,
@@ -462,8 +465,8 @@ rules:
 		t.Fatalf("GET /hold under TTL grant: %v", err)
 	}
 	<-streamStarted
-	if flows := srv.Flows().List(); len(flows) == 0 || flows[0].GrantID != gTTL.ID {
-		t.Fatalf("expected active flow with grant_id %s, got %+v", gTTL.ID, flows)
+	if active := flows.List(); len(active) == 0 || active[0].GrantID != gTTL.ID {
+		t.Fatalf("expected active flow with grant_id %s, got %+v", gTTL.ID, active)
 	}
 	// Read until EOF/error: must terminate promptly once the 120ms TTL expires!
 	ttlDone := make(chan error, 1)
@@ -481,7 +484,7 @@ rules:
 	}
 
 	// 5b. Live revoke tears down an open WebSocket flow immediately.
-	wsConn, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+	wsConn, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 		ServerName: "ws.example.com",
 		RootCAs:    mitmRoots,
 		MinVersion: tls.VersionTLS12,
@@ -498,7 +501,7 @@ rules:
 		t.Fatalf("WS upgrade failed: resp=%+v err=%v", wsResp, err)
 	}
 	<-wsStarted
-	if n := srv.Flows().RevokeByPrincipal("worker-claude", "ws.example.com"); n != 1 {
+	if n := flows.RevokeByPrincipal("worker-claude", "ws.example.com"); n != 1 {
 		t.Fatalf("RevokeByPrincipal ws count = %d, want 1", n)
 	}
 	wsReadDone := make(chan error, 1)
@@ -517,7 +520,7 @@ rules:
 	}
 
 	// 5c. Reload removing a rule tears down an active H1 keep-alive SSE stream AND closes the guest TCP socket.
-	rawKeepAlive, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+	rawKeepAlive, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 		ServerName: "unbound.example.com",
 		RootCAs:    mitmRoots,
 		MinVersion: tls.VersionTLS12,

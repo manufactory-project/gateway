@@ -140,7 +140,11 @@ func NewServer(listenAddr string, collector *Collector) (*Server, error) {
 		return nil, fmt.Errorf("metrics: invalid listen address %q: %w", listenAddr, err)
 	}
 	ip, err := netip.ParseAddr(host)
-	if err != nil || ip.IsUnspecified() {
+	if err != nil {
+		return nil, fmt.Errorf("metrics: wildcard or non-IP listen address %q is forbidden", listenAddr)
+	}
+	ip = ip.Unmap()
+	if ip.IsUnspecified() {
 		return nil, fmt.Errorf("metrics: wildcard or non-IP listen address %q is forbidden", listenAddr)
 	}
 	return &Server{
@@ -172,14 +176,6 @@ func (s *Server) Start() error {
 		}
 	}()
 	return nil
-}
-
-// Addr returns the bound TCP address.
-func (s *Server) Addr() string {
-	if s.ln == nil {
-		return ""
-	}
-	return s.ln.Addr().String()
 }
 
 // Shutdown gracefully stops the metrics HTTP server and waits for its goroutine.

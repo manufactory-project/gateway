@@ -33,6 +33,8 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	args, trailingJSON := stripJSONFlag(args)
+
 	fs := flag.NewFlagSet("gwctl", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	socketPath := fs.String("socket", defaultSocket, "path to gatewayd admin Unix socket")
@@ -40,6 +42,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	jsonOut := *asJSON || trailingJSON
 	rest := fs.Args()
 	if len(rest) == 0 {
 		return errors.New("usage: gwctl [--socket PATH] [--json] <status|reload|flows|revoke|grants|grant|audit|ca|dataplane>")
@@ -50,9 +53,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	switch cmd {
 	case "ca":
-		return runCA(cmdArgs, *asJSON, stdout, stderr)
+		return runCA(cmdArgs, jsonOut, stdout, stderr)
 	case "dataplane":
-		return runDataplane(ctx, cmdArgs, *asJSON, stdout, stderr)
+		return runDataplane(ctx, cmdArgs, jsonOut, stdout, stderr)
 	}
 
 	client := admin.NewClient(*socketPath)
@@ -64,7 +67,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if *asJSON {
+		if jsonOut {
 			return printJSON(stdout, st)
 		}
 		_, err = fmt.Fprintf(stdout, "config_hash=%s active_flows=%d active_grants=%d audit_healthy=%v audit_write_errors=%d\n",
@@ -76,7 +79,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if *asJSON {
+		if jsonOut {
 			return printJSON(stdout, res)
 		}
 		_, err = fmt.Fprintf(stdout, "reloaded config_hash=%s wiped_grants=%d\n", res.ConfigHash, len(res.WipedGrants))
@@ -87,7 +90,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if *asJSON {
+		if jsonOut {
 			return printJSON(stdout, flows)
 		}
 		for _, f := range flows {
@@ -117,7 +120,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if *asJSON {
+		if jsonOut {
 			return printJSON(stdout, res)
 		}
 		_, err = fmt.Fprintf(stdout, "revoked_flows=%d revoked_grant=%v\n", res.RevokedFlows, res.RevokedGrant)
@@ -128,7 +131,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if *asJSON {
+		if jsonOut {
 			return printJSON(stdout, grants)
 		}
 		for _, g := range grants {
@@ -148,7 +151,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			if err != nil {
 				return err
 			}
-			if *asJSON {
+			if jsonOut {
 				return printJSON(stdout, res)
 			}
 			_, err = fmt.Fprintf(stdout, "revoked_grant=%v revoked_flows=%d\n", res.RevokedGrant, res.RevokedFlows)
@@ -165,6 +168,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err := gfs.Parse(cmdArgs); err != nil {
 			return err
 		}
+		if *port > 65535 {
+			return fmt.Errorf("grant: port %d exceeds 65535", *port)
+		}
 		g, err := client.CreateGrant(ctx, admin.GrantRequest{
 			Principal: *principal,
 			Host:      *host,
@@ -176,7 +182,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if *asJSON {
+		if jsonOut {
 			return printJSON(stdout, g)
 		}
 		_, err = fmt.Fprintf(stdout, "granted %s principal=%s host=%s:%d expires=%s\n",
@@ -203,7 +209,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			Effect:    *effect,
 			Since:     *since,
 		}, func(ev audit.Event) error {
-			if *asJSON {
+			if jsonOut {
 				return printJSON(stdout, ev)
 			}
 			_, err := fmt.Fprintf(stdout, "%s kind=%s principal=%s host=%s effect=%s reason=%s status=%d\n",
@@ -214,6 +220,30 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown subcommand %q", cmd)
 	}
+}
+
+// stripJSONFlag allows --json to appear anywhere on the command line (before or after
+// any subcommand), honoring "--" to stop flag scanning.
+func stripJSONFlag(args []string) ([]string, bool) {
+	out := make([]string, 0, len(args))
+	found := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			out = append(out, args[i:]...)
+			break
+		}
+		switch a {
+		case "--json", "-json", "--json=true", "-json=true":
+			found = true
+			continue
+		case "--json=false", "-json=false":
+			found = false
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, found
 }
 
 func runCA(args []string, asJSON bool, stdout, stderr io.Writer) error {

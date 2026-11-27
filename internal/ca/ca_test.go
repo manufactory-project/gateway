@@ -110,17 +110,23 @@ func TestLeafCacheSingleflightConcurrencyAndEviction(t *testing.T) {
 		t.Fatalf("leaf verify failed: %v", err)
 	}
 
-	// Capacity bound evicts oldest name cleanly.
+	// Capacity bound evicts oldest name cleanly: re-requesting api.anthropic.com
+	// after 3 other names must mint a fresh leaf with a new serial number.
 	for _, h := range []string{"h2.example.com", "h3.example.com", "h4.example.com"} {
 		if _, err := cache.Leaf(h); err != nil {
 			t.Fatalf("Leaf %s: %v", h, err)
 		}
 	}
-	if cache.Len() != 3 {
-		t.Fatalf("cache len = %d, want 3", cache.Len())
+	reminted, err := cache.Leaf("api.anthropic.com")
+	if err != nil {
+		t.Fatalf("remint evicted api.anthropic.com: %v", err)
 	}
-	if cache.Cached("api.anthropic.com") {
-		t.Fatal("expected oldest leaf api.anthropic.com to be evicted")
+	remintedCert, err := x509.ParseCertificate(reminted.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse reminted leaf: %v", err)
+	}
+	if remintedCert.SerialNumber.Cmp(certs[0].SerialNumber) == 0 {
+		t.Fatal("expected oldest leaf api.anthropic.com to be evicted and reminted with a new serial")
 	}
 
 	// DeniedSNILimiter enforces burst cap.

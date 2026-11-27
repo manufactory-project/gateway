@@ -261,22 +261,6 @@ func (c *LeafCache) Leaf(name string) (*tls.Certificate, error) {
 	return cert, nil
 }
 
-// Cached reports whether name is currently cached (for diagnostics and invariant tests).
-func (c *LeafCache) Cached(name string) bool {
-	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.entries[name]
-	return ok
-}
-
-// Len returns the number of currently cached leaf certificates.
-func (c *LeafCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.entries)
-}
-
 func (c *LeafCache) mint(name string, now time.Time) (*tls.Certificate, time.Time, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

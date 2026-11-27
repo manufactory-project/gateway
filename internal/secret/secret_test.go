@@ -179,3 +179,36 @@ func TestStreamingRedactorAcrossChunkBoundariesAndEncodings(t *testing.T) {
 		t.Fatalf("redacted output = %q, want %q", got, want)
 	}
 }
+
+// TestStreamingRedactorPrefixSecretAcrossChunkBoundary covers Item 15:
+// a shorter secret that is a prefix of a longer secret on the same host must NOT
+// match prematurely at a chunk boundary and leak the longer secret's suffix.
+func TestStreamingRedactorPrefixSecretAcrossChunkBoundary(t *testing.T) {
+	shortSec := "tok_prefix_1234"
+	longSec := shortSec + "_SECRET_SUFFIX_9999"
+	red := secret.NewRedactor([]secret.Pair{
+		{Name: "short", Placeholder: "mf_ph_short", Value: shortSec},
+		{Name: "long", Placeholder: "mf_ph_long", Value: longSec},
+	})
+
+	var out bytes.Buffer
+	sw := red.StreamWriter(&out, nil)
+	// Chunk 1 ends right at the end of shortSec; chunk 2 carries the suffix of longSec!
+	if _, err := sw.Write([]byte("lead " + shortSec)); err != nil {
+		t.Fatalf("Write chunk 1: %v", err)
+	}
+	if _, err := sw.Write([]byte("_SECRET_SUFFIX_9999 tail")); err != nil {
+		t.Fatalf("Write chunk 2: %v", err)
+	}
+	if err := sw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got := out.String()
+	if strings.Contains(got, "SECRET_SUFFIX") || strings.Contains(got, shortSec) {
+		t.Fatalf("prefix secret leaked suffix across chunk boundary: %q", got)
+	}
+	if got != "lead mf_ph_long tail" {
+		t.Fatalf("got %q, want %q", got, "lead mf_ph_long tail")
+	}
+}

@@ -23,21 +23,33 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func freePort(t *testing.T, ip string) uint16 {
+func freePorts(t *testing.T, ip string, n int) []uint16 {
 	t.Helper()
-	ln, err := net.Listen("tcp4", ip+":0")
-	if err != nil {
-		t.Fatalf("pick free port on %s: %v", ip, err)
+	lns := make([]net.Listener, 0, n)
+	ports := make([]uint16, 0, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp4", ip+":0")
+		if err != nil {
+			for _, prev := range lns {
+				if cErr := prev.Close(); cErr != nil {
+					t.Errorf("close prev listener: %v", cErr)
+				}
+			}
+			t.Fatalf("freePorts %s[%d]: %v", ip, i, err)
+		}
+		tcpAddr, ok := ln.Addr().(*net.TCPAddr)
+		if !ok {
+			t.Fatalf("unexpected addr type %T", ln.Addr())
+		}
+		lns = append(lns, ln)
+		ports = append(ports, uint16(tcpAddr.Port))
 	}
-	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("unexpected addr type %T", ln.Addr())
+	for _, ln := range lns {
+		if err := ln.Close(); err != nil {
+			t.Fatalf("close probe listener: %v", err)
+		}
 	}
-	port := uint16(tcpAddr.Port)
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close probe listener: %v", err)
-	}
-	return port
+	return ports
 }
 
 func queryDNS(t *testing.T, netProto, addr, name string, qtype uint16) *mdns.Msg {
@@ -55,7 +67,9 @@ func queryDNS(t *testing.T, netProto, addr, name string, qtype uint16) *mdns.Msg
 func TestFakeIPDNSWireInvariantsAndFailClosedAudit(t *testing.T) {
 	dir := t.TempDir()
 	auditDir := filepath.Join(dir, "audit")
-	dnsPort := freePort(t, "127.0.11.1")
+	ports := freePorts(t, "127.0.11.1", 3)
+	dnsPort, httpsPort, httpPort := ports[0], ports[1], ports[2]
+	dnsAddr := net.JoinHostPort("127.0.11.1", strconv.Itoa(int(dnsPort)))
 
 	cfgYAML := `
 ca:
@@ -73,8 +87,8 @@ links:
     subnet: 127.0.11.0/28
     gateway_ip: 127.0.11.1
     dns_port: ` + strconv.Itoa(int(dnsPort)) + `
-    https_port: 18443
-    http_port: 18080
+    https_port: ` + strconv.Itoa(int(httpsPort)) + `
+    http_port: ` + strconv.Itoa(int(httpPort)) + `
 rules:
   - id: allow-anthropic
     principal: worker-claude
@@ -132,7 +146,7 @@ rules:
 	fakePrefix := netip.MustParsePrefix("198.18.0.0/15")
 
 	// Positive control: allowlisted exact host gets stable fake IPv4 over both UDP and TCP.
-	rUDP := queryDNS(t, "udp", srv.UDPAddr(), "api.anthropic.com", mdns.TypeA)
+	rUDP := queryDNS(t, "udp", dnsAddr, "api.anthropic.com", mdns.TypeA)
 	if rUDP.Rcode != mdns.RcodeSuccess || len(rUDP.Answer) != 1 {
 		t.Fatalf("UDP A api.anthropic.com: rcode=%d answers=%d", rUDP.Rcode, len(rUDP.Answer))
 	}
@@ -145,7 +159,7 @@ rules:
 		t.Fatalf("fake IP %v outside %s", aRec.A, fakePrefix)
 	}
 
-	rTCP := queryDNS(t, "tcp", srv.TCPAddr(), "api.anthropic.com", mdns.TypeA)
+	rTCP := queryDNS(t, "tcp", dnsAddr, "api.anthropic.com", mdns.TypeA)
 	if rTCP.Rcode != mdns.RcodeSuccess || len(rTCP.Answer) != 1 {
 		t.Fatalf("TCP A api.anthropic.com: rcode=%d answers=%d", rTCP.Rcode, len(rTCP.Answer))
 	}
@@ -159,7 +173,7 @@ rules:
 
 	// Positive control: NODATA (NOERROR, 0 answers) for AAAA, HTTPS, SVCB on allowlisted host.
 	for _, qt := range []uint16{mdns.TypeAAAA, mdns.TypeHTTPS, mdns.TypeSVCB} {
-		r := queryDNS(t, "udp", srv.UDPAddr(), "api.anthropic.com", qt)
+		r := queryDNS(t, "udp", dnsAddr, "api.anthropic.com", qt)
 		if r.Rcode != mdns.RcodeSuccess || len(r.Answer) != 0 {
 			t.Fatalf("allowlisted %s: got rcode=%d answers=%d, want NOERROR/0", mdns.TypeToString[qt], r.Rcode, len(r.Answer))
 		}
@@ -168,7 +182,7 @@ rules:
 	// Containment: TXT, MX, NS, SRV, CNAME refused BOTH inside allowlisted zones AND outside.
 	for _, qt := range []uint16{mdns.TypeTXT, mdns.TypeMX, mdns.TypeNS, mdns.TypeSRV, mdns.TypeCNAME} {
 		for _, host := range []string{"api.anthropic.com", "sub.allowed.example", "evil.exfil.example"} {
-			r := queryDNS(t, "udp", srv.UDPAddr(), host, qt)
+			r := queryDNS(t, "udp", dnsAddr, host, qt)
 			if r.Rcode != mdns.RcodeRefused || len(r.Answer) != 0 {
 				t.Fatalf("%s %s: got rcode=%d answers=%d, want REFUSED/0", host, mdns.TypeToString[qt], r.Rcode, len(r.Answer))
 			}
@@ -177,7 +191,7 @@ rules:
 
 	// Containment: non-allowlisted host refused for A and AAAA.
 	for _, qt := range []uint16{mdns.TypeA, mdns.TypeAAAA} {
-		r := queryDNS(t, "udp", srv.UDPAddr(), "blocked.example.com", qt)
+		r := queryDNS(t, "udp", dnsAddr, "blocked.example.com", qt)
 		if r.Rcode != mdns.RcodeRefused || len(r.Answer) != 0 {
 			t.Fatalf("blocked.example.com %s: got rcode=%d answers=%d, want REFUSED/0", mdns.TypeToString[qt], r.Rcode, len(r.Answer))
 		}
@@ -190,7 +204,7 @@ rules:
 	mZero := new(mdns.Msg)
 	mZero.Id = mdns.Id()
 	mZero.Opcode = mdns.OpcodeQuery
-	rZero, _, err := rawClient.Exchange(mZero, srv.UDPAddr())
+	rZero, _, err := rawClient.Exchange(mZero, dnsAddr)
 	if err != nil || rZero.Rcode != mdns.RcodeRefused {
 		t.Fatalf("0-question query: rcode=%v err=%v, want REFUSED", rZero, err)
 	}
@@ -202,7 +216,7 @@ rules:
 		{Name: "api.anthropic.com.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET},
 		{Name: "api.anthropic.com.", Qtype: mdns.TypeAAAA, Qclass: mdns.ClassINET},
 	}
-	rTwo, _, err := rawClient.Exchange(mTwo, srv.UDPAddr())
+	rTwo, _, err := rawClient.Exchange(mTwo, dnsAddr)
 	if err != nil || rTwo.Rcode != mdns.RcodeRefused {
 		t.Fatalf("2-question query: rcode=%v err=%v, want REFUSED", rTwo, err)
 	}
@@ -211,7 +225,7 @@ rules:
 	mUpdate.Id = mdns.Id()
 	mUpdate.Opcode = mdns.OpcodeUpdate
 	mUpdate.Question = []mdns.Question{{Name: "api.anthropic.com.", Qtype: mdns.TypeA, Qclass: mdns.ClassINET}}
-	rUpd, _, err := rawClient.Exchange(mUpdate, srv.UDPAddr())
+	rUpd, _, err := rawClient.Exchange(mUpdate, dnsAddr)
 	if err != nil || rUpd.Rcode != mdns.RcodeNotImplemented {
 		t.Fatalf("OpcodeUpdate query: rcode=%v err=%v, want NOTIMP", rUpd, err)
 	}
@@ -220,15 +234,15 @@ rules:
 	mChaos.Id = mdns.Id()
 	mChaos.Opcode = mdns.OpcodeQuery
 	mChaos.Question = []mdns.Question{{Name: "api.anthropic.com.", Qtype: mdns.TypeA, Qclass: mdns.ClassCHAOS}}
-	rChaos, _, err := rawClient.Exchange(mChaos, srv.UDPAddr())
+	rChaos, _, err := rawClient.Exchange(mChaos, dnsAddr)
 	if err != nil || rChaos.Rcode != mdns.RcodeRefused {
 		t.Fatalf("ClassCHAOS query: rcode=%v err=%v, want REFUSED", rChaos, err)
 	}
 
 	// Audit completeness check: every query above (incl. malformed/opcode/class) produced an audit record.
-	events, err := audit.Query(auditDir, audit.QueryOptions{})
+	events, _, err := audit.QueryWithCursor(auditDir, audit.QueryOptions{})
 	if err != nil {
-		t.Fatalf("audit.Query: %v", err)
+		t.Fatalf("audit.QueryWithCursor: %v", err)
 	}
 	// 2 (A udp+tcp) + 3 (AAAA/HTTPS/SVCB) + 15 (5 qtypes * 3 hosts) + 2 (blocked A/AAAA) + 4 (0q, 2q, update, chaos) = 26.
 	if len(events) != 26 {
@@ -243,10 +257,10 @@ rules:
 		t.Fatalf("replace auditDir with file: %v", err)
 	}
 	// Force rotation by querying until the 200-byte segment triggers openSegmentLocked on broken auditDir.
-	rFail := queryDNS(t, "udp", srv.UDPAddr(), "api.anthropic.com", mdns.TypeA)
+	rFail := queryDNS(t, "udp", dnsAddr, "api.anthropic.com", mdns.TypeA)
 	if rFail.Rcode == mdns.RcodeSuccess {
 		// One more query if previous line hadn't crossed 200B boundary yet.
-		rFail = queryDNS(t, "udp", srv.UDPAddr(), "api.anthropic.com", mdns.TypeA)
+		rFail = queryDNS(t, "udp", dnsAddr, "api.anthropic.com", mdns.TypeA)
 	}
 	if rFail.Rcode != mdns.RcodeServerFailure || len(rFail.Answer) != 0 {
 		t.Fatalf("expected SERVFAIL with 0 answers on unwritable audit sink, got rcode=%d answers=%d", rFail.Rcode, len(rFail.Answer))

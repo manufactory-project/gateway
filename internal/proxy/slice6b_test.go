@@ -112,6 +112,7 @@ func TestSlice6BFailClosedPromises(t *testing.T) {
 
 	ports := freePorts(t, "127.0.32.1", 3)
 	httpsPort, httpPort, dnsPort := ports[0], ports[1], ports[2]
+	httpsAddr := fmt.Sprintf("127.0.32.1:%d", httpsPort)
 
 	cfgYAML := fmt.Sprintf(`
 ca:
@@ -217,7 +218,7 @@ rules:
 		tr := &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, network, srv.HTTPSAddr())
+				return d.DialContext(ctx, network, httpsAddr)
 			},
 			TLSClientConfig: &tls.Config{
 				ServerName: sni,
@@ -280,7 +281,7 @@ rules:
 	}
 
 	// --- Item 8: Upstream 101 that is NOT Upgrade: websocket returns 502 (never forwards 101) ---
-	conn, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+	conn, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 		ServerName: "ws101.example.com",
 		RootCAs:    mitmRoots,
 		MinVersion: tls.VersionTLS12,
@@ -306,9 +307,9 @@ rules:
 	}
 
 	// Confirm redaction error and non-WS 101 were both audited.
-	events, err := audit.Query(auditDir, audit.QueryOptions{})
+	events, _, err := audit.QueryWithCursor(auditDir, audit.QueryOptions{})
 	if err != nil {
-		t.Fatalf("audit.Query: %v", err)
+		t.Fatalf("audit.QueryWithCursor: %v", err)
 	}
 	var sawRedactErr, sawNonWS101 bool
 	for _, ev := range events {

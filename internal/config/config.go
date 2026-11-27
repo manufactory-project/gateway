@@ -321,6 +321,7 @@ func validateExplicitListenAddr(addr string) error {
 	if err != nil {
 		return fmt.Errorf("listen host %q must be an explicit IP literal: %w", host, err)
 	}
+	ip = ip.Unmap()
 	if ip.IsUnspecified() {
 		return fmt.Errorf("wildcard listen address %q is forbidden", addr)
 	}
@@ -804,12 +805,13 @@ func isSafeIdentifier(s string) bool {
 }
 
 func isValidIfName(s string) bool {
-	// Linux IFNAMSIZ is 16 including NUL terminator.
+	// Linux IFNAMSIZ is 16 including NUL terminator; '.' is rejected in v0.1 because
+	// sysctl paths map '.' to '/'.
 	if len(s) == 0 || len(s) > 15 {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		if !isIdentByte(s[i]) {
+		if !isTokenByte(s[i]) {
 			return false
 		}
 	}

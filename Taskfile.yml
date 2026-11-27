@@ -25,6 +25,14 @@ tasks:
           echo "lint: nolint directive naming errcheck is forbidden" >&2
           exit 1
         fi
+      - |
+        set -eu
+        out=$(go run golang.org/x/tools/cmd/deadcode@v0.42.0 ./...)
+        if [ -n "$out" ]; then
+          echo "lint: deadcode found unreachable functions:" >&2
+          echo "$out" >&2
+          exit 1
+        fi
 
   test:
     desc: Run Go tests with race detector (goleak enforced in tests)

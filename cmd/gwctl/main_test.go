@@ -31,9 +31,9 @@ func TestGwctlVerbsEndToEnd(t *testing.T) {
 	auditDir := filepath.Join(dir, "audit")
 	sockPath := filepath.Join(dir, "admin.sock")
 
-	// 1. Offline `gwctl ca init`
+	// 1. Offline `gwctl ca init` with --json AFTER the subcommand (Item 18).
 	var out, errBuf bytes.Buffer
-	if err := run(context.Background(), []string{"--json", "ca", "init", "--cert", certPath, "--key", keyPath}, &out, &errBuf); err != nil {
+	if err := run(context.Background(), []string{"ca", "init", "--cert", certPath, "--key", keyPath, "--json"}, &out, &errBuf); err != nil {
 		t.Fatalf("gwctl ca init: %v (stderr=%s)", err, errBuf.String())
 	}
 	if !strings.Contains(out.String(), certPath) {
@@ -101,11 +101,19 @@ rules:
 	runCLI := func(args ...string) string {
 		t.Helper()
 		var stdout, stderr bytes.Buffer
-		full := append([]string{"--socket", sockPath, "--json"}, args...)
+		// Pass --json AFTER the subcommand to verify Item 18 on every subcommand.
+		full := append([]string{"--socket", sockPath}, args...)
+		full = append(full, "--json")
 		if err := run(context.Background(), full, &stdout, &stderr); err != nil {
 			t.Fatalf("gwctl %v failed: %v (stderr=%s)", args, err, stderr.String())
 		}
 		return stdout.String()
+	}
+
+	// Item 18: --port 65979 (65536 + 443) would wrap to 443 as uint16 if unchecked; must fail.
+	var badOut, badErr bytes.Buffer
+	if err := run(context.Background(), []string{"--socket", sockPath, "grant", "--principal", "worker-claude", "--host", "x.example.com", "--port", "65979", "--ttl", "5m"}, &badOut, &badErr); err == nil {
+		t.Fatal("expected gwctl grant --port 65979 (wraps to 443) to fail")
 	}
 
 	// status

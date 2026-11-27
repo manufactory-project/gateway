@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -103,6 +104,16 @@ func makeSignedServerCert(t *testing.T, root ca.CA, dnsNames []string) tls.Certi
 		t.Fatalf("sign upstream leaf: %v", err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+type countingSigner struct {
+	crypto.Signer
+	signs atomic.Int32
+}
+
+func (c *countingSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	c.signs.Add(1)
+	return c.Signer.Sign(rand, digest, opts)
 }
 
 func TestProxyMITMHardeningH2SSEWSAndFalsePositives(t *testing.T) {
@@ -337,8 +348,13 @@ rules:
 		}
 	})
 
-	leaves := ca.NewLeafCache(mitmCA)
+	cs := &countingSigner{Signer: mitmCA.Key}
+	mitmCAWithCount := mitmCA
+	mitmCAWithCount.Key = cs
+	leaves := ca.NewLeafCache(mitmCAWithCount)
 	guardDialer := netguard.NewDialer(netguard.Options{Store: store})
+	httpsAddr := net.JoinHostPort("127.0.12.1", strconv.Itoa(int(httpsPort)))
+	httpAddr := net.JoinHostPort("127.0.12.1", strconv.Itoa(int(httpPort)))
 
 	trustedPort := tcpPort(t, trustedSrv.Listener.Addr())
 	untrustedPort := tcpPort(t, untrustedSrv.Listener.Addr())
@@ -389,7 +405,7 @@ rules:
 		tr := &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, network, srv.HTTPSAddr())
+				return d.DialContext(ctx, network, httpsAddr)
 			},
 			TLSClientConfig: &tls.Config{
 				ServerName: sni,
@@ -409,16 +425,16 @@ rules:
 		}
 	}
 
-	// --- Containment 1: Denied SNI fails TLS handshake and is NEVER cached in LeafCache ---
+	// --- Containment 1: Denied SNI fails TLS handshake and NEVER mints/caches a leaf ---
 	if _, err := makeClient("blocked.example.com", false).Get("https://blocked.example.com/"); err == nil {
 		t.Fatal("expected TLS handshake failure for denied SNI")
 	}
-	if leaves.Cached("blocked.example.com") {
-		t.Fatal("denied SNI must never be cached in LeafCache")
+	if cs.signs.Load() != 0 {
+		t.Fatalf("denied SNI must never mint or cache a leaf, got %d CA signs", cs.signs.Load())
 	}
 
 	// --- Containment 2: SSH over port 443 fails TLS handshake (zero raw-TCP fallback) ---
-	sshConn, err := net.DialTimeout("tcp", srv.HTTPSAddr(), time.Second)
+	sshConn, err := net.DialTimeout("tcp", httpsAddr, time.Second)
 	if err != nil {
 		t.Fatalf("dial https for SSH test: %v", err)
 	}
@@ -502,7 +518,7 @@ rules:
 		{"GET https://api.example.com/v1/ok HTTP/1.1\r\nHost: api.example.com\r\n\r\n", "absolute-uri-forbidden"},
 		{"GET /v1/../secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n", "path-traversal"},
 	} {
-		tcConn, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+		tcConn, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 			ServerName: "api.example.com",
 			RootCAs:    mitmRoots,
 			MinVersion: tls.VersionTLS12,
@@ -686,7 +702,7 @@ rules:
 	}
 
 	// --- Positive control & containment 10: Opted-in WebSocket + 64B egress byte cap ---
-	wsConn, err := tls.Dial("tcp", srv.HTTPSAddr(), &tls.Config{
+	wsConn, err := tls.Dial("tcp", httpsAddr, &tls.Config{
 		ServerName: "ws.example.com",
 		RootCAs:    mitmRoots,
 		MinVersion: tls.VersionTLS12,
@@ -740,7 +756,7 @@ rules:
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, network, srv.HTTPAddr())
+				return d.DialContext(ctx, network, httpAddr)
 			},
 		},
 	}

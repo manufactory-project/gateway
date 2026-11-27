@@ -48,17 +48,29 @@ func tcpPort(t *testing.T, addr net.Addr) uint16 {
 	return uint16(ta.Port)
 }
 
-func freePort(t *testing.T, ip string) uint16 {
+func freePorts(t *testing.T, ip string, n int) []uint16 {
 	t.Helper()
-	ln, err := net.Listen("tcp4", ip+":0")
-	if err != nil {
-		t.Fatalf("freePort %s: %v", ip, err)
+	lns := make([]net.Listener, 0, n)
+	ports := make([]uint16, 0, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp4", ip+":0")
+		if err != nil {
+			for _, prev := range lns {
+				if cErr := prev.Close(); cErr != nil {
+					t.Errorf("close prev listener: %v", cErr)
+				}
+			}
+			t.Fatalf("freePorts %s[%d]: %v", ip, i, err)
+		}
+		lns = append(lns, ln)
+		ports = append(ports, tcpPort(t, ln.Addr()))
 	}
-	p := tcpPort(t, ln.Addr())
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close freePort: %v", err)
+	for _, ln := range lns {
+		if err := ln.Close(); err != nil {
+			t.Fatalf("close freePorts: %v", err)
+		}
 	}
-	return p
+	return ports
 }
 
 func signLeaf(t *testing.T, root ca.CA, names []string) tls.Certificate {
@@ -315,10 +327,11 @@ func TestStressReloadRevokeH1H2SSEAndSlowlorisBounds(t *testing.T) {
 	upSrv.StartTLS()
 	t.Cleanup(upSrv.Close)
 
-	httpsPort := freePort(t, "127.0.22.1")
-	httpPort := freePort(t, "127.0.22.1")
-	dnsPort := freePort(t, "127.0.22.1")
-	metricsPort := freePort(t, "127.0.0.1")
+	linkPorts := freePorts(t, "127.0.22.1", 3)
+	httpsPort, httpPort, dnsPort := linkPorts[0], linkPorts[1], linkPorts[2]
+	metricsPort := freePorts(t, "127.0.0.1", 1)[0]
+	httpsAddr := fmt.Sprintf("127.0.22.1:%d", httpsPort)
+	metricsAddr := fmt.Sprintf("127.0.0.1:%d", metricsPort)
 
 	cfgYAML := fmt.Sprintf(`
 ca:
@@ -471,7 +484,7 @@ rules:
 		tr := &http.Transport{
 			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, network, pSrv.HTTPSAddr())
+				return d.DialContext(ctx, network, httpsAddr)
 			},
 			TLSClientConfig: &tls.Config{
 				ServerName: sni,
@@ -604,7 +617,7 @@ rules:
 	// Verify /metrics reports live counters cleanly.
 	mTr := &http.Transport{}
 	t.Cleanup(mTr.CloseIdleConnections)
-	mResp, err := (&http.Client{Transport: mTr}).Get("http://" + mSrv.Addr() + "/metrics")
+	mResp, err := (&http.Client{Transport: mTr}).Get("http://" + metricsAddr + "/metrics")
 	if err != nil {
 		t.Fatalf("GET /metrics: %v", err)
 	}
@@ -625,4 +638,184 @@ rules:
 			t.Errorf("/metrics missing %q\n%s", want, mText)
 		}
 	}
+}
+
+// TestAdminAuditTailFollowNoDuplicatesAndRotation covers Item 14:
+// (1) tail=10 of 1000 events then append 1 produces exactly 1 new line (total 11, zero duplicates);
+// (2) segment rotation during an active --follow stream delivers every new event without stalling.
+func TestAdminAuditTailFollowNoDuplicatesAndRotation(t *testing.T) {
+	dir := t.TempDir()
+	auditDir := filepath.Join(dir, "audit")
+	sockPath := filepath.Join(dir, "admin.sock")
+	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: /tmp/ca.crt
+  key_path: /tmp/ca.key
+audit:
+  dir: %s
+  max_file_bytes: 2048
+links:
+  - name: sbx0
+    principal: worker-tail
+    subnet: 127.0.29.0/28
+    gateway_ip: 127.0.29.1
+rules:
+  - id: r1
+    principal: worker-tail
+    effect: allow
+    hosts: [api.example.com]
+    ports: [443]
+`, auditDir)
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	aw, err := audit.NewWriter(audit.Options{
+		Dir:          auditDir,
+		MaxFileBytes: 4096,
+	})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := aw.Close(); err != nil {
+			t.Errorf("audit close: %v", err)
+		}
+	})
+
+	aSrv, err := admin.NewServer(admin.Options{
+		SocketPath: sockPath,
+		Store:      store,
+		Flows:      proxy.NewFlowRegistry(),
+		Audit:      aw,
+	})
+	if err != nil {
+		t.Fatalf("admin.NewServer: %v", err)
+	}
+	if err := aSrv.Start(); err != nil {
+		t.Fatalf("admin.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := aSrv.Shutdown(ctx); err != nil {
+			t.Errorf("admin.Shutdown: %v", err)
+		}
+	})
+
+	// Seed 1000 distinct events (triggers multiple 4 KiB segment rotations too).
+	for i := 0; i < 1000; i++ {
+		if err := aw.WriteSync(audit.Event{
+			Kind:      audit.KindRequest,
+			Principal: "worker-tail",
+			Host:      "api.example.com",
+			Reason:    fmt.Sprintf("ev-%04d", i),
+			Effect:    audit.EffectAllow,
+		}); err != nil {
+			t.Fatalf("WriteSync %d: %v", i, err)
+		}
+	}
+
+	client := admin.NewClient(sockPath)
+	t.Cleanup(client.Close)
+
+	// Part 1: tail=10 of 1000 then append 1 -> exactly 10 initial + 1 new (zero duplicates).
+	followCtx, followCancel := context.WithCancel(context.Background())
+	evCh := make(chan audit.Event, 128)
+	done := make(chan error, 1)
+	go func() {
+		done <- client.StreamAudit(followCtx, admin.AuditParams{Tail: 10, Follow: true}, func(ev audit.Event) error {
+			evCh <- ev
+			return nil
+		})
+	}()
+
+	initial := make([]audit.Event, 0, 10)
+	for len(initial) < 10 {
+		select {
+		case ev := <-evCh:
+			initial = append(initial, ev)
+		case <-time.After(2 * time.Second):
+			followCancel()
+			<-done
+			t.Fatalf("timed out reading initial 10 tail events (got %d)", len(initial))
+		}
+	}
+	if initial[0].Reason != "ev-0990" || initial[9].Reason != "ev-0999" {
+		followCancel()
+		<-done
+		t.Fatalf("unexpected tail window: first=%q last=%q", initial[0].Reason, initial[9].Reason)
+	}
+
+	// Append 1 new event -> must receive exactly ev-1000 and nothing else.
+	if err := aw.WriteSync(audit.Event{
+		Kind:      audit.KindRequest,
+		Principal: "worker-tail",
+		Host:      "api.example.com",
+		Reason:    "ev-1000",
+		Effect:    audit.EffectAllow,
+	}); err != nil {
+		followCancel()
+		<-done
+		t.Fatalf("WriteSync ev-1000: %v", err)
+	}
+	select {
+	case ev := <-evCh:
+		if ev.Reason != "ev-1000" {
+			followCancel()
+			<-done
+			t.Fatalf("expected ev-1000 after tail=10, got %q (duplicate replay!)", ev.Reason)
+		}
+	case <-time.After(2 * time.Second):
+		followCancel()
+		<-done
+		t.Fatal("timed out waiting for ev-1000")
+	}
+
+	// Part 2: Append 40 more events (~6 KiB > 4 KiB MaxFileBytes) forcing segment rotation during follow.
+	for i := 1001; i <= 1040; i++ {
+		if err := aw.WriteSync(audit.Event{
+			Kind:      audit.KindRequest,
+			Principal: "worker-tail",
+			Host:      "api.example.com",
+			Reason:    fmt.Sprintf("ev-%04d", i),
+			Effect:    audit.EffectAllow,
+		}); err != nil {
+			followCancel()
+			<-done
+			t.Fatalf("WriteSync %d: %v", i, err)
+		}
+	}
+	for i := 1001; i <= 1040; i++ {
+		want := fmt.Sprintf("ev-%04d", i)
+		select {
+		case ev := <-evCh:
+			if ev.Reason != want {
+				followCancel()
+				<-done
+				t.Fatalf("rotation follow event mismatch: got %q, want %q", ev.Reason, want)
+			}
+		case <-time.After(2 * time.Second):
+			followCancel()
+			<-done
+			t.Fatalf("stalled during rotation waiting for %s", want)
+		}
+	}
+
+	// Ensure no stray extra events arrive.
+	select {
+	case extra := <-evCh:
+		followCancel()
+		<-done
+		t.Fatalf("unexpected duplicate/extra event: %+v", extra)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	followCancel()
+	<-done
 }

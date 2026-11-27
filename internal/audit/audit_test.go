@@ -91,9 +91,9 @@ func TestAuditQueryRedactionAndPeerEscaping(t *testing.T) {
 		t.Fatalf("expected exactly 2 JSONL lines (no forged newline break), got %d:\n%s", len(lines), raw)
 	}
 
-	events, err := audit.Query(dir, audit.QueryOptions{})
+	events, _, err := audit.QueryWithCursor(dir, audit.QueryOptions{})
 	if err != nil {
-		t.Fatalf("Query: %v", err)
+		t.Fatalf("QueryWithCursor: %v", err)
 	}
 	if len(events) != 2 {
 		t.Fatalf("expected 2 events, got %d", len(events))
@@ -233,21 +233,21 @@ func TestAuditRotationRetentionAndQueryFilters(t *testing.T) {
 		t.Fatalf("write new deny event: %v", err)
 	}
 
-	all, err := audit.Query(dir, audit.QueryOptions{})
+	all, _, err := audit.QueryWithCursor(dir, audit.QueryOptions{})
 	if err != nil {
-		t.Fatalf("Query all: %v", err)
+		t.Fatalf("QueryWithCursor all: %v", err)
 	}
 	if len(all) != 2 {
 		t.Fatalf("expected 2 retained events after pruning old day, got %d: %+v", len(all), all)
 	}
 
-	filtered, err := audit.Query(dir, audit.QueryOptions{
+	filtered, _, err := audit.QueryWithCursor(dir, audit.QueryOptions{
 		Principal: "p2",
 		Effect:    audit.EffectDeny,
 		Tail:      1,
 	})
 	if err != nil {
-		t.Fatalf("Query filtered: %v", err)
+		t.Fatalf("QueryWithCursor filtered: %v", err)
 	}
 	if len(filtered) != 1 || filtered[0].Host != "blocked.example.com" {
 		t.Fatalf("unexpected filtered events: %+v", filtered)

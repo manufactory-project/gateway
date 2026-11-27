@@ -97,11 +97,6 @@ func (a *Allocator) Allocate(host string) netip.Addr {
 	return cand
 }
 
-// Prefix returns the allocator's CIDR prefix.
-func (a *Allocator) Prefix() netip.Prefix {
-	return a.prefix
-}
-
 func uint32ToIPv4(v uint32) netip.Addr {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], v)
@@ -205,22 +200,6 @@ func (s *Server) Start() error {
 	<-udpReady
 	<-tcpReady
 	return nil
-}
-
-// UDPAddr returns the bound UDP socket address (useful when DNSPort is configured).
-func (s *Server) UDPAddr() string {
-	if s.udpConn == nil {
-		return ""
-	}
-	return s.udpConn.LocalAddr().String()
-}
-
-// TCPAddr returns the bound TCP socket address.
-func (s *Server) TCPAddr() string {
-	if s.tcpLn == nil {
-		return ""
-	}
-	return s.tcpLn.Addr().String()
 }
 
 // Shutdown gracefully stops both UDP and TCP DNS servers and waits for goroutines to exit.

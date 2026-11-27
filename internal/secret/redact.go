@@ -85,18 +85,55 @@ func (r *Redactor) Active() bool {
 	return r != nil && len(r.needles) > 0
 }
 
-// ScrubBytes replaces all matching secret forms in b with their placeholders.
+// ScrubBytes replaces all matching secret forms in b with their placeholders
+// in a single left-to-right longest-match-first pass.
 func (r *Redactor) ScrubBytes(b []byte) []byte {
 	if !r.Active() || len(b) == 0 {
 		return b
 	}
-	out := b
-	for _, n := range r.needles {
-		if bytes.Contains(out, n.pattern) {
-			out = bytes.ReplaceAll(out, n.pattern, n.replacement)
+	emitted, _ := r.scan(b, true)
+	return emitted
+}
+
+// scan processes buf left-to-right matching longest secrets first.
+// When final is false, it stops before the last maxLen-1 raw bytes and returns
+// them as unscrubbed remainder so a shorter secret that is a prefix of a longer
+// secret cannot prematurely match and leak the longer secret's suffix across a
+// chunk boundary.
+func (r *Redactor) scan(buf []byte, final bool) (emitted []byte, remainder []byte) {
+	safeLimit := len(buf)
+	if !final {
+		keep := r.maxLen - 1
+		if keep < 0 {
+			keep = 0
+		}
+		if len(buf) <= keep {
+			return nil, append([]byte(nil), buf...)
+		}
+		safeLimit = len(buf) - keep
+	}
+
+	out := make([]byte, 0, safeLimit)
+	i := 0
+	for i < safeLimit {
+		matched := false
+		for _, n := range r.needles {
+			if len(buf)-i >= len(n.pattern) && bytes.HasPrefix(buf[i:], n.pattern) {
+				out = append(out, n.replacement...)
+				i += len(n.pattern)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, buf[i])
+			i++
 		}
 	}
-	return out
+	if i < len(buf) {
+		remainder = append([]byte(nil), buf[i:]...)
+	}
+	return out, remainder
 }
 
 // ScrubString replaces all matching secret forms in s with their placeholders.
@@ -120,9 +157,8 @@ func (r *Redactor) ScrubHeader(h http.Header) {
 	}
 }
 
-// StreamWriter returns a sliding-window streaming writer that scrubs secrets
-// even when split across arbitrary chunk boundaries, calling flushFn after each
-// emitted chunk so SSE streams remain unbuffered beyond maxPatternLen-1 bytes.
+// StreamWriter returns a sliding-window streaming writer that carries raw
+// unscrubbed tail bytes across chunk boundaries and matches longest secrets first.
 func (r *Redactor) StreamWriter(dst io.Writer, flushFn func() error) *StreamWriter {
 	return &StreamWriter{
 		redactor: r,
@@ -140,8 +176,9 @@ type StreamWriter struct {
 	written  int64
 }
 
-// Write appends p to the sliding window, scrubs, emits all safe prefix bytes,
-// and retains at most maxLen-1 trailing bytes for cross-boundary matches.
+// Write appends raw p to the unscrubbed sliding window, emits only safe prefix
+// bytes where longest-match is unambiguous, and retains at most maxLen-1 raw
+// trailing bytes for cross-boundary matches.
 func (sw *StreamWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -164,24 +201,17 @@ func (sw *StreamWriter) Write(p []byte) (int, error) {
 	copy(buf, sw.carry)
 	copy(buf[len(sw.carry):], p)
 
-	scrubbed := sw.redactor.ScrubBytes(buf)
-	keep := sw.redactor.maxLen - 1
-	if keep < 0 {
-		keep = 0
-	}
-	if len(scrubbed) <= keep {
-		sw.carry = append(sw.carry[:0], scrubbed...)
+	emit, rem := sw.redactor.scan(buf, false)
+	sw.carry = rem
+	if len(emit) == 0 {
 		return len(p), nil
 	}
 
-	emitLen := len(scrubbed) - keep
-	n, err := sw.dst.Write(scrubbed[:emitLen])
+	n, err := sw.dst.Write(emit)
 	sw.written += int64(n)
 	if err != nil {
 		return 0, err
 	}
-	sw.carry = append(sw.carry[:0], scrubbed[emitLen:]...)
-
 	if sw.flushFn != nil {
 		if fErr := sw.flushFn(); fErr != nil {
 			return len(p), fErr
@@ -190,13 +220,16 @@ func (sw *StreamWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Close scrubs and emits any remaining carry bytes at EOF.
+// Close scrubs and emits any remaining raw carry bytes at EOF.
 func (sw *StreamWriter) Close() error {
 	if len(sw.carry) == 0 {
 		return nil
 	}
-	final := sw.redactor.ScrubBytes(sw.carry)
+	final, _ := sw.redactor.scan(sw.carry, true)
 	sw.carry = nil
+	if len(final) == 0 {
+		return nil
+	}
 	n, err := sw.dst.Write(final)
 	sw.written += int64(n)
 	if err != nil {

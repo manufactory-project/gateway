@@ -160,11 +160,6 @@ func NewServer(opts Options) (*Server, error) {
 	return s, nil
 }
 
-// Flows returns the FlowRegistry tracking this server's active flows.
-func (s *Server) Flows() *FlowRegistry {
-	return s.flows
-}
-
 func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) {
 	s.flows.RevokeWhere(func(info FlowInfo) bool {
 		if info.Link != s.link.Name {
@@ -277,22 +272,6 @@ func (s *Server) pruneGrantLoop() {
 			s.store.PruneExpiredGrants()
 		}
 	}
-}
-
-// HTTPSAddr returns the bound HTTPS listener address.
-func (s *Server) HTTPSAddr() string {
-	if s.httpsLn == nil {
-		return ""
-	}
-	return s.httpsLn.Addr().String()
-}
-
-// HTTPAddr returns the bound HTTP listener address.
-func (s *Server) HTTPAddr() string {
-	if s.httpLn == nil {
-		return ""
-	}
-	return s.httpLn.Addr().String()
 }
 
 // Shutdown drains listeners, tears down remaining link flows, closes idle upstream connections, and waits for goroutines.

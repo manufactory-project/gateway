@@ -342,16 +342,6 @@ func (e *Evaluator) HostBindings(principal, rawHost string) []config.BindingConf
 	return slices.Clone(cs.boundHosts[principal][host])
 }
 
-// HasBindingForHost reports whether any Binding exists for (principal, rawHost).
-func (e *Evaluator) HasBindingForHost(principal, rawHost string) bool {
-	host, ok := normalizeLookupHost(rawHost)
-	if !ok {
-		return false
-	}
-	cs := e.currentCompiled()
-	return len(cs.boundHosts[principal][host]) > 0
-}
-
 // MatchBindings returns the bindings that apply to (principal, rawHost, port, method, path).
 // Bindings match ONLY on HTTPS port 443 (never cleartext port 80).
 func (e *Evaluator) MatchBindings(principal, rawHost string, port uint16, method, reqPath string) []config.BindingConfig {

@@ -160,6 +160,16 @@ func TestConfigValidationInvariants(t *testing.T) {
 			yaml:      strings.Replace(validYAML, "  ready_file: /run/gatewayd/dataplane.ready\n", "", 1),
 			wantError: "dataplane.ready_file",
 		},
+		{
+			name:      "reject v4-mapped wildcard metrics listener",
+			yaml:      strings.Replace(validYAML, "listen: 127.0.0.1:9102", "listen: \"[::ffff:0.0.0.0]:9102\"", 1),
+			wantError: "wildcard listen address",
+		},
+		{
+			name:      "reject dot in interface name",
+			yaml:      strings.Replace(validYAML, "interface: sbx0", "interface: sbx0.1", 1),
+			wantError: "interface",
+		},
 	}
 
 	for _, tc := range cases {

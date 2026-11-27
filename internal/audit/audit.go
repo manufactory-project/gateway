@@ -111,6 +111,8 @@ type Writer struct {
 	seq         int
 	file        *os.File
 	fileSize    int64
+	writeSeq    uint64
+	notifyCh    chan struct{}
 	writeErrors atomic.Uint64
 	healthy     atomic.Bool
 }
@@ -145,6 +147,7 @@ func NewWriter(opts Options) (*Writer, error) {
 		diag:         diag,
 		now:          nowFn,
 		onWriteError: opts.OnWriteError,
+		notifyCh:     make(chan struct{}),
 	}
 
 	if err := w.openSegmentLocked(nowFn().UTC(), false); err != nil {
@@ -200,6 +203,9 @@ func (w *Writer) WriteSync(ev Event) error {
 	}
 	w.fileSize += int64(n)
 	w.healthy.Store(true)
+	w.writeSeq++
+	close(w.notifyCh)
+	w.notifyCh = make(chan struct{})
 
 	if w.stdout != nil {
 		if _, err := w.stdout.Write(line); err != nil {
@@ -216,8 +222,32 @@ func (w *Writer) WriteSync(ev Event) error {
 func (w *Writer) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.closed = true
+	if !w.closed {
+		w.closed = true
+		close(w.notifyCh)
+		w.notifyCh = make(chan struct{})
+	}
 	return w.closeFileLocked()
+}
+
+// WriteSeq returns the current monotonic successful write sequence number.
+func (w *Writer) WriteSeq() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeSeq
+}
+
+// WaitWrite returns a channel closed as soon as a new write succeeds past afterSeq
+// (or immediately if writeSeq already advanced or the writer is closed).
+func (w *Writer) WaitWrite(afterSeq uint64) <-chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.writeSeq != afterSeq || w.closed {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return w.notifyCh
 }
 
 // WriteErrors returns the total number of failed audit writes since creation.
@@ -437,8 +467,83 @@ type segmentRef struct {
 	seq  int
 }
 
-// Query reads audit events from dir matching opts in chronological order.
-func Query(dir string, opts QueryOptions) ([]Event, error) {
+// Cursor records a segment filename and byte offset for incremental tail/follow reads.
+type Cursor struct {
+	File   string
+	Offset int64
+}
+
+// QueryWithCursor reads audit events matching opts and returns a Cursor positioned
+// strictly after the last complete line across all segments in dir (even when opts.Tail
+// truncates the returned slice), so incremental follow never replays duplicates.
+func QueryWithCursor(dir string, opts QueryOptions) ([]Event, Cursor, error) {
+	segs, err := listSegments(dir)
+	if err != nil {
+		return nil, Cursor{}, err
+	}
+
+	var (
+		results []Event
+		cursor  Cursor
+	)
+	for _, s := range segs {
+		endOff, err := readSegmentFrom(filepath.Join(dir, s.name), 0, opts, &results)
+		if err != nil {
+			return nil, Cursor{}, err
+		}
+		cursor = Cursor{File: s.name, Offset: endOff}
+	}
+	if opts.Tail > 0 && len(results) > opts.Tail {
+		results = results[len(results)-opts.Tail:]
+	}
+	return results, cursor, nil
+}
+
+// ReadAfter reads only new events appended strictly after cursor, advancing seamlessly
+// across file-size or daily segment rotations.
+func ReadAfter(dir string, cursor Cursor, opts QueryOptions) ([]Event, Cursor, error) {
+	segs, err := listSegments(dir)
+	if err != nil {
+		return nil, cursor, err
+	}
+	if len(segs) == 0 {
+		return nil, cursor, nil
+	}
+
+	var curDay string
+	var curSeq int
+	var hasCur bool
+	if cursor.File != "" {
+		curDay, curSeq, hasCur = parseSegmentName(cursor.File)
+	}
+
+	var results []Event
+	nextCursor := cursor
+	for _, s := range segs {
+		if hasCur {
+			if s.day < curDay || (s.day == curDay && s.seq < curSeq) {
+				continue
+			}
+			if s.name == cursor.File {
+				endOff, err := readSegmentFrom(filepath.Join(dir, s.name), cursor.Offset, opts, &results)
+				if err != nil {
+					return nil, nextCursor, err
+				}
+				nextCursor = Cursor{File: s.name, Offset: endOff}
+				continue
+			}
+		}
+		// Newer segment after rotation: read from offset 0.
+		endOff, err := readSegmentFrom(filepath.Join(dir, s.name), 0, opts, &results)
+		if err != nil {
+			return nil, nextCursor, err
+		}
+		nextCursor = Cursor{File: s.name, Offset: endOff}
+	}
+	return results, nextCursor, nil
+}
+
+func listSegments(dir string) ([]segmentRef, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("audit: read dir %s: %w", dir, err)
@@ -460,50 +565,49 @@ func Query(dir string, opts QueryOptions) ([]Event, error) {
 		}
 		return segs[i].seq < segs[j].seq
 	})
-
-	var results []Event
-	for _, s := range segs {
-		if err := readSegment(filepath.Join(dir, s.name), opts, &results); err != nil {
-			return nil, err
-		}
-	}
-	if opts.Tail > 0 && len(results) > opts.Tail {
-		results = results[len(results)-opts.Tail:]
-	}
-	return results, nil
+	return segs, nil
 }
 
-func readSegment(path string, opts QueryOptions, out *[]Event) error {
+func readSegmentFrom(path string, startOffset int64, opts QueryOptions, out *[]Event) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("audit: open %s: %w", path, err)
+		return startOffset, fmt.Errorf("audit: open %s: %w", path, err)
 	}
 
-	var scanErr error
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64<<10), 1<<20)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		var ev Event
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			continue
-		}
-		if matchesQuery(ev, opts) {
-			*out = append(*out, ev)
+	if startOffset > 0 {
+		if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+			closeErr := f.Close()
+			return startOffset, errors.Join(fmt.Errorf("audit: seek %s: %w", path, err), closeErr)
 		}
 	}
-	scanErr = sc.Err()
-	closeErr := f.Close()
-	if scanErr != nil {
-		return errors.Join(fmt.Errorf("audit: scan %s: %w", path, scanErr), closeErr)
+
+	pos := startOffset
+	br := bufio.NewReaderSize(f, 64<<10)
+	for {
+		lineBytes, readErr := br.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			closeErr := f.Close()
+			return pos, errors.Join(fmt.Errorf("audit: read %s: %w", path, readErr), closeErr)
+		}
+		// Only advance past complete newline-terminated lines so a concurrent partial write is never skipped.
+		if len(lineBytes) > 0 && lineBytes[len(lineBytes)-1] == '\n' {
+			pos += int64(len(lineBytes))
+			trimmed := strings.TrimSpace(string(lineBytes))
+			if trimmed != "" {
+				var ev Event
+				if err := json.Unmarshal([]byte(trimmed), &ev); err == nil && matchesQuery(ev, opts) {
+					*out = append(*out, ev)
+				}
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
 	}
-	if closeErr != nil {
-		return fmt.Errorf("audit: close %s: %w", path, closeErr)
+	if closeErr := f.Close(); closeErr != nil {
+		return pos, fmt.Errorf("audit: close %s: %w", path, closeErr)
 	}
-	return nil
+	return pos, nil
 }
 
 func matchesQuery(ev Event, opts QueryOptions) bool {
