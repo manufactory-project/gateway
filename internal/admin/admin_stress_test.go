@@ -453,18 +453,23 @@ rules:
 		}
 	})
 
-	// Start real SIGHUP watcher.
-	sigCtx, sigCancel := context.WithCancel(context.Background())
-	sigDone := make(chan struct{})
+	// Start real SIGHUP watcher and grant pruner so short-TTL grants expire mid-flight.
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	var bgWG sync.WaitGroup
+	bgWG.Add(2)
 	go func() {
-		defer close(sigDone)
-		store.WatchSIGHUP(sigCtx, func(_ *config.Snapshot, _ []string, reloadErr error) {
+		defer bgWG.Done()
+		store.WatchSIGHUP(bgCtx, func(_ *config.Snapshot, _ []string, reloadErr error) {
 			col.ObserveReload(reloadErr == nil)
 		})
 	}()
+	go func() {
+		defer bgWG.Done()
+		store.RunGrantPruner(bgCtx, 20*time.Millisecond)
+	}()
 	t.Cleanup(func() {
-		sigCancel()
-		<-sigDone
+		bgCancel()
+		bgWG.Wait()
 	})
 	time.Sleep(20 * time.Millisecond)
 
