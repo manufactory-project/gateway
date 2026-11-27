@@ -40,21 +40,23 @@ type Options struct {
 	Leaves        *ca.LeafCache
 	Dialer      *netguard.Dialer
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-	Flows       *FlowRegistry
-	OnRequest   func(principal, effect string, status int)
+	Flows          *FlowRegistry
+	OnRequest      func(principal, effect string, status int)
+	OnConnRejected func(link string)
 }
 
 // Server owns the explicit-bind HTTPS (:443 semantics) and HTTP (:80 semantics)
 // listeners for a single sandbox link.
 type Server struct {
-	link        config.LinkConfig
-	store       *config.Store
-	eval        *policy.Evaluator
-	audit       *audit.Writer
-	leaves      *ca.LeafCache
-	dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
-	flows       *FlowRegistry
-	onRequest   func(principal, effect string, status int)
+	link           config.LinkConfig
+	store          *config.Store
+	eval           *policy.Evaluator
+	audit          *audit.Writer
+	leaves         *ca.LeafCache
+	dialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
+	flows          *FlowRegistry
+	onRequest      func(principal, effect string, status int)
+	onConnRejected func(link string)
 
 	transport *http.Transport
 
@@ -96,20 +98,22 @@ func NewServer(opts Options) (*Server, error) {
 		MaxIdleConns:           100,
 		IdleConnTimeout:        60 * time.Second,
 		TLSHandshakeTimeout:    15 * time.Second,
+		ResponseHeaderTimeout:  hCfg.ParsedUpstreamResponseHeaderTimeout,
 		ExpectContinueTimeout:  1 * time.Second,
 		MaxResponseHeaderBytes: int64(hCfg.MaxHeaderBytes),
 	}
 
 	s := &Server{
-		link:        opts.Link,
-		store:       opts.Store,
-		eval:        opts.Evaluator,
-		audit:       opts.Audit,
-		leaves:      opts.Leaves,
-		dialContext: dialFn,
-		flows:       flows,
-		onRequest:   opts.OnRequest,
-		transport:   tr,
+		link:           opts.Link,
+		store:          opts.Store,
+		eval:           opts.Evaluator,
+		audit:          opts.Audit,
+		leaves:         opts.Leaves,
+		dialContext:    dialFn,
+		flows:          flows,
+		onRequest:      opts.OnRequest,
+		onConnRejected: opts.OnConnRejected,
+		transport:      tr,
 	}
 
 	opts.Store.OnReload(s.onConfigReload)
@@ -155,14 +159,26 @@ func (s *Server) Start() error {
 		return errors.Join(fmt.Errorf("proxy: listen http %s: %w", httpAddr, err), closeErr)
 	}
 
+	hCfg := s.store.Current().Config.HTTP
+	connSem := make(chan struct{}, hCfg.MaxConnsPerLink)
+
 	tlsCfg := &tls.Config{
 		MinVersion:     tls.VersionTLS12,
 		NextProtos:     []string{"h2", "http/1.1"},
 		GetCertificate: s.getCertificate,
 	}
-	httpsLn := tls.NewListener(rawHTTPSLn, tlsCfg)
-
-	hCfg := s.store.Current().Config.HTTP
+	httpsLn := tls.NewListener(&cappedListener{
+		Listener:   rawHTTPSLn,
+		sem:        connSem,
+		linkName:   s.link.Name,
+		onRejected: s.onConnRejected,
+	}, tlsCfg)
+	cappedHTTPLn := &cappedListener{
+		Listener:   httpLn,
+		sem:        connSem,
+		linkName:   s.link.Name,
+		onRejected: s.onConnRejected,
+	}
 
 	var httpsProtos http.Protocols
 	httpsProtos.SetHTTP1(true)
@@ -198,7 +214,7 @@ func (s *Server) Start() error {
 	}
 
 	s.httpsLn = httpsLn
-	s.httpLn = httpLn
+	s.httpLn = cappedHTTPLn
 
 	s.wg.Add(2)
 	go func() {
@@ -209,11 +225,50 @@ func (s *Server) Start() error {
 	}()
 	go func() {
 		defer s.wg.Done()
-		if err := s.httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := s.httpSrv.Serve(cappedHTTPLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return
 		}
 	}()
 	return nil
+}
+
+type cappedListener struct {
+	net.Listener
+	sem        chan struct{}
+	linkName   string
+	onRejected func(link string)
+}
+
+func (l *cappedListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.sem <- struct{}{}:
+			return &trackedConn{Conn: c, sem: l.sem}, nil
+		default:
+			closeQuietly(c)
+			if l.onRejected != nil {
+				l.onRejected(l.linkName)
+			}
+		}
+	}
+}
+
+type trackedConn struct {
+	net.Conn
+	sem       chan struct{}
+	closeOnce sync.Once
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.closeOnce.Do(func() {
+		<-c.sem
+	})
+	return err
 }
 
 // Shutdown drains listeners, tears down remaining link flows, closes idle upstream connections, and waits for goroutines.

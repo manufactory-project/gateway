@@ -9,6 +9,7 @@ audit:
   dir: /var/log/gateway/audit
   retain_days: 30
   max_file_bytes: 104857600
+  max_total_bytes: 10737418240
   stdout_json: true
 
 admin:
@@ -35,6 +36,8 @@ http:
   max_request_body_bytes: 33554432
   ws_max_egress_bytes: 67108864
   max_header_bytes: 32768
+  max_conns_per_link: 512
+  upstream_response_header_timeout: 10m
 
 records:
   forge.internal.example: <forge-ip>

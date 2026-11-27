@@ -273,14 +273,15 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	}
 
 	srv, err := proxy.NewServer(proxy.Options{
-		Link:        store.Current().Config.Links[0],
-		Store:       store,
-		Evaluator:   policy.NewEvaluator(store),
-		Audit:       aw,
-		Leaves:      ca.NewLeafCache(leafCA),
-		DialContext: dialFn,
-		Flows:       flows,
-		OnRequest:   col.ObserveRequest,
+		Link:           store.Current().Config.Links[0],
+		Store:          store,
+		Evaluator:      policy.NewEvaluator(store),
+		Audit:          aw,
+		Leaves:         ca.NewLeafCache(leafCA),
+		DialContext:    dialFn,
+		Flows:          flows,
+		OnRequest:      col.ObserveRequest,
+		OnConnRejected: col.IncConnRejected,
 	})
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)

@@ -177,14 +177,15 @@ func (rt *daemonRuntime) startLinks(
 		rt.dnsServers = append(rt.dnsServers, ds)
 
 		ps, err := proxy.NewServer(proxy.Options{
-			Link:      link,
-			Store:     store,
-			Evaluator: eval,
-			Audit:     rt.auditWriter,
-			Leaves:    leaves,
-			Dialer:    dialer,
-			Flows:     flows,
-			OnRequest: collector.ObserveRequest,
+			Link:           link,
+			Store:          store,
+			Evaluator:      eval,
+			Audit:          rt.auditWriter,
+			Leaves:         leaves,
+			Dialer:         dialer,
+			Flows:          flows,
+			OnRequest:      collector.ObserveRequest,
+			OnConnRejected: collector.IncConnRejected,
 		})
 		if err != nil {
 			return err
@@ -282,12 +283,14 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		auditStdout = stdout
 	}
 	auditWriter, err := audit.NewWriter(audit.Options{
-		Dir:          cfg.Audit.Dir,
-		RetainDays:   cfg.Audit.RetainDays,
-		MaxFileBytes: cfg.Audit.MaxFileBytes,
-		Stdout:       auditStdout,
-		Diag:         stderr,
-		OnWriteError: collector.IncAuditWriteError,
+		Dir:           cfg.Audit.Dir,
+		RetainDays:    cfg.Audit.RetainDays,
+		MaxFileBytes:  cfg.Audit.MaxFileBytes,
+		MaxTotalBytes: cfg.Audit.MaxTotalBytes,
+		Stdout:        auditStdout,
+		Diag:          stderr,
+		OnWriteError:  collector.IncAuditWriteError,
+		OnSizePrune:   collector.ObserveAuditSizePruned,
 	})
 	if err != nil {
 		return err

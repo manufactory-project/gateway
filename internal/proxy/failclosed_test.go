@@ -607,3 +607,132 @@ func TestTruncatedUpstreamResponseAbortsGuestH1AndH2(t *testing.T) {
 		})
 	}
 }
+
+func TestMaxConnsPerLinkCapAndMetric(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts:         []string{"cap.example.com"},
+		HTTPBlockYAML: "http:\n  max_conns_per_link: 2\n",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		RulesYAML: `
+  - id: allow-cap
+    principal: worker-test
+    effect: allow
+    hosts: [cap.example.com]
+    ports: [443]
+`,
+	})
+
+	// Hold 2 raw TCP connections (1 HTTPS + 1 HTTP) to saturate the shared per-link cap=2.
+	c1, err := net.DialTimeout("tcp4", gw.HTTPSAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial c1: %v", err)
+	}
+	c2, err := net.DialTimeout("tcp4", gw.HTTPAddr, time.Second)
+	if err != nil {
+		if cErr := c1.Close(); cErr != nil {
+			t.Logf("close c1: %v", cErr)
+		}
+		t.Fatalf("dial c2: %v", err)
+	}
+	// Give listener goroutines a moment to accept both slots.
+	time.Sleep(40 * time.Millisecond)
+
+	// Connection N+1 (3rd) must be closed immediately and counted in gateway_conns_rejected_total.
+	c3, err := net.DialTimeout("tcp4", gw.HTTPSAddr, time.Second)
+	if err == nil {
+		if dErr := c3.SetReadDeadline(time.Now().Add(time.Second)); dErr != nil {
+			t.Fatalf("set c3 deadline: %v", dErr)
+		}
+		var one [1]byte
+		if _, rErr := c3.Read(one[:]); rErr == nil {
+			t.Fatal("expected 3rd connection beyond cap to be closed, read succeeded")
+		} else if ne, ok := rErr.(net.Error); ok && ne.Timeout() {
+			t.Fatal("3rd connection beyond cap stayed open instead of closing immediately")
+		}
+		if cErr := c3.Close(); cErr != nil {
+			t.Logf("close c3: %v", cErr)
+		}
+	}
+
+	// Verify metric incremented for link sbx0.
+	deadline := time.Now().Add(time.Second)
+	sawMetric := false
+	for time.Now().Before(deadline) {
+		rec := httptest.NewRecorder()
+		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		if strings.Contains(rec.Body.String(), `gateway_conns_rejected_total{link="sbx0"} 1`) {
+			sawMetric = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawMetric {
+		rec := httptest.NewRecorder()
+		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		t.Fatalf("missing gateway_conns_rejected_total{link=\"sbx0\"} 1 in metrics:\n%s", rec.Body.String())
+	}
+
+	// Release held connections and confirm requests under the cap succeed.
+	if err := c1.Close(); err != nil {
+		t.Fatalf("close c1: %v", err)
+	}
+	if err := c2.Close(); err != nil {
+		t.Fatalf("close c2: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+	resp, err := gw.H1Client(t, "cap.example.com").Get("https://cap.example.com/ok")
+	if err != nil {
+		t.Fatalf("GET under cap failed: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close resp: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET under cap status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestUpstreamResponseHeaderTimeoutAudits502(t *testing.T) {
+	release := make(chan struct{})
+	gw := newTestGateway(t, testGatewaySpec{
+		OnCleanupFirst: func() { close(release) },
+		Hosts:          []string{"slowhdr.example.com"},
+		HTTPBlockYAML:  "http:\n  upstream_response_header_timeout: 80ms\n",
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+		}),
+		RulesYAML: `
+  - id: allow-slowhdr
+    principal: worker-test
+    effect: allow
+    hosts: [slowhdr.example.com]
+    ports: [443]
+`,
+	})
+
+	resp, err := gw.H1Client(t, "slowhdr.example.com").Get("https://slowhdr.example.com/stall")
+	if err != nil {
+		t.Fatalf("GET /stall: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close resp: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+
+	var saw502 bool
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Kind == audit.KindRequest && ev.Path == "/stall" && ev.Status == http.StatusBadGateway && ev.Error != "" {
+			saw502 = true
+		}
+	}
+	if !saw502 {
+		t.Fatal("missing audited 502 for upstream_response_header_timeout")
+	}
+}

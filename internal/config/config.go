@@ -23,13 +23,16 @@ import (
 const (
 	DefaultFakeCIDR            = "198.18.0.0/15"
 	DefaultDNSTTLSeconds       = 60
-	DefaultMaxRequestBodyBytes = 32 << 20 // 32 MiB
-	DefaultWSMaxEgressBytes    = 64 << 20 // 64 MiB
-	DefaultMaxHeaderBytes      = 32 << 10 // 32 KiB
-	DefaultAuditRetainDays     = 30
-	MaxAuditRetainDays         = int(math.MaxInt64 / int64(24*time.Hour))
-	DefaultAuditMaxFileBytes   = 100 << 20 // 100 MiB
-	DefaultHTTPSPort           = 10443
+	DefaultMaxRequestBodyBytes           = 32 << 20 // 32 MiB
+	DefaultWSMaxEgressBytes              = 64 << 20 // 64 MiB
+	DefaultMaxHeaderBytes                = 32 << 10 // 32 KiB
+	DefaultMaxConnsPerLink               = 512
+	DefaultUpstreamResponseHeaderTimeout = "10m"
+	DefaultAuditRetainDays               = 30
+	MaxAuditRetainDays                   = int(math.MaxInt64 / int64(24*time.Hour))
+	DefaultAuditMaxFileBytes             = 100 << 20        // 100 MiB
+	DefaultAuditMaxTotalBytes            = int64(10) << 30  // 10 GiB
+	DefaultHTTPSPort                     = 10443
 	DefaultHTTPPort            = 10080
 	DefaultDNSPort             = 10053
 	DefaultDHCPLeaseTime       = "12h"
@@ -62,10 +65,11 @@ type CAConfig struct {
 
 // AuditConfig configures the fail-closed JSONL audit sink.
 type AuditConfig struct {
-	Dir          string `yaml:"dir"`
-	RetainDays   int    `yaml:"retain_days"`
-	MaxFileBytes int64  `yaml:"max_file_bytes"`
-	StdoutJSON   bool   `yaml:"stdout_json"`
+	Dir           string `yaml:"dir"`
+	RetainDays    int    `yaml:"retain_days"`
+	MaxFileBytes  int64  `yaml:"max_file_bytes"`
+	MaxTotalBytes int64  `yaml:"max_total_bytes"`
+	StdoutJSON    bool   `yaml:"stdout_json"`
 }
 
 // AdminConfig configures the Unix-domain-socket Admin API.
@@ -100,11 +104,15 @@ type DNSConfig struct {
 	TTLSeconds uint32 `yaml:"ttl_seconds"`
 }
 
-// HTTPConfig configures MITM HTTP/2/WS size and header limits.
+// HTTPConfig configures MITM HTTP/2/WS size, connection, timeout, and header limits.
 type HTTPConfig struct {
-	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
-	WSMaxEgressBytes    int64 `yaml:"ws_max_egress_bytes"`
-	MaxHeaderBytes      int   `yaml:"max_header_bytes"`
+	MaxRequestBodyBytes           int64  `yaml:"max_request_body_bytes"`
+	WSMaxEgressBytes              int64  `yaml:"ws_max_egress_bytes"`
+	MaxHeaderBytes                int    `yaml:"max_header_bytes"`
+	MaxConnsPerLink               int    `yaml:"max_conns_per_link"`
+	UpstreamResponseHeaderTimeout string `yaml:"upstream_response_header_timeout"`
+
+	ParsedUpstreamResponseHeaderTimeout time.Duration `yaml:"-"`
 }
 
 // LinkConfig maps one sandbox link interface and subnet to one principal.
@@ -212,6 +220,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Audit.MaxFileBytes == 0 {
 		cfg.Audit.MaxFileBytes = DefaultAuditMaxFileBytes
 	}
+	if cfg.Audit.MaxTotalBytes == 0 {
+		cfg.Audit.MaxTotalBytes = DefaultAuditMaxTotalBytes
+	}
 	if cfg.DNS.FakeCIDR == "" {
 		cfg.DNS.FakeCIDR = DefaultFakeCIDR
 	}
@@ -226,6 +237,12 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.HTTP.MaxHeaderBytes == 0 {
 		cfg.HTTP.MaxHeaderBytes = DefaultMaxHeaderBytes
+	}
+	if cfg.HTTP.MaxConnsPerLink == 0 {
+		cfg.HTTP.MaxConnsPerLink = DefaultMaxConnsPerLink
+	}
+	if cfg.HTTP.UpstreamResponseHeaderTimeout == "" {
+		cfg.HTTP.UpstreamResponseHeaderTimeout = DefaultUpstreamResponseHeaderTimeout
 	}
 	if cfg.Dataplane.DHCP.LeaseTime == "" {
 		cfg.Dataplane.DHCP.LeaseTime = DefaultDHCPLeaseTime
@@ -267,6 +284,9 @@ func validate(cfg *Config) error {
 	if cfg.Audit.MaxFileBytes < 0 {
 		return fmt.Errorf("audit.max_file_bytes must be >= 0, got %d", cfg.Audit.MaxFileBytes)
 	}
+	if cfg.Audit.MaxTotalBytes < 0 {
+		return fmt.Errorf("audit.max_total_bytes must be >= 0, got %d", cfg.Audit.MaxTotalBytes)
+	}
 	if cfg.Metrics.Listen != "" {
 		if err := validateExplicitListenAddr(cfg.Metrics.Listen); err != nil {
 			return fmt.Errorf("metrics.listen: %w", err)
@@ -275,7 +295,7 @@ func validate(cfg *Config) error {
 	if err := validateDNS(cfg); err != nil {
 		return err
 	}
-	if err := validateHTTP(cfg.HTTP); err != nil {
+	if err := validateHTTP(&cfg.HTTP); err != nil {
 		return err
 	}
 	if err := validateRecords(cfg); err != nil {
@@ -364,7 +384,7 @@ func validateDNS(cfg *Config) error {
 	return nil
 }
 
-func validateHTTP(h HTTPConfig) error {
+func validateHTTP(h *HTTPConfig) error {
 	if h.MaxRequestBodyBytes <= 0 {
 		return fmt.Errorf("http.max_request_body_bytes must be > 0, got %d", h.MaxRequestBodyBytes)
 	}
@@ -374,6 +394,14 @@ func validateHTTP(h HTTPConfig) error {
 	if h.MaxHeaderBytes <= 0 {
 		return fmt.Errorf("http.max_header_bytes must be > 0, got %d", h.MaxHeaderBytes)
 	}
+	if h.MaxConnsPerLink <= 0 {
+		return fmt.Errorf("http.max_conns_per_link must be > 0, got %d", h.MaxConnsPerLink)
+	}
+	dur, err := time.ParseDuration(h.UpstreamResponseHeaderTimeout)
+	if err != nil || dur <= 0 {
+		return fmt.Errorf("http.upstream_response_header_timeout %q must be a positive duration", h.UpstreamResponseHeaderTimeout)
+	}
+	h.ParsedUpstreamResponseHeaderTimeout = dur
 	return nil
 }
 
@@ -621,8 +649,8 @@ func validateRuleBasics(i int, r *RuleConfig, seenIDs, declaredPrincipals map[st
 		r.Methods[mi] = strings.ToUpper(m)
 	}
 	for pi, p := range r.Paths {
-		if !strings.HasPrefix(p, "/") {
-			return nil, false, fmt.Errorf("rules[%s].paths[%d] %q must start with '/'", r.ID, pi, p)
+		if err := ValidatePathPattern(p); err != nil {
+			return nil, false, fmt.Errorf("rules[%s].paths[%d] %q: %w", r.ID, pi, p, err)
 		}
 	}
 	return seenHosts, has443, nil
@@ -740,8 +768,8 @@ func validateBinding(ruleID string, b *BindingConfig, ruleHosts map[string]bool)
 		b.Methods[mi] = strings.ToUpper(m)
 	}
 	for pi, p := range b.Paths {
-		if !strings.HasPrefix(p, "/") {
-			return fmt.Errorf("rules[%s].bindings[%s].paths[%d] %q must start with '/'", ruleID, b.Name, pi, p)
+		if err := ValidatePathPattern(p); err != nil {
+			return fmt.Errorf("rules[%s].bindings[%s].paths[%d] %q: %w", ruleID, b.Name, pi, p, err)
 		}
 	}
 
@@ -774,6 +802,31 @@ func validateBinding(ruleID string, b *BindingConfig, ruleHosts map[string]bool)
 
 	if b.SecretFile == "" || !filepath.IsAbs(b.SecretFile) {
 		return fmt.Errorf("rules[%s].bindings[%s].secret_file %q must be an absolute path", ruleID, b.Name, b.SecretFile)
+	}
+	return nil
+}
+
+// ValidatePathPattern checks that a path glob starts with '/' and stays within
+// bounded wildcard complexity: at most one '**' across the pattern, no '***',
+// and at most 4 single '*' wildcards per path segment.
+func ValidatePathPattern(p string) error {
+	if !strings.HasPrefix(p, "/") {
+		return errors.New("must start with '/'")
+	}
+	if strings.Contains(p, "***") {
+		return errors.New("contains invalid '***' wildcard sequence")
+	}
+	doubleStars := 0
+	for _, seg := range strings.Split(p, "/") {
+		ds := strings.Count(seg, "**")
+		doubleStars += ds
+		if doubleStars > 1 {
+			return errors.New("may contain at most one '**' wildcard")
+		}
+		singleStars := strings.Count(strings.ReplaceAll(seg, "**", ""), "*")
+		if singleStars > 4 {
+			return fmt.Errorf("segment %q has %d '*' wildcards (max 4)", seg, singleStars)
+		}
 	}
 	return nil
 }

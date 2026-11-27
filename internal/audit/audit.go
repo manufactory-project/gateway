@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,9 @@ const (
 
 	// DefaultMaxFileBytes is the default per-segment rotation size (100 MiB).
 	DefaultMaxFileBytes = 100 << 20
+
+	// DefaultMaxTotalBytes is the default total audit directory size cap (10 GiB).
+	DefaultMaxTotalBytes = int64(10) << 30
 
 	filePrefix = "gateway-"
 	fileExt    = ".jsonl"
@@ -77,33 +81,38 @@ type Event struct {
 	ExpiresAt  string    `json:"expires_at,omitempty"`
 	FlowID     string    `json:"flow_id,omitempty"`
 	Secrets    []string  `json:"secrets,omitempty"`
-	BytesOut   int64     `json:"bytes_out,omitempty"`
-	BytesIn    int64     `json:"bytes_in,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	ConfigHash string    `json:"config_hash,omitempty"`
+	BytesOut     int64     `json:"bytes_out,omitempty"`
+	BytesIn      int64     `json:"bytes_in,omitempty"`
+	BytesRemoved int64     `json:"bytes_removed,omitempty"`
+	Error        string    `json:"error,omitempty"`
+	ConfigHash   string    `json:"config_hash,omitempty"`
 }
 
 // Options configures an audit Writer.
 type Options struct {
-	Dir          string
-	RetainDays   int
-	MaxFileBytes int64
-	Stdout       io.Writer
-	Diag         io.Writer
-	Now          func() time.Time
-	OnWriteError func()
+	Dir           string
+	RetainDays    int
+	MaxFileBytes  int64
+	MaxTotalBytes int64
+	Stdout        io.Writer
+	Diag          io.Writer
+	Now           func() time.Time
+	OnWriteError  func()
+	OnSizePrune   func(bytesRemoved int64)
 }
 
 // Writer appends structured JSONL audit events synchronously and fails closed
 // whenever the underlying file sink cannot be opened or written.
 type Writer struct {
-	dir          string
-	retain       time.Duration
-	maxFileBytes int64
-	stdout       io.Writer
-	diag         io.Writer
-	now          func() time.Time
-	onWriteError func()
+	dir           string
+	retain        time.Duration
+	maxFileBytes  int64
+	maxTotalBytes int64
+	stdout        io.Writer
+	diag          io.Writer
+	now           func() time.Time
+	onWriteError  func()
+	onSizePrune   func(bytesRemoved int64)
 
 	mu          sync.Mutex
 	closed      bool
@@ -128,6 +137,10 @@ func NewWriter(opts Options) (*Writer, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxFileBytes
 	}
+	maxTotal := opts.MaxTotalBytes
+	if maxTotal <= 0 {
+		maxTotal = DefaultMaxTotalBytes
+	}
 	nowFn := opts.Now
 	if nowFn == nil {
 		nowFn = time.Now
@@ -138,13 +151,15 @@ func NewWriter(opts Options) (*Writer, error) {
 	}
 
 	w := &Writer{
-		dir:          opts.Dir,
-		retain:       time.Duration(opts.RetainDays) * 24 * time.Hour,
-		maxFileBytes: maxBytes,
-		stdout:       opts.Stdout,
-		diag:         diag,
-		now:          nowFn,
-		onWriteError: opts.OnWriteError,
+		dir:           opts.Dir,
+		retain:        time.Duration(opts.RetainDays) * 24 * time.Hour,
+		maxFileBytes:  maxBytes,
+		maxTotalBytes: maxTotal,
+		stdout:        opts.Stdout,
+		diag:          diag,
+		now:           nowFn,
+		onWriteError:  opts.OnWriteError,
+		onSizePrune:   opts.OnSizePrune,
 	}
 
 	if err := w.openSegmentLocked(nowFn().UTC(), false); err != nil {
@@ -186,6 +201,10 @@ func (w *Writer) WriteSync(ev Event) error {
 		}
 	}
 
+	return w.writeLineLocked(line)
+}
+
+func (w *Writer) writeLineLocked(line []byte) error {
 	n, writeErr := w.file.Write(line)
 	if writeErr != nil || n != len(line) {
 		if writeErr == nil {
@@ -294,6 +313,7 @@ func (w *Writer) openSegmentLocked(ts time.Time, incrementSeq bool) error {
 	}
 
 	w.pruneLocked(ts.UTC())
+	w.pruneSizeLocked(ts.UTC())
 	return nil
 }
 
@@ -345,6 +365,101 @@ func (w *Writer) pruneLocked(now time.Time) {
 					return
 				}
 			}
+		}
+	}
+}
+
+type segmentMeta struct {
+	name   string
+	day    string
+	seq    int
+	size   int64
+	active bool
+}
+
+func (w *Writer) pruneSizeLocked(now time.Time) {
+	if w.maxTotalBytes <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		if _, dErr := fmt.Fprintf(w.diag, "audit: size-prune readdir %s: %v\n", w.dir, err); dErr != nil {
+			return
+		}
+		return
+	}
+	activeName := segmentFileName(w.day, w.seq)
+	var (
+		segs  []segmentMeta
+		total int64
+	)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		dayStr, seq, ok := parseSegmentName(e.Name())
+		if !ok {
+			continue
+		}
+		fi, infoErr := e.Info()
+		if infoErr != nil {
+			continue
+		}
+		sz := fi.Size()
+		total += sz
+		segs = append(segs, segmentMeta{
+			name:   e.Name(),
+			day:    dayStr,
+			seq:    seq,
+			size:   sz,
+			active: e.Name() == activeName,
+		})
+	}
+	if total <= w.maxTotalBytes {
+		return
+	}
+	sort.Slice(segs, func(i, j int) bool {
+		if segs[i].day != segs[j].day {
+			return segs[i].day < segs[j].day
+		}
+		return segs[i].seq < segs[j].seq
+	})
+	var removed int64
+	for _, seg := range segs {
+		if total <= w.maxTotalBytes {
+			break
+		}
+		if seg.active {
+			continue
+		}
+		if rmErr := os.Remove(filepath.Join(w.dir, seg.name)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			if _, dErr := fmt.Fprintf(w.diag, "audit: size-prune remove %s: %v\n", seg.name, rmErr); dErr != nil {
+				return
+			}
+			continue
+		}
+		total -= seg.size
+		removed += seg.size
+	}
+	if removed <= 0 {
+		return
+	}
+	if w.onSizePrune != nil {
+		w.onSizePrune(removed)
+	}
+	ev := sanitizeEvent(Event{
+		Kind:         KindLifecycle,
+		Reason:       "audit-size-pruned",
+		BytesRemoved: removed,
+	}, now.UTC())
+	line, mErr := json.Marshal(ev)
+	if mErr != nil {
+		return
+	}
+	line = append(line, '\n')
+	if wErr := w.writeLineLocked(line); wErr != nil {
+		if _, dErr := fmt.Fprintf(w.diag, "audit: write audit-size-pruned event: %v\n", wErr); dErr != nil {
+			return
 		}
 	}
 }

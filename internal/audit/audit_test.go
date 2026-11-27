@@ -283,3 +283,65 @@ func TestAuditRotationAndRetention(t *testing.T) {
 		t.Fatal("expected RetainDays > MaxRetainDays to fail")
 	}
 }
+
+func TestAuditSizePruningKeepsActiveAndEmitsLifecycleEvent(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	var prunedTotal atomic.Int64
+	w, err := audit.NewWriter(audit.Options{
+		Dir:           dir,
+		MaxFileBytes:  150,
+		MaxTotalBytes: 360,
+		Now:           func() time.Time { return now },
+		OnSizePrune:   func(n int64) { prunedTotal.Add(n) },
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := w.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	// Write enough events to rotate across 5+ segments so total exceeds MaxTotalBytes.
+	for i := 0; i < 6; i++ {
+		if err := w.WriteSync(audit.Event{
+			Kind:      audit.KindRequest,
+			Principal: "worker-claude",
+			Host:      "api.anthropic.com",
+			Path:      "/v1/messages",
+			Method:    "POST",
+			Status:    200,
+			Effect:    audit.EffectAllow,
+		}); err != nil {
+			t.Fatalf("WriteSync %d: %v", i, err)
+		}
+	}
+
+	if prunedTotal.Load() <= 0 {
+		t.Fatalf("expected OnSizePrune > 0, got %d", prunedTotal.Load())
+	}
+
+	// Oldest segment gateway-2026-11-26.jsonl must have been deleted while newer active segment remains.
+	if _, err := os.Stat(filepath.Join(dir, "gateway-2026-11-26.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("expected oldest closed segment to be pruned, stat err=%v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("active segment was deleted; expected at least 1 segment remaining")
+	}
+
+	var sawLifecycle bool
+	for _, ev := range readAuditEvents(t, dir) {
+		if ev.Kind == audit.KindLifecycle && ev.Reason == "audit-size-pruned" && ev.BytesRemoved > 0 {
+			sawLifecycle = true
+		}
+	}
+	if !sawLifecycle {
+		t.Fatal("missing lifecycle audit event with reason=audit-size-pruned and bytes_removed>0")
+	}
+}

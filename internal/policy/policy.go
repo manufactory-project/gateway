@@ -487,39 +487,138 @@ func globPathMatch(pattern, value string) bool {
 	return matchGlob(pattern, value)
 }
 
-func matchGlob(pat, val string) bool {
-	for len(pat) > 0 {
-		if strings.HasPrefix(pat, "**") {
-			rest := pat[2:]
-			if rest == "" {
-				return true
+type globTokenKind uint8
+
+const (
+	globLit globTokenKind = iota
+	globStar
+	globDoubleStar
+)
+
+type globToken struct {
+	kind globTokenKind
+	ch   byte
+}
+
+func tokenizeGlob(pat string) []globToken {
+	toks := make([]globToken, 0, len(pat))
+	for i := 0; i < len(pat); {
+		if pat[i] == '*' {
+			if i+1 < len(pat) && pat[i+1] == '*' {
+				toks = append(toks, globToken{kind: globDoubleStar})
+				i += 2
+				continue
 			}
-			for i := 0; i <= len(val); i++ {
-				if matchGlob(rest, val[i:]) {
-					return true
-				}
-			}
-			return false
+			toks = append(toks, globToken{kind: globStar})
+			i++
+			continue
 		}
-		if pat[0] == '*' {
-			rest := pat[1:]
-			for i := 0; i <= len(val); i++ {
-				if i > 0 && val[i-1] == '/' {
-					break
-				}
-				if matchGlob(rest, val[i:]) {
-					return true
-				}
-			}
-			return false
-		}
-		if len(val) == 0 || pat[0] != val[0] {
-			return false
-		}
-		pat = pat[1:]
-		val = val[1:]
+		toks = append(toks, globToken{kind: globLit, ch: pat[i]})
+		i++
 	}
-	return len(val) == 0
+	return toks
+}
+
+// matchGlob evaluates pat against val using a linear-time NFA simulation so
+// worst-case non-matching paths never backtrack exponentially.
+func matchGlob(pat, val string) bool {
+	toks := tokenizeGlob(pat)
+	if len(toks) < 64 {
+		return matchGlobBitmask(toks, val)
+	}
+	return matchGlobSlice(toks, val)
+}
+
+func matchGlobBitmask(toks []globToken, val string) bool {
+	n := len(toks)
+	var (
+		wildMask uint64
+		starMask uint64
+		dblMask  uint64
+		charMask [256]uint64
+	)
+	for j, tk := range toks {
+		bit := uint64(1) << j
+		switch tk.kind {
+		case globDoubleStar:
+			dblMask |= bit
+			wildMask |= bit
+		case globStar:
+			starMask |= bit
+			wildMask |= bit
+		case globLit:
+			charMask[tk.ch] |= bit
+		}
+	}
+
+	cur := uint64(1)
+	for add := (cur & wildMask) << 1; add & ^cur != 0; add = (cur & wildMask) << 1 {
+		cur |= add
+	}
+	for i := 0; i < len(val); i++ {
+		ch := val[i]
+		next := ((cur & charMask[ch]) << 1) | (cur & dblMask)
+		if ch != '/' {
+			next |= cur & starMask
+		}
+		if next == 0 {
+			return false
+		}
+		for add := (next & wildMask) << 1; add & ^next != 0; add = (next & wildMask) << 1 {
+			next |= add
+		}
+		cur = next
+	}
+	return cur&(uint64(1)<<n) != 0
+}
+
+func matchGlobSlice(toks []globToken, val string) bool {
+	n := len(toks)
+	cur := make([]bool, n+1)
+	next := make([]bool, n+1)
+
+	closeEps := func(states []bool) {
+		for j := 0; j < n; j++ {
+			if states[j] && (toks[j].kind == globStar || toks[j].kind == globDoubleStar) {
+				states[j+1] = true
+			}
+		}
+	}
+
+	cur[0] = true
+	closeEps(cur)
+
+	for i := 0; i < len(val); i++ {
+		ch := val[i]
+		clear(next)
+		any := false
+		for j := 0; j < n; j++ {
+			if !cur[j] {
+				continue
+			}
+			switch toks[j].kind {
+			case globDoubleStar:
+				next[j] = true
+				any = true
+			case globStar:
+				if ch != '/' {
+					next[j] = true
+					any = true
+				}
+			case globLit:
+				if toks[j].ch == ch {
+					next[j+1] = true
+					any = true
+				}
+			}
+		}
+		if !any {
+			return false
+		}
+		closeEps(next)
+		cur, next = next, cur
+	}
+	return cur[n]
 }
 
 func normalizeLookupHost(raw string) (string, bool) {

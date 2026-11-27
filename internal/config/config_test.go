@@ -181,6 +181,31 @@ func TestConfigValidationInvariants(t *testing.T) {
 			yaml:      strings.Replace(validYAML, "interface: sbx0", "interface: sbx0.1", 1),
 			wantError: "interface",
 		},
+		{
+			name:      "reject two double-stars in rule path",
+			yaml:      strings.Replace(validYAML, "hosts: [deb.debian.org]", "hosts: [deb.debian.org]\n    paths: [\"/**/a/**\"]", 1),
+			wantError: "at most one '**'",
+		},
+		{
+			name:      "reject five single-stars in one segment",
+			yaml:      strings.Replace(validYAML, "hosts: [deb.debian.org]", "hosts: [deb.debian.org]\n    paths: [\"/*a*b*c*d*e\"]", 1),
+			wantError: "max 4",
+		},
+		{
+			name:      "reject negative audit.max_total_bytes",
+			yaml:      strings.Replace(validYAML, "  dir: /var/log/gateway/audit", "  dir: /var/log/gateway/audit\n  max_total_bytes: -1", 1),
+			wantError: "max_total_bytes",
+		},
+		{
+			name:      "reject negative http.max_conns_per_link",
+			yaml:      validYAML + "\nhttp:\n  max_conns_per_link: -5\n",
+			wantError: "max_conns_per_link",
+		},
+		{
+			name:      "reject invalid http.upstream_response_header_timeout",
+			yaml:      validYAML + "\nhttp:\n  upstream_response_header_timeout: notaduration\n",
+			wantError: "upstream_response_header_timeout",
+		},
 	}
 
 	for _, tc := range cases {
@@ -326,6 +351,12 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	if _, err := store.AddGrant("worker-claude", "forge.internal.example", 443, nil, nil, time.Minute, true); err == nil {
 		t.Fatal("expected AddGrant with allow_websocket on bound host to fail")
 	}
+	if _, err := store.AddGrant("worker-claude", "glob.example.com", 443, nil, []string{"/**/a/**"}, time.Minute, false); err == nil {
+		t.Fatal("expected AddGrant with two '**' wildcards to fail")
+	}
+	if _, err := store.AddGrant("worker-claude", "glob.example.com", 443, nil, []string{"/*a*b*c*d*e"}, time.Minute, false); err == nil {
+		t.Fatal("expected AddGrant with five '*' in one segment to fail")
+	}
 
 	immutableChanges := []struct {
 		name string
@@ -342,6 +373,9 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		{"dataplane_dhcp", strings.Replace(validYAML, "user: dnsmasq", "user: nobody", 1)},
 		{"dataplane_verify_sysctls", strings.Replace(validYAML, "dataplane:\n", "dataplane:\n  verify_sysctls: false\n", 1)},
 		{"http_max_header_bytes", validYAML + "\nhttp:\n  max_header_bytes: 65536\n"},
+		{"http_max_conns_per_link", validYAML + "\nhttp:\n  max_conns_per_link: 64\n"},
+		{"http_upstream_response_header_timeout", validYAML + "\nhttp:\n  upstream_response_header_timeout: 30s\n"},
+		{"audit_max_total_bytes", strings.Replace(validYAML, "  dir: /var/log/gateway/audit", "  dir: /var/log/gateway/audit\n  max_total_bytes: 1048576", 1)},
 	}
 	for _, tc := range immutableChanges {
 		t.Run("refuse_"+tc.name, func(t *testing.T) {

@@ -19,12 +19,14 @@ import (
 
 // Collector owns gateway's isolated Prometheus registry and metric instruments.
 type Collector struct {
-	registry         *prometheus.Registry
-	auditWriteErrors prometheus.Counter
-	requestsTotal    *prometheus.CounterVec
-	dnsQueriesTotal  *prometheus.CounterVec
-	reloadsTotal     *prometheus.CounterVec
-	revocationsTotal prometheus.Counter
+	registry                  *prometheus.Registry
+	auditWriteErrors          prometheus.Counter
+	auditSizePrunedBytesTotal prometheus.Counter
+	requestsTotal             *prometheus.CounterVec
+	dnsQueriesTotal           *prometheus.CounterVec
+	reloadsTotal              *prometheus.CounterVec
+	revocationsTotal          prometheus.Counter
+	connsRejectedTotal        *prometheus.CounterVec
 }
 
 // Options wires dynamic gauges into a Collector.
@@ -43,6 +45,10 @@ func NewCollector(opts Options) *Collector {
 			Name: "gateway_audit_write_errors_total",
 			Help: "Total number of failed fail-closed audit sink writes.",
 		}),
+		auditSizePrunedBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gateway_audit_size_pruned_bytes_total",
+			Help: "Total bytes removed from closed audit segments by max_total_bytes pruning.",
+		}),
 		requestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_requests_total",
 			Help: "Total HTTP/TLS/WebSocket requests handled by gateway.",
@@ -59,14 +65,20 @@ func NewCollector(opts Options) *Collector {
 			Name: "gateway_revocations_total",
 			Help: "Total live flows torn down by revocation or reload.",
 		}),
+		connsRejectedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_conns_rejected_total",
+			Help: "Total guest connections closed because a link reached http.max_conns_per_link.",
+		}, []string{"link"}),
 	}
 
 	reg.MustRegister(
 		c.auditWriteErrors,
+		c.auditSizePrunedBytesTotal,
 		c.requestsTotal,
 		c.dnsQueriesTotal,
 		c.reloadsTotal,
 		c.revocationsTotal,
+		c.connsRejectedTotal,
 	)
 
 	if opts.ActiveFlows != nil {
@@ -87,6 +99,18 @@ func NewCollector(opts Options) *Collector {
 // IncAuditWriteError increments gateway_audit_write_errors_total.
 func (c *Collector) IncAuditWriteError() {
 	c.auditWriteErrors.Inc()
+}
+
+// ObserveAuditSizePruned adds bytesRemoved to gateway_audit_size_pruned_bytes_total.
+func (c *Collector) ObserveAuditSizePruned(bytesRemoved int64) {
+	if bytesRemoved > 0 {
+		c.auditSizePrunedBytesTotal.Add(float64(bytesRemoved))
+	}
+}
+
+// IncConnRejected increments gateway_conns_rejected_total for link.
+func (c *Collector) IncConnRejected(link string) {
+	c.connsRejectedTotal.WithLabelValues(link).Inc()
 }
 
 // ObserveRequest increments gateway_requests_total.

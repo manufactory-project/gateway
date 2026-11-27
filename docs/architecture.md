@@ -74,7 +74,8 @@ Guest packet on sandbox interface (sbxN)
 - **Live config reload:** `config.Store.Reload` (triggered by `SIGHUP` or `POST /v1/reload`)
   re-parses and validates YAML strictly (`KnownFields(true)`). Any change to restart-only sections
   (`ca`, `audit`, `admin`, `metrics`, `dns.fake_cidr`, `dataplane`, `http.max_header_bytes`,
-  `links`/principals) is refused while keeping the prior snapshot and active grants intact. On
+  `http.max_conns_per_link`, `http.upstream_response_header_timeout`, `links`/principals) is refused
+  while keeping the prior snapshot and active grants intact. On
   success, the snapshot swaps atomically, all ephemeral TTL grants are wiped, and per-link
   `onConfigReload` callbacks tear down flows that are no longer allowed and WebSockets on hosts
   that gained a secret binding.
@@ -139,8 +140,10 @@ never records header values, and writes each JSONL record synchronously under a 
 answering DNS queries or dialing upstream. Any write or rotation failure marks the sink unhealthy,
 increments `gateway_audit_write_errors_total`, and returns an error so callers fail closed
 (`SERVFAIL` / `503`). `WriteSync` does **not** call `fsync`, so the last OS-buffered records can
-be lost on sudden power loss or kernel crash. Disk consumption is bounded by size and daily
-rotation (`audit.max_file_bytes`) plus retention pruning (`audit.retain_days`). Operators inspect
+be lost on sudden power loss or kernel crash. Disk consumption is bounded by total directory cap
+(`audit.max_total_bytes`, default `10 GiB`, pruning oldest closed segments first and emitting a
+lifecycle `audit-size-pruned` record) plus daily retention pruning (`audit.retain_days`), with
+per-segment rotation at `audit.max_file_bytes`. Operators inspect
 audit logs with `tail -F <dir>/*.jsonl | jq` or ship stdout JSON (`audit.stdout_json: true`) to
 Loki.
 

@@ -3,6 +3,7 @@ package policy_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,5 +181,40 @@ func TestPolicySpecificityDenyTiesAndIsolation(t *testing.T) {
 	}
 	if d := ev.DecideRequest("worker-a", "secret.example.com", 443, "GET", "/"); d.Allow {
 		t.Fatalf("explicit YAML deny must beat ephemeral grant, got %+v", d)
+	}
+}
+
+func TestGlobPatternWorstCaseUnder10ms(t *testing.T) {
+	yamlCfg := `
+ca:
+  cert_path: /tmp/ca.crt
+  key_path: /tmp/ca.key
+audit:
+  dir: /tmp/audit
+links:
+  - name: sbx0
+    principal: worker-a
+    subnet: 127.0.10.0/28
+    gateway_ip: 127.0.10.1
+rules:
+  - id: worst-glob
+    principal: worker-a
+    effect: allow
+    hosts: ["glob.example.com"]
+    ports: [443]
+    paths: ["/**a*a*a*a*Z", "/*a*a*a*Z"]
+`
+	st := makeStore(t, yamlCfg, time.Now)
+	ev := policy.NewEvaluator(st)
+
+	path32K := "/" + strings.Repeat("a", 32<<10)
+	start := time.Now()
+	d := ev.DecideRequest("worker-a", "glob.example.com", 443, "GET", path32K)
+	elapsed := time.Since(start)
+	if d.Allow {
+		t.Fatal("expected non-matching 32 KiB path to be denied")
+	}
+	if elapsed >= 10*time.Millisecond {
+		t.Fatalf("worst allowed glob on 32 KiB non-matching path took %v, want < 10ms", elapsed)
 	}
 }

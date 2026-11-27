@@ -167,6 +167,12 @@ func checkReloadImmutable(prev, next *Config) error {
 	if prev.HTTP.MaxHeaderBytes != next.HTTP.MaxHeaderBytes {
 		return errors.New("reload refused: http.max_header_bytes changed (restart required)")
 	}
+	if prev.HTTP.MaxConnsPerLink != next.HTTP.MaxConnsPerLink {
+		return errors.New("reload refused: http.max_conns_per_link changed (restart required)")
+	}
+	if prev.HTTP.ParsedUpstreamResponseHeaderTimeout != next.HTTP.ParsedUpstreamResponseHeaderTimeout {
+		return errors.New("reload refused: http.upstream_response_header_timeout changed (restart required)")
+	}
 	if !slices.Equal(prev.Links, next.Links) {
 		return errors.New("reload refused: links or principals changed (restart required)")
 	}
@@ -220,8 +226,8 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 	}
 	normPaths := make([]string, len(paths))
 	for i, p := range paths {
-		if !strings.HasPrefix(p, "/") {
-			return Grant{}, fmt.Errorf("grant: path %q must start with '/'", p)
+		if err := ValidatePathPattern(p); err != nil {
+			return Grant{}, fmt.Errorf("grant: path %q: %w", p, err)
 		}
 		normPaths[i] = p
 	}
