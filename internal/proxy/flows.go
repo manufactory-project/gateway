@@ -82,11 +82,13 @@ func (f *activeFlow) teardown(reason string) {
 	up := f.upConn
 	f.mu.Unlock()
 
-	if f.cancel != nil {
-		f.cancel()
-	}
+	// Close the guest connection before canceling reqCtx so net/http cannot
+	// observe cancellation and flush a synthetic 200 OK on an open socket.
 	if f.guestConn != nil {
 		closeQuietly(f.guestConn)
+	}
+	if f.cancel != nil {
+		f.cancel()
 	}
 	// Direct upstream close applies only to WebSockets, where gateway owns the raw socket.
 	// Transport-managed HTTP/H2/SSE flows rely on reqCancel() + guestConn.Close().

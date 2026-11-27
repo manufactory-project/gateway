@@ -584,11 +584,11 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		}
 		if reason := af.reason(); reason != "" {
 			rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, reason)
-			return
+			panic(http.ErrAbortHandler)
 		}
 		if parentCtx.Err() != nil {
 			rc.auditCompleted(statusClientClosedRequest, countingBody.n.Load(), 0, TeardownClientCanceled)
-			return
+			panic(http.ErrAbortHandler)
 		}
 		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, err.Error())
 		http.Error(w, "upstream error", http.StatusBadGateway)

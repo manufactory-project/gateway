@@ -34,9 +34,10 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	if err != nil {
 		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), err.Error())
 		rc.auditCompleted(status, 0, 0, errText)
-		if !canceled {
-			http.Error(w, "upstream websocket connect failed", http.StatusBadGateway)
+		if canceled {
+			panic(http.ErrAbortHandler)
 		}
+		http.Error(w, "upstream websocket connect failed", http.StatusBadGateway)
 		return
 	}
 	af.setUpstreamConn(upConn)
@@ -45,7 +46,7 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	if rc.r.Context().Err() != nil {
 		status, errText, _ := wsCancelOrErr(af, rc.r.Context(), rc.r.Context().Err().Error())
 		rc.auditCompleted(status, 0, 0, errText)
-		return
+		panic(http.ErrAbortHandler)
 	}
 
 	outReq := buildWSUpgradeRequest(rc)
@@ -53,9 +54,10 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	if err != nil {
 		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), err.Error())
 		rc.auditCompleted(status, 0, 0, errText)
-		if !canceled {
-			http.Error(w, "upstream response failed", http.StatusBadGateway)
+		if canceled {
+			panic(http.ErrAbortHandler)
 		}
+		http.Error(w, "upstream response failed", http.StatusBadGateway)
 		return
 	}
 
@@ -66,7 +68,7 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	if rc.r.Context().Err() != nil {
 		status, errText, _ := wsCancelOrErr(af, rc.r.Context(), rc.r.Context().Err().Error())
 		rc.auditCompleted(status, 0, 0, errText)
-		return
+		panic(http.ErrAbortHandler)
 	}
 
 	clientConn, clientBuf, err := http.NewResponseController(w).Hijack()
