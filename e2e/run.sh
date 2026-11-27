@@ -42,7 +42,7 @@ Options:
 
 Planted wiring defect flags (Step 2.6, restored after each):
   --defect-drop-fib-local   Remove fib daddr type local guard and verify probe goes red
-  --defect-drop-ct-zone     Remove sbx1 conntrack zone and verify harness goes red
+  --defect-drop-ct-zone     Put both links in one conntrack zone and verify functional collision
   --defect-drop-dns-dnat    Remove :53 DNAT rules and verify probe goes red
   --run-all-defects         Run all three planted wiring defects sequentially
 EOF
@@ -479,9 +479,9 @@ run_probe_guest0
 run_probe_guest1
 
 run_same_ip_step() {
-  local expect_both_zones="${1:-1}"
+  local src_port="${1:?missing source port}"
+  local mode="${2:-normal}"
   local static_ip="10.77.0.50"
-  local src_port="45001"
 
   g0_exec bash -ceu "
     systemctl stop systemd-networkd 2>/dev/null || true
@@ -500,26 +500,76 @@ run_same_ip_step() {
 
   gw_exec conntrack -F >/dev/null 2>&1 || true
 
-  local out0="$TMPDIR_WORK/same0.jsonl"
-  local out1="$TMPDIR_WORK/same1.jsonl"
+  local audit_before
+  audit_before="$(gw_exec bash -ceu 'cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | wc -l')"
+
+  local out0="$TMPDIR_WORK/same0-${src_port}.jsonl"
+  local out1="$TMPDIR_WORK/same1-${src_port}.jsonl"
+  # Start guest0 slightly ahead with a longer hold so its conntrack entries are
+  # established when guest1 sends the identical 4-tuple (10.77.0.50:<src_port>).
   g0_exec /usr/local/bin/gatewayd-probe \
-    --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 6s \
-    --allow-host "$UPSTREAM_HOST" >"$out0" &
+    --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 8s \
+    --allow-host "$UPSTREAM_HOST" >"$out0" 2>&1 &
   local pid0=$!
+  sleep 1
   g1_exec /usr/local/bin/gatewayd-probe \
     --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 6s \
-    --allow-host "$UPSTREAM_HOST" >"$out1" &
+    --allow-host "$UPSTREAM_HOST" >"$out1" 2>&1 &
   local pid1=$!
 
-  sleep 2
-  local ct_out
-  ct_out="$(gw_exec conntrack -L 2>/dev/null | grep "src=${static_ip}" || true)"
-  echo "$ct_out"
+  local ct_out=""
+  if [[ "$mode" == "normal" ]]; then
+    sleep 2
+    ct_out="$(gw_exec conntrack -L 2>/dev/null | grep "src=${static_ip}" || true)"
+    echo "$ct_out"
+  fi
 
   local rc0=0 rc1=0
   wait "$pid0" || rc0=$?
   wait "$pid1" || rc1=$?
-  cat "$out0" "$out1"
+  echo "    guest0 (sport=${src_port}) exit=${rc0}:"
+  cat "$out0"
+  echo "    guest1 (sport=${src_port}) exit=${rc1}:"
+  cat "$out1"
+
+  local audit_delta
+  audit_delta="$(gw_exec bash -ceu "cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))")"
+  local g0_audited=0 g1_audited=0
+  if echo "$audit_delta" | grep -q "\"principal\":\"guest0\".*\"src_ip\":\"${static_ip}\""; then
+    g0_audited=1
+  fi
+  if echo "$audit_delta" | grep -q "\"principal\":\"guest1\".*\"src_ip\":\"${static_ip}\""; then
+    g1_audited=1
+  fi
+
+  # Restore DHCP on both guests and refresh guest IPs and :8080 controls.
+  configure_guest_dhcp "$G0_INST"
+  configure_guest_dhcp "$G1_INST"
+  G0_IP="$(g0_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  G1_IP="$(g1_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+  start_guest_peer_listener "$G0_INST" "$G0_IP"
+  start_guest_peer_listener "$G1_INST" "$G1_IP"
+
+  if [[ "$mode" == "defect" ]]; then
+    # Defect mode must fail for a functional reason (probe non-zero exit or
+    # wrong-link/missing principal attribution), never conntrack -L string grep.
+    local reasons=()
+    if [[ "$rc0" -ne 0 ]]; then
+      reasons+=("guest0 probe exited non-zero (${rc0})")
+    fi
+    if [[ "$rc1" -ne 0 ]]; then
+      reasons+=("guest1 probe exited non-zero (${rc1})")
+    fi
+    if [[ "$g0_audited" -ne 1 || "$g1_audited" -ne 1 ]]; then
+      reasons+=("reply/request misrouted or missing link attribution (guest0_audited=${g0_audited}, guest1_audited=${g1_audited})")
+    fi
+    if [[ "${#reasons[@]}" -gt 0 ]]; then
+      echo "    functional collision detected: ${reasons[*]}"
+      return 1
+    fi
+    echo "    no functional failure observed in defect mode"
+    return 0
+  fi
 
   local ok=1
   if [[ "$rc0" -ne 0 || "$rc1" -ne 0 ]]; then
@@ -533,24 +583,15 @@ run_same_ip_step() {
     echo "    missing conntrack zone=102"
     ok=0
   fi
-  if [[ "$expect_both_zones" -eq 1 ]]; then
-    gw_exec bash -ceu "
-      grep -q '\"principal\":\"guest0\".*\"src_ip\":\"${static_ip}\"' /var/log/gatewayd/audit/*.jsonl
-      grep -q '\"principal\":\"guest1\".*\"src_ip\":\"${static_ip}\"' /var/log/gatewayd/audit/*.jsonl
-    " || ok=0
+  if [[ "$g0_audited" -ne 1 || "$g1_audited" -ne 1 ]]; then
+    echo "    missing audit attribution (guest0_audited=${g0_audited}, guest1_audited=${g1_audited})"
+    ok=0
   fi
-
-  # Restore DHCP on both guests.
-  configure_guest_dhcp "$G0_INST"
-  configure_guest_dhcp "$G1_INST"
-  G0_IP="$(g0_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-  G1_IP="$(g1_exec ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-
   [[ "$ok" -eq 1 ]]
 }
 
-echo "==> Step 2.5: Same IP, same source port"
-run_same_ip_step 1
+echo "==> Step 2.5: Same IP, same source port (sport=45001)"
+run_same_ip_step 45001 normal
 
 restore_dataplane() {
   gw_exec /usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml
@@ -573,20 +614,27 @@ if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then
 fi
 
 if [[ "$DEFECT_DROP_CT_ZONE" -eq 1 ]]; then
-  echo "==> Step 2.6 (defect): remove sbx1 conntrack zone"
+  echo "==> Step 2.6 (defect): put both links in one conntrack zone (sport=45002)"
   gw_exec bash -ceu '
-    h1="$(nft -a list chain inet gw raw_prerouting | awk "/ct zone set 102/{print \$NF; exit}")"
-    h2="$(nft -a list chain inet gw raw_output     | awk "/ct zone set 102/{print \$NF; exit}")"
-    [[ -n "$h1" && -n "$h2" ]] || { echo "failed to find zone 102 handles" >&2; exit 1; }
-    nft delete rule inet gw raw_prerouting handle "$h1"
-    nft delete rule inet gw raw_output handle "$h2"
+    deleted=0
+    for chain in raw_prerouting raw_output; do
+      for h in $(nft -a list chain inet gw "$chain" | awk "/ct zone set/{print \$NF}"); do
+        nft delete rule inet gw "$chain" handle "$h"
+        deleted=$((deleted + 1))
+      done
+    done
+    if [[ "$deleted" -lt 4 ]]; then
+      echo "FAIL: expected to delete >=4 conntrack zone handles, deleted ${deleted}" >&2
+      exit 1
+    fi
+    echo "    deleted ${deleted} conntrack zone handles (both links now share zone 0)"
   '
-  if run_same_ip_step 0 >/dev/null 2>&1; then
+  if run_same_ip_step 45002 defect; then
     restore_dataplane
-    echo "FAIL: same-IP check still passed after removing sbx1 conntrack zone" >&2
+    echo "FAIL: same-IP step still passed with both links sharing one conntrack zone" >&2
     exit 1
   fi
-  echo "    PASS: harness went red without sbx1 conntrack zone"
+  echo "    PASS: same-IP step failed functionally when both links shared one conntrack zone"
   restore_dataplane
 fi
 
