@@ -519,19 +519,20 @@ func checkUnreachableHTTP(ctx context.Context, name, addr, hostHeader string, ti
 }
 
 func checkSNIHostSpoof(ctx context.Context, cfg probeConfig) Result {
+	const expect = "HTTP 403"
 	target := net.JoinHostPort(cfg.WrongIP, strconv.Itoa(cfg.httpsTargetPort()))
 	status, err := rawHTTPSGet(ctx, target, cfg.AllowHost, cfg.DenyHost, "/", nil, cfg.RootCAs, cfg.Timeout, 0)
 	if err != nil {
 		return Result{
 			Check:  "sni_host_spoof",
-			Expect: "HTTP 403 (or connection refused)",
-			Got:    fmt.Sprintf("refused: %v", err),
-			Pass:   true,
+			Expect: expect,
+			Got:    fmt.Sprintf("error: %v", err),
+			Pass:   false,
 		}
 	}
 	return Result{
 		Check:  "sni_host_spoof",
-		Expect: "HTTP 403 (or connection refused)",
+		Expect: expect,
 		Got:    fmt.Sprintf("HTTP %d", status),
 		Pass:   status == http.StatusForbidden,
 	}
