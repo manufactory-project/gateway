@@ -288,245 +288,301 @@ func (s *Server) auditDeniedSNI(srcIP, sni, reason, ruleID string) {
 	}
 }
 
+type reqContext struct {
+	srv         *Server
+	r           *http.Request
+	srcIP       string
+	proto       string
+	host        string
+	dstPort     uint16
+	dec         policy.Decision
+	wantWS      bool
+	maxBody     int64
+	flowID      string
+	secretNames []string
+	subPairs    []secret.Pair
+	outHeaders  http.Header
+}
+
+func (rc *reqContext) baseEvent(kind audit.Kind) audit.Event {
+	return audit.Event{
+		Kind:      kind,
+		Principal: rc.srv.link.Principal,
+		Link:      rc.srv.link.Name,
+		SrcIP:     rc.srcIP,
+		Protocol:  rc.proto,
+		Host:      rc.host,
+		Port:      int(rc.dstPort),
+		Method:    rc.r.Method,
+		Path:      rc.r.URL.Path,
+		HasQuery:  rc.r.URL.RawQuery != "",
+		Reason:    rc.dec.Reason,
+		RuleID:    rc.dec.RuleID,
+		GrantID:   rc.dec.GrantID,
+		FlowID:    rc.flowID,
+		Secrets:   rc.secretNames,
+	}
+}
+
+func (rc *reqContext) deny(w http.ResponseWriter, status int, reason string) {
+	ev := rc.baseEvent(audit.KindRequest)
+	ev.Status = status
+	ev.Effect = audit.EffectDeny
+	ev.Reason = reason
+	if err := rc.srv.audit.WriteSync(ev); err != nil {
+		http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if rc.srv.onRequest != nil {
+		rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectDeny), status)
+	}
+	http.Error(w, "egress denied: "+reason, status)
+}
+
+func (rc *reqContext) auditAdmitted() error {
+	ev := rc.baseEvent(audit.KindRequestAdmitted)
+	ev.Effect = audit.EffectAllow
+	return rc.srv.audit.WriteSync(ev)
+}
+
+func (rc *reqContext) auditCompleted(status int, bytesOut, bytesIn int64, errText string) {
+	kind := audit.KindRequest
+	if rc.wantWS {
+		kind = audit.KindWebSocket
+	}
+	ev := rc.baseEvent(kind)
+	ev.Status = status
+	ev.Effect = audit.EffectAllow
+	ev.BytesOut = bytesOut
+	ev.BytesIn = bytesIn
+	ev.Error = errText
+	if err := rc.srv.audit.WriteSync(ev); err != nil {
+		return
+	}
+	if rc.srv.onRequest != nil {
+		rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectAllow), status)
+	}
+}
+
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint16) {
+	rc, ok := s.admit(w, r, dstPort)
+	if !ok {
+		return
+	}
+	if !s.prepare(w, rc) {
+		return
+	}
+	s.relay(w, rc)
+}
+
+func (s *Server) admit(w http.ResponseWriter, r *http.Request, dstPort uint16) (*reqContext, bool) {
 	srcIP := ""
 	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		srcIP = h
 	}
-	reqPath := r.URL.Path
-	hasQuery := r.URL.RawQuery != ""
-
-	deny := func(status int, reason, ruleID, host string, secretNames []string) {
-		ev := audit.Event{
-			Kind:      audit.KindRequest,
-			Principal: s.link.Principal,
-			Link:      s.link.Name,
-			SrcIP:     srcIP,
-			Protocol:  r.Proto,
-			Host:      host,
-			Port:      int(dstPort),
-			Method:    r.Method,
-			Path:      reqPath,
-			HasQuery:  hasQuery,
-			Status:    status,
-			Effect:    audit.EffectDeny,
-			Reason:    reason,
-			RuleID:    ruleID,
-			Secrets:   secretNames,
-		}
-		if err := s.audit.WriteSync(ev); err != nil {
-			http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		if s.onRequest != nil {
-			s.onRequest(s.link.Principal, string(audit.EffectDeny), status)
-		}
-		http.Error(w, "egress denied: "+reason, status)
+	rc := &reqContext{
+		srv:     s,
+		r:       r,
+		srcIP:   srcIP,
+		proto:   r.Proto,
+		host:    r.Host,
+		dstPort: dstPort,
 	}
 
-	// 1. Reject CONNECT unconditionally.
+	// 1. Reject CONNECT, non-origin-form targets, and H2 explicit Host header.
 	if r.Method == http.MethodConnect {
-		deny(http.StatusForbidden, "connect-forbidden", "", r.Host, nil)
-		return
+		rc.deny(w, http.StatusForbidden, "connect-forbidden")
+		return nil, false
 	}
-
-	// 2. Reject non-origin-form targets (*, absolute-URI, relative path, path traversal, escaped slashes).
 	if errReason := validateOriginForm(r); errReason != "" {
-		deny(http.StatusForbidden, errReason, "", r.Host, nil)
-		return
+		rc.deny(w, http.StatusForbidden, errReason)
+		return nil, false
 	}
-
-	// 3. Reject explicit Host header alongside :authority on HTTP/2 (NOW.md:49).
 	if r.ProtoMajor == 2 && len(r.Header["Host"]) > 0 {
-		deny(http.StatusForbidden, "h2-host-header", "", r.Host, nil)
-		return
+		rc.deny(w, http.StatusForbidden, "h2-host-header")
+		return nil, false
 	}
 
-	// 4. Validate Host/:authority non-empty, exact port match against listener dstPort, and SNI == Host on HTTPS.
+	// 2. Validate Host/:authority, port match against dstPort, and SNI == Host on HTTPS.
 	host, errReason := validateHostAndSNI(r, dstPort)
 	if errReason != "" {
-		deny(http.StatusForbidden, errReason, "", r.Host, nil)
-		return
+		rc.deny(w, http.StatusForbidden, errReason)
+		return nil, false
 	}
+	rc.host = host
 
-	// 5. Inspect Upgrade headers: reject h2c and arbitrary upgrades unconditionally.
+	// 3. Classify Upgrade headers (reject h2c and arbitrary upgrades).
 	wantWS, upgradeErr := classifyUpgrade(r)
 	if upgradeErr != "" {
-		deny(http.StatusForbidden, upgradeErr, "", host, nil)
-		return
+		rc.deny(w, http.StatusForbidden, upgradeErr)
+		return nil, false
 	}
+	rc.wantWS = wantWS
 
-	// 6. Evaluate policy live per HTTP request (never snapshotted at SYN).
-	dec := s.eval.DecideRequest(s.link.Principal, host, dstPort, r.Method, r.URL.Path)
-	if !dec.Allow {
-		deny(http.StatusForbidden, dec.Reason, dec.RuleID, host, nil)
-		return
+	// 4. Evaluate policy live per HTTP request (never snapshotted at SYN).
+	rc.dec = s.eval.DecideRequest(s.link.Principal, host, dstPort, r.Method, r.URL.Path)
+	if !rc.dec.Allow {
+		rc.deny(w, http.StatusForbidden, rc.dec.Reason)
+		return nil, false
 	}
-
-	if wantWS && !dec.AllowWebSocket {
-		deny(http.StatusForbidden, "websocket-not-allowed", dec.RuleID, host, nil)
-		return
-	}
-	if wantWS && (r.ContentLength != 0 || len(r.TransferEncoding) > 0) {
-		deny(http.StatusBadRequest, "websocket-upgrade-with-body", dec.RuleID, host, nil)
-		return
-	}
-
-	// 7. Check Content-Length against streaming body cap before dialing upstream.
-	maxBody := s.store.Current().Config.HTTP.MaxRequestBodyBytes
-	if r.ContentLength > maxBody {
-		deny(http.StatusRequestEntityTooLarge, "body-too-large", dec.RuleID, host, nil)
-		return
-	}
-
-	// 8. Substitute bound secrets (HTTPS :443 only) and unconditionally sweep Proxy-Authorization & mf_ph_*.
-	outHeaders := make(http.Header)
-	copyEndToEndHeaders(outHeaders, r.Header, wantWS)
-
-	var (
-		secretNames []string
-		subPairs    []secret.Pair
-	)
-	if !wantWS {
-		matchedBindings := s.eval.MatchBindings(s.link.Principal, host, dstPort, r.Method, r.URL.Path)
-		var subErr error
-		secretNames, subPairs, subErr = secret.ApplyRequest(outHeaders, matchedBindings, dstPort, secret.FileResolver{})
-		if subErr != nil {
-			var resErr *secret.ResolveError
-			var badNames []string
-			if errors.As(subErr, &resErr) && resErr.Name != "" {
-				badNames = []string{resErr.Name}
-			}
-			deny(http.StatusForbidden, "secret-unresolved", dec.RuleID, host, badNames)
-			return
-		}
-		if dec.HasBindings {
-			// Force identity encoding on every request to a bound host (NOW.md:61).
-			outHeaders.Set("Accept-Encoding", "identity")
-		}
-	} else {
-		secret.SweepHeaders(outHeaders)
-	}
-
-	// 9. Register per-request/per-stream flow BEFORE dialing upstream so live revoke/reload/TTL works immediately.
-	flowProto := r.Proto
 	if wantWS {
-		flowProto = "websocket"
+		if !rc.dec.AllowWebSocket {
+			rc.deny(w, http.StatusForbidden, "websocket-not-allowed")
+			return nil, false
+		}
+		if r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
+			rc.deny(w, http.StatusBadRequest, "websocket-upgrade-with-body")
+			return nil, false
+		}
+		rc.proto = "websocket"
 	}
-	reqCtx, reqCancel := context.WithCancel(r.Context())
+
+	// 5. Reject declared request bodies exceeding the streaming body cap before dialing.
+	rc.maxBody = s.store.Current().Config.HTTP.MaxRequestBodyBytes
+	if r.ContentLength > rc.maxBody {
+		rc.deny(w, http.StatusRequestEntityTooLarge, "body-too-large")
+		return nil, false
+	}
+	return rc, true
+}
+
+func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
+	rc.outHeaders = make(http.Header)
+	copyEndToEndHeaders(rc.outHeaders, rc.r.Header, rc.wantWS)
+	if rc.wantWS {
+		secret.SweepHeaders(rc.outHeaders)
+		return true
+	}
+
+	matchedBindings := s.eval.MatchBindings(s.link.Principal, rc.host, rc.dstPort, rc.r.Method, rc.r.URL.Path)
+	secretNames, subPairs, subErr := secret.ApplyRequest(rc.outHeaders, matchedBindings, rc.dstPort, secret.FileResolver{})
+	if subErr != nil {
+		var resErr *secret.ResolveError
+		if errors.As(subErr, &resErr) && resErr.Name != "" {
+			rc.secretNames = []string{resErr.Name}
+		}
+		rc.deny(w, http.StatusForbidden, "secret-unresolved")
+		return false
+	}
+	rc.secretNames = secretNames
+	rc.subPairs = subPairs
+	if rc.dec.HasBindings {
+		// Force identity encoding on every request to a bound host.
+		rc.outHeaders.Set("Accept-Encoding", "identity")
+	}
+	return true
+}
+
+func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
+	reqCtx, reqCancel := context.WithCancel(rc.r.Context())
 	defer reqCancel()
 
 	af := s.flows.register(FlowInfo{
 		Principal: s.link.Principal,
 		Link:      s.link.Name,
-		Host:      host,
-		Port:      dstPort,
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		RuleID:    dec.RuleID,
-		GrantID:   dec.GrantID,
-		Protocol:  flowProto,
-	}, reqCancel, guestConnFromContext(r.Context()))
+		Host:      rc.host,
+		Port:      rc.dstPort,
+		Method:    rc.r.Method,
+		Path:      rc.r.URL.Path,
+		RuleID:    rc.dec.RuleID,
+		GrantID:   rc.dec.GrantID,
+		Protocol:  rc.proto,
+	}, reqCancel, guestConnFromContext(rc.r.Context()))
 	defer s.flows.unregister(af.info.ID)
+	rc.flowID = af.info.ID
 
-	// 10. Fail-closed admission audit BEFORE dialing upstream.
-	admitEv := audit.Event{
-		Kind:      audit.KindRequestAdmitted,
-		Principal: s.link.Principal,
-		Link:      s.link.Name,
-		SrcIP:     srcIP,
-		Protocol:  flowProto,
-		Host:      host,
-		Port:      int(dstPort),
-		Method:    r.Method,
-		Path:      reqPath,
-		HasQuery:  hasQuery,
-		Effect:    audit.EffectAllow,
-		Reason:    dec.Reason,
-		RuleID:    dec.RuleID,
-		GrantID:   dec.GrantID,
-		FlowID:    af.info.ID,
-		Secrets:   secretNames,
-	}
-	if err := s.audit.WriteSync(admitEv); err != nil {
+	// Fail-closed admission audit BEFORE dialing upstream.
+	if err := rc.auditAdmitted(); err != nil {
 		http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	if wantWS {
-		s.serveWebSocket(w, r.WithContext(reqCtx), dstPort, host, srcIP, dec, outHeaders, af)
+	if rc.wantWS {
+		rc.r = rc.r.WithContext(reqCtx)
+		s.serveWebSocket(w, rc, af)
 		return
 	}
 
-	// 11. Rebuild outbound request with streaming MaxBytesReader and upstream conn trace.
-	scheme := "https"
-	if dstPort == 80 {
-		scheme = "http"
-	}
-
-	limitedBody := http.MaxBytesReader(w, r.Body, maxBody)
-	countingBody := &countingReadCloser{rc: limitedBody}
-
-	outURL := *r.URL
-	outURL.Scheme = scheme
-	outURL.Host = net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
-
-	outReq, err := http.NewRequestWithContext(reqCtx, r.Method, outURL.String(), countingBody)
+	countingBody := &countingReadCloser{rc: http.MaxBytesReader(w, rc.r.Body, rc.maxBody)}
+	outReq, err := buildOutboundRequest(reqCtx, rc, countingBody)
 	if err != nil {
-		deny(http.StatusBadGateway, "build-request-failed", dec.RuleID, host, secretNames)
+		rc.deny(w, http.StatusBadGateway, "build-request-failed")
 		return
 	}
-	outReq.Host = host
-	outReq.ContentLength = r.ContentLength
-	outReq.Header = outHeaders
 
-	// 12. RoundTrip directly (never follow 3xx redirects!).
+	// RoundTrip directly (never follow 3xx redirects).
 	resp, err := s.transport.RoundTrip(outReq)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			deny(http.StatusRequestEntityTooLarge, "body-too-large", dec.RuleID, host, secretNames)
+			rc.deny(w, http.StatusRequestEntityTooLarge, "body-too-large")
 			return
 		}
-		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, err.Error())
+		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, err.Error())
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			return
-		}
-	}()
+	defer closeQuietly(resp.Body)
 
-	// Refuse unexpected 101 Switching Protocols on non-WebSocket flows.
 	if resp.StatusCode == http.StatusSwitchingProtocols {
-		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "unexpected-101")
+		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, "unexpected-101")
 		http.Error(w, "unexpected protocol upgrade", http.StatusBadGateway)
 		return
 	}
 
-	// 13. Bound-host response enforcement: fail closed 502 on any non-identity
-	// Content-Encoding token or any unresolvable bound secret, strip Content-Length,
-	// and scrub headers + streaming body + trailers (NOW.md:61).
-	var redactor *secret.Redactor
-	if dec.HasBindings {
-		if !isIdentityContentEncoding(resp.Header.Values("Content-Encoding")) {
-			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "compressed-response-on-bound-host")
-			http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
-			return
-		}
-		hostPairs, pairErr := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, host), subPairs, secret.FileResolver{})
-		if pairErr != nil {
-			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "redaction-secret-unresolved")
-			http.Error(w, "bound secret unavailable for response redaction", http.StatusBadGateway)
-			return
-		}
-		redactor = secret.NewRedactor(hostPairs)
+	redactor, ok := s.prepareResponseRedactor(w, rc, resp, countingBody.n.Load())
+	if !ok {
+		return
 	}
 
-	// 14. Copy response headers, scrub if bound, announce trailers, flush per-chunk, forward trailers.
+	bytesIn, copyErr := writeProxiedResponse(w, resp, rc.dec.HasBindings, redactor)
+	errText := ""
+	if copyErr != nil {
+		errText = copyErr.Error()
+	}
+	rc.auditCompleted(resp.StatusCode, countingBody.n.Load(), bytesIn, errText)
+}
+
+func buildOutboundRequest(ctx context.Context, rc *reqContext, body io.Reader) (*http.Request, error) {
+	scheme := "https"
+	if rc.dstPort == 80 {
+		scheme = "http"
+	}
+	outURL := *rc.r.URL
+	outURL.Scheme = scheme
+	outURL.Host = net.JoinHostPort(rc.host, strconv.Itoa(int(rc.dstPort)))
+
+	outReq, err := http.NewRequestWithContext(ctx, rc.r.Method, outURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+	outReq.Host = rc.host
+	outReq.ContentLength = rc.r.ContentLength
+	outReq.Header = rc.outHeaders
+	return outReq, nil
+}
+
+func (s *Server) prepareResponseRedactor(w http.ResponseWriter, rc *reqContext, resp *http.Response, bytesOut int64) (*secret.Redactor, bool) {
+	if !rc.dec.HasBindings {
+		return nil, true
+	}
+	if !isIdentityContentEncoding(resp.Header.Values("Content-Encoding")) {
+		rc.auditCompleted(http.StatusBadGateway, bytesOut, 0, "compressed-response-on-bound-host")
+		http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
+		return nil, false
+	}
+	hostPairs, pairErr := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, rc.host), rc.subPairs, secret.FileResolver{})
+	if pairErr != nil {
+		rc.auditCompleted(http.StatusBadGateway, bytesOut, 0, "redaction-secret-unresolved")
+		http.Error(w, "bound secret unavailable for response redaction", http.StatusBadGateway)
+		return nil, false
+	}
+	return secret.NewRedactor(hostPairs), true
+}
+
+func writeProxiedResponse(w http.ResponseWriter, resp *http.Response, hasBindings bool, redactor *secret.Redactor) (int64, error) {
 	copyEndToEndHeaders(w.Header(), resp.Header, false)
-	if dec.HasBindings {
+	if hasBindings {
 		if redactor.Active() {
 			redactor.ScrubHeader(w.Header())
 		}
@@ -555,43 +611,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 			w.Header().Add(tk, v)
 		}
 	}
-
-	errText := ""
-	if copyErr != nil {
-		errText = copyErr.Error()
-	}
-	s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, resp.StatusCode, countingBody.n.Load(), bytesIn, errText)
-}
-
-func (s *Server) auditCompleted(srcIP string, r *http.Request, dstPort uint16, host string, dec policy.Decision, flowID string, secretNames []string, status int, bytesOut, bytesIn int64, errText string) {
-	ev := audit.Event{
-		Kind:      audit.KindRequest,
-		Principal: s.link.Principal,
-		Link:      s.link.Name,
-		SrcIP:     srcIP,
-		Protocol:  r.Proto,
-		Host:      host,
-		Port:      int(dstPort),
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		HasQuery:  r.URL.RawQuery != "",
-		Status:    status,
-		Effect:    audit.EffectAllow,
-		Reason:    dec.Reason,
-		RuleID:    dec.RuleID,
-		GrantID:   dec.GrantID,
-		FlowID:    flowID,
-		Secrets:   secretNames,
-		BytesOut:  bytesOut,
-		BytesIn:   bytesIn,
-		Error:     errText,
-	}
-	if err := s.audit.WriteSync(ev); err != nil {
-		return
-	}
-	if s.onRequest != nil {
-		s.onRequest(s.link.Principal, string(audit.EffectAllow), status)
-	}
+	return bytesIn, copyErr
 }
 
 func isIdentityContentEncoding(vals []string) bool {

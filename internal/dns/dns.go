@@ -219,6 +219,32 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return errs
 }
 
+func (s *Server) newEvent(srcIP, proto, host, qtype string) audit.Event {
+	return audit.Event{
+		Kind:      audit.KindDNS,
+		Principal: s.link.Principal,
+		Link:      s.link.Name,
+		SrcIP:     srcIP,
+		Protocol:  proto,
+		Host:      host,
+		Port:      53,
+		QType:     qtype,
+	}
+}
+
+func firstQuestionMeta(r *mdns.Msg) (qname, qtypeName string) {
+	if len(r.Question) == 0 {
+		return "", ""
+	}
+	q := r.Question[0]
+	qname = strings.TrimSuffix(strings.ToLower(q.Name), ".")
+	qtypeName = mdns.TypeToString[q.Qtype]
+	if qtypeName == "" {
+		qtypeName = fmt.Sprintf("TYPE%d", q.Qtype)
+	}
+	return qname, qtypeName
+}
+
 func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 	resp := new(mdns.Msg)
 	resp.SetReply(r)
@@ -236,25 +262,12 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 		proto = "tcp"
 	}
 
+	qname, qtypeName := firstQuestionMeta(r)
+	ev := s.newEvent(srcIP, proto, qname, qtypeName)
+
 	if r.Response {
-		qname := ""
-		qtypeName := ""
-		if len(r.Question) > 0 {
-			qname = strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
-			qtypeName = mdns.TypeToString[r.Question[0].Qtype]
-		}
-		ev := audit.Event{
-			Kind:      audit.KindDNS,
-			Principal: s.link.Principal,
-			Link:      s.link.Name,
-			SrcIP:     srcIP,
-			Protocol:  proto,
-			Host:      qname,
-			Port:      53,
-			QType:     qtypeName,
-			Effect:    audit.EffectDeny,
-			Reason:    "response-packet-ignored",
-		}
+		ev.Effect = audit.EffectDeny
+		ev.Reason = "response-packet-ignored"
 		if err := s.audit.WriteSync(ev); err != nil {
 			if s.onQuery != nil {
 				s.onQuery(s.link.Principal, "audit_error")
@@ -268,77 +281,34 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 	}
 
 	if r.Opcode != mdns.OpcodeQuery {
-		qname := ""
-		qtypeName := ""
-		if len(r.Question) > 0 {
-			qname = strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
-			qtypeName = mdns.TypeToString[r.Question[0].Qtype]
-		}
-		s.auditAndReply(w, resp, mdns.RcodeNotImplemented, audit.Event{
-			Kind:      audit.KindDNS,
-			Principal: s.link.Principal,
-			Link:      s.link.Name,
-			SrcIP:     srcIP,
-			Protocol:  proto,
-			Host:      qname,
-			Port:      53,
-			QType:     qtypeName,
-			Effect:    audit.EffectDeny,
-			Reason:    "opcode-not-implemented",
-		})
+		ev.Effect = audit.EffectDeny
+		ev.Reason = "opcode-not-implemented"
+		s.auditAndReply(w, resp, mdns.RcodeNotImplemented, ev)
 		return
 	}
 
 	if len(r.Question) != 1 {
-		qname := ""
-		if len(r.Question) > 0 {
-			qname = strings.TrimSuffix(strings.ToLower(r.Question[0].Name), ".")
-		}
-		s.auditAndReply(w, resp, mdns.RcodeRefused, audit.Event{
-			Kind:      audit.KindDNS,
-			Principal: s.link.Principal,
-			Link:      s.link.Name,
-			SrcIP:     srcIP,
-			Protocol:  proto,
-			Host:      qname,
-			Port:      53,
-			Effect:    audit.EffectDeny,
-			Reason:    "invalid-question-count",
-		})
+		ev.QType = ""
+		ev.Effect = audit.EffectDeny
+		ev.Reason = "invalid-question-count"
+		s.auditAndReply(w, resp, mdns.RcodeRefused, ev)
 		return
 	}
 
 	q := r.Question[0]
-	qname := strings.TrimSuffix(strings.ToLower(q.Name), ".")
-	qtypeName := mdns.TypeToString[q.Qtype]
-	if qtypeName == "" {
-		qtypeName = fmt.Sprintf("TYPE%d", q.Qtype)
-	}
-
 	if q.Qclass != mdns.ClassINET {
-		s.auditAndReply(w, resp, mdns.RcodeRefused, audit.Event{
-			Kind:      audit.KindDNS,
-			Principal: s.link.Principal,
-			Link:      s.link.Name,
-			SrcIP:     srcIP,
-			Protocol:  proto,
-			Host:      qname,
-			Port:      53,
-			QType:     qtypeName,
-			Effect:    audit.EffectDeny,
-			Reason:    "qclass-refused",
-		})
+		ev.Effect = audit.EffectDeny
+		ev.Reason = "qclass-refused"
+		s.auditAndReply(w, resp, mdns.RcodeRefused, ev)
 		return
 	}
 
 	dec := s.eval.DecideDNS(s.link.Principal, qname)
-
-	var (
-		effect  = audit.EffectDeny
-		reason  = dec.Reason
-		ansAddr string
-		rcode   = mdns.RcodeRefused
-	)
+	ev.Effect = audit.EffectDeny
+	ev.Reason = dec.Reason
+	ev.RuleID = dec.RuleID
+	ev.GrantID = dec.GrantID
+	rcode := mdns.RcodeRefused
 
 	if dec.Allow {
 		switch q.Qtype {
@@ -356,36 +326,19 @@ func (s *Server) handleDNS(w mdns.ResponseWriter, r *mdns.Msg) {
 			}
 			resp.Answer = []mdns.RR{rr}
 			rcode = mdns.RcodeSuccess
-			effect = audit.EffectAllow
-			reason = dec.Reason
-			ansAddr = fakeIP.String()
+			ev.Effect = audit.EffectAllow
+			ev.Address = fakeIP.String()
 		case mdns.TypeAAAA, mdns.TypeHTTPS, mdns.TypeSVCB:
 			// Empty NOERROR (NODATA): keeps ECH configs out and avoids stub-resolver refusal errors.
 			rcode = mdns.RcodeSuccess
-			effect = audit.EffectAllow
-			reason = "nodata"
+			ev.Effect = audit.EffectAllow
+			ev.Reason = "nodata"
 		default:
-			// Refuse TXT, MX, NS, SRV, CNAME, etc. even inside allowlisted zones (NOW.md:41).
+			// Refuse TXT, MX, NS, SRV, CNAME, etc. even inside allowlisted zones.
 			rcode = mdns.RcodeRefused
-			effect = audit.EffectDeny
-			reason = "qtype-refused"
+			ev.Effect = audit.EffectDeny
+			ev.Reason = "qtype-refused"
 		}
-	}
-
-	ev := audit.Event{
-		Kind:      audit.KindDNS,
-		Principal: s.link.Principal,
-		Link:      s.link.Name,
-		SrcIP:     srcIP,
-		Protocol:  proto,
-		Host:      qname,
-		Address:   ansAddr,
-		Port:      53,
-		QType:     qtypeName,
-		Effect:    effect,
-		Reason:    reason,
-		RuleID:    dec.RuleID,
-		GrantID:   dec.GrantID,
 	}
 
 	s.auditAndReply(w, resp, rcode, ev)
