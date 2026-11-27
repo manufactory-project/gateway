@@ -35,8 +35,8 @@ tasks:
         fi
       - |
         set -eu
-        if go list -deps ./cmd/gwctl | grep -E 'github\.com/manufactory-project/gateway/internal/(proxy|secret|policy|netguard)$'; then
-          echo "lint: cmd/gwctl must not depend on proxy, secret, policy, or netguard" >&2
+        if go list -deps ./internal/admin | grep -E 'github\.com/manufactory-project/gateway/internal/(proxy|secret|policy|netguard)$'; then
+          echo "lint: internal/admin must not depend on proxy, secret, policy, or netguard" >&2
           exit 1
         fi
         if go list -deps ./cmd/gatewayd-probe | grep -E 'github\.com/manufactory-project/gateway/internal/(proxy|secret|policy|netguard)$'; then

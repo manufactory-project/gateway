@@ -1,6 +1,3 @@
-// Command gatewayd runs the headless, egress-only network gateway daemon,
-// or (as root in ExecStartPre=+) `gatewayd netsetup --config <path>` to apply
-// the Linux nftables, sysctls, per-link ip routing, and DHCP-only dnsmasq config.
 package main
 
 import (
@@ -28,26 +25,10 @@ import (
 	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
-func main() {
-	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		if _, wErr := fmt.Fprintf(os.Stderr, "gatewayd: %v\n", err); wErr != nil {
-			os.Exit(1)
-		}
-		os.Exit(1)
-	}
-}
-
-func run(args []string, stdout, stderr io.Writer) error {
-	if len(args) > 0 && args[0] == "netsetup" {
-		return runNetsetup(args[1:], stdout, stderr)
-	}
-	return runDaemon(args, stdout, stderr)
-}
-
 func runNetsetup(args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("gatewayd netsetup", flag.ContinueOnError)
+	fs := flag.NewFlagSet("gateway netsetup", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cfgPath := fs.String("config", "", "path to gatewayd YAML config")
+	cfgPath := fs.String("config", "", "path to gateway YAML config")
 	dryRun := fs.Bool("dry-run", false, "print generated nftables, sysctls, ip commands, and dnsmasq config without applying")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -107,9 +88,9 @@ func runNetsetup(args []string, stdout, stderr io.Writer) error {
 }
 
 func runDaemon(args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("gatewayd", flag.ContinueOnError)
+	fs := flag.NewFlagSet("gateway run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	cfgPath := fs.String("config", "", "path to gatewayd YAML config")
+	cfgPath := fs.String("config", "", "path to gateway YAML config")
 	procSysRoot := fs.String("proc-sys-root", "/proc/sys", "root directory for sysctl verification")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -138,7 +119,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	}
 	if cfg.Dataplane.ReadyFile != "" {
 		if _, err := os.Stat(cfg.Dataplane.ReadyFile); err != nil {
-			return fmt.Errorf("dataplane ready_file %s missing (run ExecStartPre=+ gatewayd netsetup first): %w", cfg.Dataplane.ReadyFile, err)
+			return fmt.Errorf("dataplane ready_file %s missing (run ExecStartPre=+ gateway netsetup first): %w", cfg.Dataplane.ReadyFile, err)
 		}
 	}
 
@@ -293,12 +274,12 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 					Reason: "sighup-reload-failed",
 					Error:  reloadErr.Error(),
 				}); aErr != nil {
-					if _, wErr := fmt.Fprintf(stderr, "gatewayd: SIGHUP reload failed (audit error: %v): %v\n", aErr, reloadErr); wErr != nil {
+					if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (audit error: %v): %v\n", aErr, reloadErr); wErr != nil {
 						return
 					}
 					return
 				}
-				if _, wErr := fmt.Fprintf(stderr, "gatewayd: SIGHUP reload failed (keeping prior config): %v\n", reloadErr); wErr != nil {
+				if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (keeping prior config): %v\n", reloadErr); wErr != nil {
 					return
 				}
 				return
@@ -322,7 +303,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		Reason: "stopped",
 	}); aErr != nil {
 		// Still proceed with graceful shutdown.
-		if _, wErr := fmt.Fprintf(stderr, "gatewayd: stopped audit write failed: %v\n", aErr); wErr != nil {
+		if _, wErr := fmt.Fprintf(stderr, "gateway: stopped audit write failed: %v\n", aErr); wErr != nil {
 			return shutdownAll()
 		}
 	}

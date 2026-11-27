@@ -1,0 +1,297 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"go.uber.org/goleak"
+
+	"github.com/manufactory-project/gateway/internal/admin"
+	"github.com/manufactory-project/gateway/internal/audit"
+	"github.com/manufactory-project/gateway/internal/ca"
+	"github.com/manufactory-project/gateway/internal/config"
+	"github.com/manufactory-project/gateway/internal/metrics"
+	"github.com/manufactory-project/gateway/internal/proxy"
+)
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
+
+func freePorts(t *testing.T, ip string, n int) []uint16 {
+	t.Helper()
+	lns := make([]net.Listener, 0, n)
+	ports := make([]uint16, 0, n)
+	for i := 0; i < n; i++ {
+		ln, err := net.Listen("tcp4", ip+":0")
+		if err != nil {
+			for _, prev := range lns {
+				if cErr := prev.Close(); cErr != nil {
+					t.Errorf("close prev listener: %v", cErr)
+				}
+			}
+			t.Fatalf("freePorts %s[%d]: %v", ip, i, err)
+		}
+		ta, ok := ln.Addr().(*net.TCPAddr)
+		if !ok {
+			t.Fatalf("unexpected addr type %T", ln.Addr())
+		}
+		lns = append(lns, ln)
+		ports = append(ports, uint16(ta.Port))
+	}
+	for _, ln := range lns {
+		if err := ln.Close(); err != nil {
+			t.Fatalf("close freePorts: %v", err)
+		}
+	}
+	return ports
+}
+
+func TestGatewayNetsetupDryRunAndStartupGuards(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. `gateway netsetup --dry-run` against example config (with sample IP).
+	rawEx, err := os.ReadFile(filepath.Join("..", "..", "examples", "gatewayd.yaml"))
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	exPath := filepath.Join(dir, "example.yaml")
+	if err := os.WriteFile(exPath, []byte(strings.ReplaceAll(string(rawEx), "<forge-ip>", "10.10.20.5")), 0o600); err != nil {
+		t.Fatalf("write example copy: %v", err)
+	}
+	var dryOut, dryErr bytes.Buffer
+	if err := run(context.Background(), []string{"netsetup", "--config", exPath, "--dry-run"}, &dryOut, &dryErr); err != nil {
+		t.Fatalf("gateway netsetup --dry-run: %v (stderr=%s)", err, dryErr.String())
+	}
+	for _, want := range []string{
+		"table inet gw {",
+		"port=0",
+		"dhcp-broadcast",
+		"no-ping",
+		"ip addr replace 10.200.0.1/28 dev sbx0",
+	} {
+		if !strings.Contains(dryOut.String(), want) {
+			t.Errorf("netsetup --dry-run missing %q", want)
+		}
+	}
+
+	// 2. `gateway run` requires --config.
+	var noCfgOut, noCfgErr bytes.Buffer
+	if err := run(context.Background(), []string{"run"}, &noCfgOut, &noCfgErr); err == nil {
+		t.Fatal("expected `gateway run` without --config to fail")
+	}
+
+	// 3. Daemon refuses to start when ready_file is missing (dataplane not applied).
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	if _, err := ca.Init(certPath, keyPath); err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	auditDir := filepath.Join(dir, "audit")
+	sockPath := filepath.Join(dir, "admin.sock")
+	readyFile := filepath.Join(dir, "dataplane.ready")
+
+	linkPorts := freePorts(t, "127.0.26.1", 3)
+	httpsPort, httpPort, dnsPort := linkPorts[0], linkPorts[1], linkPorts[2]
+	metricsPort := freePorts(t, "127.0.0.1", 1)[0]
+
+	daemonYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+admin:
+  socket: %s
+metrics:
+  listen: 127.0.0.1:%d
+dataplane:
+  verify_sysctls: false
+  ready_file: %s
+links:
+  - name: sbx0
+    principal: worker-claude
+    subnet: 127.0.26.0/28
+    gateway_ip: 127.0.26.1
+    https_port: %d
+    http_port: %d
+    dns_port: %d
+rules:
+  - id: r1
+    principal: worker-claude
+    effect: allow
+    hosts: [api.anthropic.com]
+    ports: [443]
+`, certPath, keyPath, auditDir, sockPath, metricsPort, readyFile, httpsPort, httpPort, dnsPort)
+	cfgPath := filepath.Join(dir, "daemon.yaml")
+	if err := os.WriteFile(cfgPath, []byte(daemonYAML), 0o600); err != nil {
+		t.Fatalf("write daemon yaml: %v", err)
+	}
+
+	if err := serveDaemon(context.Background(), cfgPath, "/proc/sys", &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+		t.Fatal("expected daemon to refuse startup when ready_file is missing")
+	}
+
+	// Positive control: once ready_file exists, daemon starts, answers /v1/status, and shuts down cleanly.
+	if err := os.WriteFile(readyFile, []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write readyFile: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- serveDaemon(ctx, cfgPath, "/proc/sys", &bytes.Buffer{}, &bytes.Buffer{})
+	}()
+
+	client := admin.NewClient(sockPath)
+	t.Cleanup(client.Close)
+	deadline := time.Now().Add(2 * time.Second)
+	var statusOK bool
+	for time.Now().Before(deadline) {
+		if st, err := client.Status(context.Background()); err == nil && st.AuditHealthy {
+			statusOK = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serveDaemon clean shutdown error: %v", err)
+	}
+	if !statusOK {
+		t.Fatal("daemon did not become ready on admin socket")
+	}
+}
+
+func TestGatewayCLIVerbsEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	auditDir := filepath.Join(dir, "audit")
+	sockPath := filepath.Join(dir, "admin.sock")
+
+	// 1. Offline `gateway ca init` with --json AFTER the subcommand.
+	var out, errBuf bytes.Buffer
+	if err := run(context.Background(), []string{"ca", "init", "--cert", certPath, "--key", keyPath, "--json"}, &out, &errBuf); err != nil {
+		t.Fatalf("gateway ca init: %v (stderr=%s)", err, errBuf.String())
+	}
+	if !strings.Contains(out.String(), certPath) {
+		t.Fatalf("unexpected ca init output: %s", out.String())
+	}
+
+	// Start real Admin server to exercise all online CLI verbs using the single adminFlowAdapter.
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+links:
+  - name: sbx0
+    principal: worker-claude
+    subnet: 127.0.25.0/28
+    gateway_ip: 127.0.25.1
+rules:
+  - id: r1
+    principal: worker-claude
+    effect: allow
+    hosts: [api.anthropic.com]
+    ports: [443]
+`, certPath, keyPath, auditDir)
+	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := aw.Close(); err != nil {
+			t.Errorf("audit close: %v", err)
+		}
+	})
+	flows := proxy.NewFlowRegistry()
+	aSrv, err := admin.NewServer(admin.Options{
+		SocketPath: sockPath,
+		Store:      store,
+		Flows:      adminFlowAdapter{flows: flows},
+		Audit:      aw,
+		Metrics:    metrics.NewCollector(metrics.Options{}),
+	})
+	if err != nil {
+		t.Fatalf("admin.NewServer: %v", err)
+	}
+	if err := aSrv.Start(); err != nil {
+		t.Fatalf("admin.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := aSrv.Shutdown(ctx); err != nil {
+			t.Errorf("admin.Shutdown: %v", err)
+		}
+	})
+
+	runCLI := func(args ...string) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		// Pass --json AFTER the subcommand to verify trailing flag handling on every verb.
+		full := append([]string{"--socket", sockPath}, args...)
+		full = append(full, "--json")
+		if err := run(context.Background(), full, &stdout, &stderr); err != nil {
+			t.Fatalf("gateway %v failed: %v (stderr=%s)", args, err, stderr.String())
+		}
+		return stdout.String()
+	}
+
+	// --port 65979 (65536 + 443) would wrap to 443 as uint16 if unchecked; must fail.
+	var badOut, badErr bytes.Buffer
+	if err := run(context.Background(), []string{"--socket", sockPath, "grant", "--principal", "worker-claude", "--host", "x.example.com", "--port", "65979", "--ttl", "5m"}, &badOut, &badErr); err == nil {
+		t.Fatal("expected gateway grant --port 65979 (wraps to 443) to fail")
+	}
+
+	// status
+	var st admin.StatusResponse
+	if err := json.Unmarshal([]byte(runCLI("status")), &st); err != nil {
+		t.Fatalf("parse status JSON: %v", err)
+	}
+	if !st.AuditHealthy {
+		t.Fatalf("expected audit_healthy=true, got %+v", st)
+	}
+
+	// grant + grants + grant revoke
+	var g config.Grant
+	if err := json.Unmarshal([]byte(runCLI("grant", "--principal", "worker-claude", "--host", "login.anthropic.com", "--ttl", "5m")), &g); err != nil {
+		t.Fatalf("parse grant JSON: %v", err)
+	}
+	if g.Host != "login.anthropic.com" {
+		t.Fatalf("unexpected grant: %+v", g)
+	}
+	if !strings.Contains(runCLI("grants"), g.ID) {
+		t.Fatalf("grants did not list %s", g.ID)
+	}
+	if !strings.Contains(runCLI("grant", "revoke", g.ID), `"revoked_grant":true`) {
+		t.Fatal("grant revoke did not report revoked_grant=true")
+	}
+
+	// flows + revoke + reload
+	_ = runCLI("flows")
+	if !strings.Contains(runCLI("revoke", "--principal", "worker-claude"), `"revoked_flows":0`) {
+		t.Fatal("revoke output mismatch")
+	}
+	if !strings.Contains(runCLI("reload"), `"config_hash"`) {
+		t.Fatal("reload output mismatch")
+	}
+}
