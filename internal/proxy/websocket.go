@@ -18,11 +18,11 @@ import (
 
 var errWSEgressCapExceeded = errors.New("websocket egress byte cap exceeded")
 
-func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort uint16, host, srcIP string, dec policy.Decision) {
+func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort uint16, host, srcIP string, dec policy.Decision, outHeaders http.Header, af *activeFlow) {
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
 	rawUpstream, err := s.dialContext(r.Context(), "tcp", targetAddr)
 	if err != nil {
-		s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusBadGateway, 0, 0, err.Error())
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, err.Error())
 		http.Error(w, "upstream dial failed", http.StatusBadGateway)
 		return
 	}
@@ -39,17 +39,14 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 			if closeErr := rawUpstream.Close(); closeErr != nil {
 				err = errors.Join(err, closeErr)
 			}
-			s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusBadGateway, 0, 0, err.Error())
+			s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, err.Error())
 			http.Error(w, "upstream tls handshake failed", http.StatusBadGateway)
 			return
 		}
 		upConn = tlsConn
 	}
-	defer func() {
-		if closeErr := upConn.Close(); closeErr != nil {
-			return
-		}
-	}()
+	af.setUpstreamConn(upConn)
+	defer closeQuietly(upConn)
 
 	// Rebuild clean HTTP/1.1 WebSocket upgrade request.
 	outReq := r.Clone(r.Context())
@@ -58,13 +55,12 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 	outReq.ProtoMajor = 1
 	outReq.ProtoMinor = 1
 	outReq.Host = host
-	outReq.Header = make(http.Header)
-	copyEndToEndHeaders(outReq.Header, r.Header, true)
+	outReq.Header = outHeaders
 	outReq.Header.Set("Connection", "Upgrade")
 	outReq.Header.Set("Upgrade", "websocket")
 
 	if err := outReq.Write(upConn); err != nil {
-		s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusBadGateway, 0, 0, err.Error())
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, err.Error())
 		http.Error(w, "upstream write failed", http.StatusBadGateway)
 		return
 	}
@@ -72,18 +68,14 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 	upReader := bufio.NewReader(upConn)
 	resp, err := http.ReadResponse(upReader, outReq)
 	if err != nil {
-		s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusBadGateway, 0, 0, err.Error())
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, err.Error())
 		http.Error(w, "upstream response failed", http.StatusBadGateway)
 		return
 	}
 
 	// Non-101 responses (including 3xx redirects) are returned directly without following.
 	if resp.StatusCode != http.StatusSwitchingProtocols || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
-		defer func() {
-			if closeErr := resp.Body.Close(); closeErr != nil {
-				return
-			}
-		}()
+		defer closeQuietly(resp.Body)
 		copyEndToEndHeaders(w.Header(), resp.Header, false)
 		w.WriteHeader(resp.StatusCode)
 		bytesIn, copyErr := copyStreaming(w, resp.Body)
@@ -91,22 +83,18 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 		if copyErr != nil {
 			errText = copyErr.Error()
 		}
-		s.auditWebSocket(srcIP, r, dstPort, host, dec, resp.StatusCode, 0, bytesIn, errText)
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, resp.StatusCode, 0, bytesIn, errText)
 		return
 	}
 
 	rc := http.NewResponseController(w)
 	clientConn, clientBuf, err := rc.Hijack()
 	if err != nil {
-		s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusInternalServerError, 0, 0, err.Error())
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusInternalServerError, 0, 0, err.Error())
 		http.Error(w, "hijack failed", http.StatusInternalServerError)
 		return
 	}
-	defer func() {
-		if closeErr := clientConn.Close(); closeErr != nil {
-			return
-		}
-	}()
+	defer closeQuietly(clientConn)
 
 	// Write 101 Switching Protocols response back to client.
 	var hdr strings.Builder
@@ -116,12 +104,12 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 	respHdr.Set("Connection", "Upgrade")
 	respHdr.Set("Upgrade", "websocket")
 	if err := respHdr.Write(&hdr); err != nil {
-		s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusBadGateway, 0, 0, err.Error())
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusBadGateway, 0, 0, err.Error())
 		return
 	}
 	hdr.WriteString("\r\n")
 	if _, err := io.WriteString(clientConn, hdr.String()); err != nil {
-		s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusSwitchingProtocols, 0, 0, err.Error())
+		s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusSwitchingProtocols, 0, 0, err.Error())
 		return
 	}
 
@@ -142,6 +130,19 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 			closeQuietly(clientConn)
 		})
 	}
+
+	// Ensure context cancellation (revoke / reload / TTL expiry) closes both sockets immediately.
+	stopWatch := make(chan struct{})
+	var watchWG sync.WaitGroup
+	watchWG.Add(1)
+	go func() {
+		defer watchWG.Done()
+		select {
+		case <-r.Context().Done():
+			closeBoth()
+		case <-stopWatch:
+		}
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -170,15 +171,17 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, dstPort 
 	}()
 
 	wg.Wait()
+	close(stopWatch)
+	watchWG.Wait()
 
 	errText := ""
 	if egressErr != nil {
 		errText = fmt.Sprintf("ws-egress-cap-exceeded:%d", egressCap)
 	}
-	s.auditWebSocket(srcIP, r, dstPort, host, dec, http.StatusSwitchingProtocols, bytesOut, bytesIn, errText)
+	s.auditWebSocket(srcIP, r, dstPort, host, dec, af.info.ID, http.StatusSwitchingProtocols, bytesOut, bytesIn, errText)
 }
 
-func (s *Server) auditWebSocket(srcIP string, r *http.Request, dstPort uint16, host string, dec policy.Decision, status int, bytesOut, bytesIn int64, errText string) {
+func (s *Server) auditWebSocket(srcIP string, r *http.Request, dstPort uint16, host string, dec policy.Decision, flowID string, status int, bytesOut, bytesIn int64, errText string) {
 	ev := audit.Event{
 		Kind:      audit.KindWebSocket,
 		Principal: s.link.Principal,
@@ -195,6 +198,7 @@ func (s *Server) auditWebSocket(srcIP string, r *http.Request, dstPort uint16, h
 		Reason:    dec.Reason,
 		RuleID:    dec.RuleID,
 		GrantID:   dec.GrantID,
+		FlowID:    flowID,
 		BytesOut:  bytesOut,
 		BytesIn:   bytesIn,
 		Error:     errText,
@@ -225,7 +229,6 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 		return 0, errWSEgressCapExceeded
 	}
 	if int64(len(p)) > rem {
-		// Write only up to the cap, then tear down immediately.
 		n, err := c.w.Write(p[:rem])
 		c.written += int64(n)
 		if err != nil {

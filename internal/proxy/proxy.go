@@ -1,5 +1,6 @@
 // Package proxy implements gatewayd's per-(link, dstPort) TLS MITM and HTTP/1.1,
-// HTTP/2, SSE, and opted-in WebSocket egress proxy (NOW.md:47-57).
+// HTTP/2, SSE, and opted-in WebSocket egress proxy with secret substitution,
+// identity response redaction, and live open-flow teardown (NOW.md:47-64).
 package proxy
 
 import (
@@ -11,9 +12,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/textproto"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,20 +27,24 @@ import (
 	"github.com/manufactory-project/gateway/internal/config"
 	"github.com/manufactory-project/gateway/internal/netguard"
 	"github.com/manufactory-project/gateway/internal/policy"
+	"github.com/manufactory-project/gateway/internal/secret"
 )
 
 // Options configures a per-link MITM proxy Server.
 type Options struct {
-	Link          config.LinkConfig
-	Store         *config.Store
-	Evaluator     *policy.Evaluator
-	Audit         *audit.Writer
-	Leaves        *ca.LeafCache
-	SNILimiter    *ca.DeniedSNILimiter
-	Dialer        *netguard.Dialer
-	DialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
-	UpstreamRoots *x509.CertPool
-	OnRequest     func(principal, effect string, status int)
+	Link               config.LinkConfig
+	Store              *config.Store
+	Evaluator          *policy.Evaluator
+	Audit              *audit.Writer
+	Leaves             *ca.LeafCache
+	SNILimiter         *ca.DeniedSNILimiter
+	Dialer             *netguard.Dialer
+	DialContext        func(ctx context.Context, network, addr string) (net.Conn, error)
+	UpstreamRoots      *x509.CertPool
+	Secrets            secret.Resolver
+	Flows              *FlowRegistry
+	GrantPruneInterval time.Duration
+	OnRequest          func(principal, effect string, status int)
 }
 
 // Server owns the explicit-bind HTTPS (:443 semantics) and HTTP (:80 semantics)
@@ -51,6 +58,9 @@ type Server struct {
 	sniLimiter    *ca.DeniedSNILimiter
 	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
 	upstreamRoots *x509.CertPool
+	secrets       secret.Resolver
+	flows         *FlowRegistry
+	pruneInterval time.Duration
 	onRequest     func(principal, effect string, status int)
 
 	transport *http.Transport
@@ -59,6 +69,8 @@ type Server struct {
 	httpLn   net.Listener
 	httpsSrv *http.Server
 	httpSrv  *http.Server
+	stopCh   chan struct{}
+	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
 
@@ -82,6 +94,18 @@ func NewServer(opts Options) (*Server, error) {
 		h := opts.Store.Current().Config.HTTP
 		sniLim = ca.NewDeniedSNILimiter(h.DeniedSNIRatePerSec, h.DeniedSNIBurst)
 	}
+	secrets := opts.Secrets
+	if secrets == nil {
+		secrets = secret.FileResolver{}
+	}
+	flows := opts.Flows
+	if flows == nil {
+		flows = NewFlowRegistry()
+	}
+	pruneInt := opts.GrantPruneInterval
+	if pruneInt <= 0 {
+		pruneInt = 50 * time.Millisecond
+	}
 
 	hCfg := opts.Store.Current().Config.HTTP
 	tr := &http.Transport{
@@ -99,7 +123,7 @@ func NewServer(opts Options) (*Server, error) {
 		MaxResponseHeaderBytes: int64(hCfg.MaxHeaderBytes),
 	}
 
-	return &Server{
+	s := &Server{
 		link:          opts.Link,
 		store:         opts.Store,
 		eval:          opts.Evaluator,
@@ -108,9 +132,44 @@ func NewServer(opts Options) (*Server, error) {
 		sniLimiter:    sniLim,
 		dialContext:   dialFn,
 		upstreamRoots: opts.UpstreamRoots,
+		secrets:       secrets,
+		flows:         flows,
+		pruneInterval: pruneInt,
 		onRequest:     opts.OnRequest,
 		transport:     tr,
-	}, nil
+		stopCh:        make(chan struct{}),
+	}
+
+	opts.Store.OnReload(s.onConfigReload)
+	opts.Store.SetOnGrantExpired(func(grantID string) {
+		s.flows.RevokeByGrant(grantID)
+	})
+	return s, nil
+}
+
+// Flows returns the FlowRegistry tracking this server's active flows.
+func (s *Server) Flows() *FlowRegistry {
+	return s.flows
+}
+
+func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) {
+	s.flows.RevokeWhere(func(info FlowInfo) bool {
+		if info.Link != s.link.Name {
+			return false
+		}
+		if info.GrantID != "" && slices.Contains(wipedGrantIDs, info.GrantID) {
+			return true
+		}
+		dec := s.eval.DecideRequest(info.Principal, info.Host, info.Port, info.Method, info.Path)
+		if !dec.Allow {
+			return true
+		}
+		if info.Protocol == "websocket" && !dec.AllowWebSocket {
+			return true
+		}
+		return false
+	})
+	s.transport.CloseIdleConnections()
 }
 
 // Start binds explicit HTTPS and HTTP TCP listeners on link.ParsedGatewayIP.
@@ -148,8 +207,13 @@ func (s *Server) Start() error {
 	httpProtos.SetHTTP2(false)
 	httpProtos.SetUnencryptedHTTP2(false)
 
+	connCtx := func(ctx context.Context, c net.Conn) context.Context {
+		return context.WithValue(ctx, guestConnCtxKey{}, c)
+	}
+
 	s.httpsSrv = &http.Server{
 		Handler:                      http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.serveHTTP(w, r, 443) }),
+		ConnContext:                  connCtx,
 		MaxHeaderBytes:               hCfg.MaxHeaderBytes,
 		ReadHeaderTimeout:            10 * time.Second,
 		IdleTimeout:                  90 * time.Second,
@@ -158,6 +222,7 @@ func (s *Server) Start() error {
 	}
 	s.httpSrv = &http.Server{
 		Handler:                      http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.serveHTTP(w, r, 80) }),
+		ConnContext:                  connCtx,
 		MaxHeaderBytes:               hCfg.MaxHeaderBytes,
 		ReadHeaderTimeout:            10 * time.Second,
 		IdleTimeout:                  90 * time.Second,
@@ -168,7 +233,7 @@ func (s *Server) Start() error {
 	s.httpsLn = httpsLn
 	s.httpLn = httpLn
 
-	s.wg.Add(2)
+	s.wg.Add(3)
 	go func() {
 		defer s.wg.Done()
 		if err := s.httpsSrv.Serve(httpsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -181,7 +246,24 @@ func (s *Server) Start() error {
 			return
 		}
 	}()
+	go func() {
+		defer s.wg.Done()
+		s.pruneGrantLoop()
+	}()
 	return nil
+}
+
+func (s *Server) pruneGrantLoop() {
+	ticker := time.NewTicker(s.pruneInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.store.PruneExpiredGrants()
+		}
+	}
 }
 
 // HTTPSAddr returns the bound HTTPS listener address.
@@ -200,8 +282,15 @@ func (s *Server) HTTPAddr() string {
 	return s.httpLn.Addr().String()
 }
 
-// Shutdown drains listeners, closes idle upstream connections, and waits for goroutines.
+// Shutdown drains listeners, tears down remaining link flows, closes idle upstream connections, and waits for goroutines.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
+	s.flows.RevokeWhere(func(info FlowInfo) bool {
+		return info.Link == s.link.Name
+	})
+
 	var errs error
 	if s.httpsSrv != nil {
 		if err := s.httpsSrv.Shutdown(ctx); err != nil {
@@ -278,7 +367,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	reqPath := r.URL.Path
 	hasQuery := r.URL.RawQuery != ""
 
-	deny := func(status int, reason, ruleID, host string) {
+	deny := func(status int, reason, ruleID, host string, secretNames []string) {
 		ev := audit.Event{
 			Kind:      audit.KindRequest,
 			Principal: s.link.Principal,
@@ -294,6 +383,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 			Effect:    audit.EffectDeny,
 			Reason:    reason,
 			RuleID:    ruleID,
+			Secrets:   secretNames,
 		}
 		if err := s.audit.WriteSync(ev); err != nil {
 			http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
@@ -307,62 +397,112 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 
 	// 1. Reject CONNECT unconditionally.
 	if r.Method == http.MethodConnect {
-		deny(http.StatusForbidden, "connect-forbidden", "", r.Host)
+		deny(http.StatusForbidden, "connect-forbidden", "", r.Host, nil)
 		return
 	}
 
 	// 2. Reject non-origin-form targets (*, absolute-URI, relative path, path traversal, escaped slashes).
 	if errReason := validateOriginForm(r); errReason != "" {
-		deny(http.StatusForbidden, errReason, "", r.Host)
+		deny(http.StatusForbidden, errReason, "", r.Host, nil)
 		return
 	}
 
 	// 3. Reject explicit Host header alongside :authority on HTTP/2 (NOW.md:49).
 	if r.ProtoMajor == 2 && len(r.Header["Host"]) > 0 {
-		deny(http.StatusForbidden, "h2-host-header", "", r.Host)
+		deny(http.StatusForbidden, "h2-host-header", "", r.Host, nil)
 		return
 	}
 
 	// 4. Validate Host/:authority non-empty, exact port match against listener dstPort, and SNI == Host on HTTPS.
 	host, errReason := validateHostAndSNI(r, dstPort)
 	if errReason != "" {
-		deny(http.StatusForbidden, errReason, "", r.Host)
+		deny(http.StatusForbidden, errReason, "", r.Host, nil)
 		return
 	}
 
 	// 5. Inspect Upgrade headers: reject h2c and arbitrary upgrades unconditionally.
 	wantWS, upgradeErr := classifyUpgrade(r)
 	if upgradeErr != "" {
-		deny(http.StatusForbidden, upgradeErr, "", host)
+		deny(http.StatusForbidden, upgradeErr, "", host, nil)
 		return
 	}
 
 	// 6. Evaluate policy live per HTTP request (never snapshotted at SYN).
 	dec := s.eval.DecideRequest(s.link.Principal, host, dstPort, r.Method, r.URL.Path)
 	if !dec.Allow {
-		deny(http.StatusForbidden, dec.Reason, dec.RuleID, host)
+		deny(http.StatusForbidden, dec.Reason, dec.RuleID, host, nil)
 		return
 	}
 
 	if wantWS && !dec.AllowWebSocket {
-		deny(http.StatusForbidden, "websocket-not-allowed", dec.RuleID, host)
+		deny(http.StatusForbidden, "websocket-not-allowed", dec.RuleID, host, nil)
 		return
 	}
 
 	// 7. Check Content-Length against streaming body cap before dialing upstream.
 	maxBody := s.store.Current().Config.HTTP.MaxRequestBodyBytes
 	if r.ContentLength > maxBody {
-		deny(http.StatusRequestEntityTooLarge, "body-too-large", dec.RuleID, host)
+		deny(http.StatusRequestEntityTooLarge, "body-too-large", dec.RuleID, host, nil)
 		return
 	}
 
-	// 8. Fail-closed admission audit BEFORE dialing upstream.
+	// 8. Substitute bound secrets (HTTPS :443 only) and unconditionally sweep Proxy-Authorization & mf_ph_*.
+	outHeaders := make(http.Header)
+	copyEndToEndHeaders(outHeaders, r.Header, wantWS)
+
+	var (
+		secretNames []string
+		subPairs    []secret.Pair
+	)
+	if !wantWS {
+		matchedBindings := s.eval.MatchBindings(s.link.Principal, host, dstPort, r.Method, r.URL.Path)
+		var subErr error
+		secretNames, subPairs, subErr = secret.ApplyRequest(outHeaders, matchedBindings, dstPort, s.secrets)
+		if subErr != nil {
+			var resErr *secret.ResolveError
+			var badNames []string
+			if errors.As(subErr, &resErr) && resErr.Name != "" {
+				badNames = []string{resErr.Name}
+			}
+			deny(http.StatusForbidden, "secret-unresolved", dec.RuleID, host, badNames)
+			return
+		}
+		if dec.HasBindings {
+			// Force identity encoding on every request to a bound host (NOW.md:61).
+			outHeaders.Set("Accept-Encoding", "identity")
+		}
+	} else {
+		secret.SweepHeaders(outHeaders)
+	}
+
+	// 9. Register per-request/per-stream flow BEFORE dialing upstream so live revoke/reload/TTL works immediately.
+	flowProto := r.Proto
+	if wantWS {
+		flowProto = "websocket"
+	}
+	reqCtx, reqCancel := context.WithCancel(r.Context())
+	defer reqCancel()
+
+	af := s.flows.register(FlowInfo{
+		Principal: s.link.Principal,
+		Link:      s.link.Name,
+		Host:      host,
+		Port:      dstPort,
+		Method:    r.Method,
+		Path:      r.URL.Path,
+		RuleID:    dec.RuleID,
+		GrantID:   dec.GrantID,
+		Protocol:  flowProto,
+	}, reqCancel, guestConnFromContext(r.Context()))
+	defer s.flows.unregister(af.info.ID)
+
+	// 10. Fail-closed admission audit BEFORE dialing upstream.
 	admitEv := audit.Event{
 		Kind:      audit.KindRequestAdmitted,
 		Principal: s.link.Principal,
 		Link:      s.link.Name,
 		SrcIP:     srcIP,
-		Protocol:  r.Proto,
+		Protocol:  flowProto,
 		Host:      host,
 		Port:      int(dstPort),
 		Method:    r.Method,
@@ -372,6 +512,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 		Reason:    dec.Reason,
 		RuleID:    dec.RuleID,
 		GrantID:   dec.GrantID,
+		FlowID:    af.info.ID,
+		Secrets:   secretNames,
 	}
 	if err := s.audit.WriteSync(admitEv); err != nil {
 		http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
@@ -379,11 +521,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	}
 
 	if wantWS {
-		s.serveWebSocket(w, r, dstPort, host, srcIP, dec)
+		s.serveWebSocket(w, r.WithContext(reqCtx), dstPort, host, srcIP, dec, outHeaders, af)
 		return
 	}
 
-	// 9. Rebuild outbound request with streaming MaxBytesReader and stripped hop-by-hop headers.
+	// 11. Rebuild outbound request with streaming MaxBytesReader and upstream conn trace.
 	scheme := "https"
 	if dstPort == 80 {
 		scheme = "http"
@@ -396,24 +538,29 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	outURL.Scheme = scheme
 	outURL.Host = net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), countingBody)
+	traceCtx := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
+		GotConn: func(ci httptrace.GotConnInfo) {
+			af.setUpstreamConn(ci.Conn)
+		},
+	})
+	outReq, err := http.NewRequestWithContext(traceCtx, r.Method, outURL.String(), countingBody)
 	if err != nil {
-		deny(http.StatusBadGateway, "build-request-failed", dec.RuleID, host)
+		deny(http.StatusBadGateway, "build-request-failed", dec.RuleID, host, secretNames)
 		return
 	}
 	outReq.Host = host
 	outReq.ContentLength = r.ContentLength
-	copyEndToEndHeaders(outReq.Header, r.Header, false)
+	outReq.Header = outHeaders
 
-	// 10. RoundTrip directly (never follow 3xx redirects!).
+	// 12. RoundTrip directly (never follow 3xx redirects!).
 	resp, err := s.transport.RoundTrip(outReq)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			deny(http.StatusRequestEntityTooLarge, "body-too-large", dec.RuleID, host)
+			deny(http.StatusRequestEntityTooLarge, "body-too-large", dec.RuleID, host, secretNames)
 			return
 		}
-		s.auditCompleted(srcIP, r, dstPort, host, dec, http.StatusBadGateway, countingBody.n, 0, err.Error())
+		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n, 0, err.Error())
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
@@ -425,19 +572,50 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 
 	// Refuse unexpected 101 Switching Protocols on non-WebSocket flows.
 	if resp.StatusCode == http.StatusSwitchingProtocols {
-		s.auditCompleted(srcIP, r, dstPort, host, dec, http.StatusBadGateway, countingBody.n, 0, "unexpected-101")
+		s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n, 0, "unexpected-101")
 		http.Error(w, "unexpected protocol upgrade", http.StatusBadGateway)
 		return
 	}
 
-	// 11. Copy response headers, announce trailers, flush per-chunk for SSE, and forward trailers after EOF.
+	// 13. Bound-host response enforcement: fail closed 502 on compressed Content-Encoding,
+	// strip Content-Length, and scrub headers + streaming body + trailers (NOW.md:61).
+	var redactor *secret.Redactor
+	if dec.HasBindings {
+		ce := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+		if ce != "" && !strings.EqualFold(ce, "identity") {
+			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n, 0, "compressed-response-on-bound-host")
+			http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
+			return
+		}
+		hostPairs := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, host), subPairs, s.secrets)
+		redactor = secret.NewRedactor(hostPairs)
+	}
+
+	// 14. Copy response headers, scrub if bound, announce trailers, flush per-chunk, forward trailers.
 	copyEndToEndHeaders(w.Header(), resp.Header, false)
+	if dec.HasBindings {
+		if redactor.Active() {
+			redactor.ScrubHeader(w.Header())
+		}
+		// Always strip Content-Length on bound hosts before WriteHeader.
+		w.Header().Del("Content-Length")
+	}
 	for k := range resp.Trailer {
 		w.Header().Add("Trailer", k)
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	bytesIn, copyErr := copyStreaming(w, resp.Body)
+	var (
+		bytesIn int64
+		copyErr error
+	)
+	if redactor != nil && redactor.Active() {
+		bytesIn, copyErr = copyStreamingRedacted(w, resp.Body, redactor)
+		redactor.ScrubHeader(resp.Trailer)
+	} else {
+		bytesIn, copyErr = copyStreaming(w, resp.Body)
+	}
+
 	for k, vals := range resp.Trailer {
 		tk := http.TrailerPrefix + k
 		for _, v := range vals {
@@ -449,10 +627,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	if copyErr != nil {
 		errText = copyErr.Error()
 	}
-	s.auditCompleted(srcIP, r, dstPort, host, dec, resp.StatusCode, countingBody.n, bytesIn, errText)
+	s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, resp.StatusCode, countingBody.n, bytesIn, errText)
 }
 
-func (s *Server) auditCompleted(srcIP string, r *http.Request, dstPort uint16, host string, dec policy.Decision, status int, bytesOut, bytesIn int64, errText string) {
+func (s *Server) auditCompleted(srcIP string, r *http.Request, dstPort uint16, host string, dec policy.Decision, flowID string, secretNames []string, status int, bytesOut, bytesIn int64, errText string) {
 	ev := audit.Event{
 		Kind:      audit.KindRequest,
 		Principal: s.link.Principal,
@@ -469,6 +647,8 @@ func (s *Server) auditCompleted(srcIP string, r *http.Request, dstPort uint16, h
 		Reason:    dec.Reason,
 		RuleID:    dec.RuleID,
 		GrantID:   dec.GrantID,
+		FlowID:    flowID,
+		Secrets:   secretNames,
 		BytesOut:  bytesOut,
 		BytesIn:   bytesIn,
 		Error:     errText,
@@ -500,7 +680,6 @@ func validateOriginForm(r *http.Request) string {
 			return "escaped-path-separator"
 		}
 	}
-	// Reject uncleaned traversal segments like /v1/../admin.
 	if strings.Contains(r.URL.Path, "\\") {
 		return "backslash-in-path"
 	}
@@ -509,7 +688,6 @@ func validateOriginForm(r *http.Request) string {
 			return "path-traversal"
 		}
 	}
-	// Keep single check that path.Clean doesn't escape root.
 	if !strings.HasPrefix(path.Clean(r.URL.Path), "/") {
 		return "non-origin-form-target"
 	}
@@ -613,7 +791,6 @@ func copyEndToEndHeaders(dst, src http.Header, keepWS bool) {
 	for k, vals := range src {
 		canon := textproto.CanonicalMIMEHeaderKey(k)
 		if canon == "Te" {
-			// Preserve TE: trailers for gRPC/HTTP2 trailers.
 			for _, v := range vals {
 				if strings.EqualFold(strings.TrimSpace(v), "trailers") {
 					dst.Add("TE", "trailers")
@@ -656,6 +833,34 @@ func copyStreaming(w http.ResponseWriter, src io.Reader) (int64, error) {
 				return total, nil
 			}
 			return total, readErr
+		}
+	}
+}
+
+func copyStreamingRedacted(w http.ResponseWriter, src io.Reader, redactor *secret.Redactor) (int64, error) {
+	rc := http.NewResponseController(w)
+	flushFn := func() error {
+		err := rc.Flush()
+		if errors.Is(err, http.ErrNotSupported) {
+			return nil
+		}
+		return err
+	}
+	sw := redactor.StreamWriter(w, flushFn)
+	buf := make([]byte, 32<<10)
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if _, writeErr := sw.Write(buf[:n]); writeErr != nil {
+				return sw.Written(), writeErr
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				closeErr := sw.Close()
+				return sw.Written(), closeErr
+			}
+			return sw.Written(), readErr
 		}
 	}
 }
