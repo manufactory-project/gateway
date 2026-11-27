@@ -36,12 +36,13 @@ const (
 type Kind string
 
 const (
-	KindDNS       Kind = "dns"
-	KindRequest   Kind = "request"
-	KindWebSocket Kind = "websocket"
-	KindLifecycle Kind = "lifecycle"
-	KindGrant     Kind = "grant"
-	KindRevoke    Kind = "revoke"
+	KindDNS             Kind = "dns"
+	KindRequest         Kind = "request"
+	KindRequestAdmitted Kind = "request_admitted"
+	KindWebSocket       Kind = "websocket"
+	KindLifecycle       Kind = "lifecycle"
+	KindGrant           Kind = "grant"
+	KindRevoke          Kind = "revoke"
 )
 
 // Effect is the enforcement outcome of a decision.
