@@ -11,7 +11,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PROJECT=""
 REMOTE=""
-TARGET=""
 IMAGE="images:ubuntu/24.04"
 MGMT_NET="incusbr0"
 MGMT_NET_EXPLICIT=0
@@ -35,7 +34,6 @@ Required:
 
 Options:
   --remote <name>           Incus remote prefix (empty = local default)
-  --target <member>         Incus cluster member for all bridges and instances (required on clusters)
   --image <image>           Container image (default: images:ubuntu/24.04)
   --mgmt-network <name>     Existing management/upstream bridge for gw eth0 (default: incusbr0)
   --create-mgmt-network     Create a dedicated NAT bridge gwdm-<tag> for gw eth0 and delete on cleanup
@@ -57,7 +55,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) PROJECT="${2:?missing value for --project}"; shift 2 ;;
     --remote) REMOTE="${2:?missing value for --remote}"; shift 2 ;;
-    --target) TARGET="${2:?missing value for --target}"; shift 2 ;;
     --image) IMAGE="${2:?missing value for --image}"; shift 2 ;;
     --mgmt-network) MGMT_NET="${2:?missing value for --mgmt-network}"; MGMT_NET_EXPLICIT=1; shift 2 ;;
     --create-mgmt-network) CREATE_MGMT_NET=1; shift ;;
@@ -96,13 +93,6 @@ if [[ -n "$REMOTE" ]]; then
   RPREFIX="${REMOTE}:"
 fi
 
-TARGET_ARGS=()
-TARGET_FLAG=""
-if [[ -n "$TARGET" ]]; then
-  TARGET_ARGS=(--target "$TARGET")
-  TARGET_FLAG=" --target ${TARGET}"
-fi
-
 # Derive <=15-char Linux bridge names deterministic per project.
 PROJ_TAG="$(printf '%s' "$PROJECT" | sha256sum | cut -c1-6)"
 NET0="sbx0-${PROJ_TAG}"
@@ -122,23 +112,23 @@ G1_INST="${RPREFIX}guest1"
 
 # Exact Incus provisioning commands printed before confirmation.
 print_plan() {
-  echo "Planned Incus commands (throwaway project '${PROJECT}', remote '${REMOTE:-local}', target '${TARGET:-none (standalone)}'):"
+  echo "Planned Incus commands (throwaway project '${PROJECT}', remote '${REMOTE:-local}'):"
   echo "  incus project create ${RPREFIX}${PROJECT} -c features.images=false -c features.profiles=true -c features.networks=false -c features.storage.volumes=false"
   echo "  incus profile device add ${RPREFIX}default root disk path=/ pool=${STORAGE_POOL} --project ${PROJECT}"
   if [[ "$CREATE_MGMT_NET" -eq 1 ]]; then
-    echo "  incus network create ${RPREFIX}${MGMT_NET} --type=bridge ipv4.address=auto ipv4.nat=true ipv6.address=none${TARGET_FLAG}"
+    echo "  incus network create ${RPREFIX}${MGMT_NET} --type=bridge ipv4.address=auto ipv4.nat=true ipv6.address=none"
   fi
-  echo "  incus network create ${RPREFIX}${NET0} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}"
-  echo "  incus network create ${RPREFIX}${NET1} --type=bridge ipv4.address=none ipv6.address=none${TARGET_FLAG}"
-  echo "  incus init ${IMAGE} ${GW_INST} --project ${PROJECT}${TARGET_FLAG}"
+  echo "  incus network create ${RPREFIX}${NET0} --type=bridge ipv4.address=none ipv6.address=none"
+  echo "  incus network create ${RPREFIX}${NET1} --type=bridge ipv4.address=none ipv6.address=none"
+  echo "  incus init ${IMAGE} ${GW_INST} --project ${PROJECT}"
   echo "  incus config device add ${GW_INST} eth0 nic network=${MGMT_NET} name=eth0 --project ${PROJECT}"
   echo "  incus config device add ${GW_INST} sbx0 nic network=${NET0} name=sbx0 --project ${PROJECT}"
   echo "  incus config device add ${GW_INST} sbx1 nic network=${NET1} name=sbx1 --project ${PROJECT}"
   echo "  incus start ${GW_INST} --project ${PROJECT}"
-  echo "  incus init ${IMAGE} ${G0_INST} --project ${PROJECT}${TARGET_FLAG}"
+  echo "  incus init ${IMAGE} ${G0_INST} --project ${PROJECT}"
   echo "  incus config device add ${G0_INST} eth0 nic network=${NET0} name=eth0 --project ${PROJECT}"
   echo "  incus start ${G0_INST} --project ${PROJECT}"
-  echo "  incus init ${IMAGE} ${G1_INST} --project ${PROJECT}${TARGET_FLAG}"
+  echo "  incus init ${IMAGE} ${G1_INST} --project ${PROJECT}"
   echo "  incus config device add ${G1_INST} eth0 nic network=${NET1} name=eth0 --project ${PROJECT}"
   echo "  incus start ${G1_INST} --project ${PROJECT}"
   echo ""
@@ -157,16 +147,14 @@ if [[ "$PLAN_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-# Refuse to run on an Incus cluster unless --target <member> is explicitly passed.
+# Refuse clustered Incus altogether.
 CLUSTER_LIST_CMD=(incus cluster list --format csv)
 if [[ -n "$RPREFIX" ]]; then
   CLUSTER_LIST_CMD=(incus cluster list "$RPREFIX" --format csv)
 fi
 if cluster_members="$("${CLUSTER_LIST_CMD[@]}" 2>/dev/null)" && [[ -n "$cluster_members" ]]; then
-  if [[ -z "$TARGET" ]]; then
-    echo "error: Incus cluster detected; pass --target <member> to pin bridges and instances" >&2
-    exit 1
-  fi
+  echo "clustered Incus is not supported; use a standalone Incus such as standalone-host" >&2
+  exit 1
 fi
 
 # Refuse if the project or any managed bridge network already exists.
@@ -268,26 +256,26 @@ CREATED_PROJECT=1
 incus profile device add "${RPREFIX}default" root disk path=/ "pool=${STORAGE_POOL}" --project "$PROJECT"
 
 if [[ "$CREATE_MGMT_NET" -eq 1 ]]; then
-  incus network create "${RPREFIX}${MGMT_NET}" --type=bridge ipv4.address=auto ipv4.nat=true ipv6.address=none "${TARGET_ARGS[@]}"
+  incus network create "${RPREFIX}${MGMT_NET}" --type=bridge ipv4.address=auto ipv4.nat=true ipv6.address=none
   CREATED_MGMT_NET=1
 fi
 
-incus network create "${RPREFIX}${NET0}" --type=bridge ipv4.address=none ipv6.address=none "${TARGET_ARGS[@]}"
+incus network create "${RPREFIX}${NET0}" --type=bridge ipv4.address=none ipv6.address=none
 CREATED_NET0=1
-incus network create "${RPREFIX}${NET1}" --type=bridge ipv4.address=none ipv6.address=none "${TARGET_ARGS[@]}"
+incus network create "${RPREFIX}${NET1}" --type=bridge ipv4.address=none ipv6.address=none
 CREATED_NET1=1
 
-incus init "$IMAGE" "$GW_INST" --project "$PROJECT" "${TARGET_ARGS[@]}"
+incus init "$IMAGE" "$GW_INST" --project "$PROJECT"
 incus config device add "$GW_INST" eth0 nic "network=${MGMT_NET}" name=eth0 --project "$PROJECT"
 incus config device add "$GW_INST" sbx0 nic "network=${NET0}" name=sbx0 --project "$PROJECT"
 incus config device add "$GW_INST" sbx1 nic "network=${NET1}" name=sbx1 --project "$PROJECT"
 incus start "$GW_INST" --project "$PROJECT"
 
-incus init "$IMAGE" "$G0_INST" --project "$PROJECT" "${TARGET_ARGS[@]}"
+incus init "$IMAGE" "$G0_INST" --project "$PROJECT"
 incus config device add "$G0_INST" eth0 nic "network=${NET0}" name=eth0 --project "$PROJECT"
 incus start "$G0_INST" --project "$PROJECT"
 
-incus init "$IMAGE" "$G1_INST" --project "$PROJECT" "${TARGET_ARGS[@]}"
+incus init "$IMAGE" "$G1_INST" --project "$PROJECT"
 incus config device add "$G1_INST" eth0 nic "network=${NET1}" name=eth0 --project "$PROJECT"
 incus start "$G1_INST" --project "$PROJECT"
 
