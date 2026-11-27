@@ -56,6 +56,14 @@ tasks:
       - |
         set -eu
         go mod tidy -diff
+      - |
+        set -eu
+        bad=$(git log --no-merges --format='%an <%ae>|%cn <%ce>' | awk -F'|' 'NF != 2 || $1 != "Manufactory Bot <bot@manufactory.systems>" || ($2 != "Manufactory Bot <bot@manufactory.systems>" && $2 != "GitHub <noreply@github.com>")')
+        if [ -n "$bad" ]; then
+          echo "lint: commit identity check failed (expected author Manufactory Bot <bot@manufactory.systems>, committer bot or GitHub):" >&2
+          echo "$bad" >&2
+          exit 1
+        fi
 
   test:
     desc: Run Go tests with race detector (goleak enforced in tests)
