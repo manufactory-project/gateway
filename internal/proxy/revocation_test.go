@@ -836,3 +836,173 @@ func TestAdmissionRecheckAfterFlowRegistrationBlocksRevokedRule(t *testing.T) {
 		t.Fatal("missing audited 403 deny for post-registration recheck")
 	}
 }
+
+func waitAuditCompletedError(t *testing.T, gw *testGateway, path, wantErr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, ev := range gw.AuditEvents(t) {
+			if (ev.Kind == "request" || ev.Kind == "websocket") && ev.Path == path {
+				if ev.Error != wantErr {
+					t.Fatalf("path %s completion audit error = %q, want %q", path, ev.Error, wantErr)
+				}
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for completion audit on %s with error=%q", path, wantErr)
+}
+
+func openTestWSUpgrade(t *testing.T, gw *testGateway, host, path string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	c := gw.DialTLS(t, host)
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", path, host)
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatalf("write WS upgrade %s: %v", path, err)
+	}
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("WS %s upgrade resp=%+v err=%v", path, resp, err)
+	}
+	return c, br
+}
+
+func drainHTTPAndWS(t *testing.T, resp *http.Response, wsConn net.Conn, wsBR *bufio.Reader) {
+	t.Helper()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Logf("http stream ended: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("close http resp: %v", err)
+	}
+	if _, err := io.ReadAll(wsBR); err != nil {
+		t.Logf("ws stream ended: %v", err)
+	}
+	if err := wsConn.Close(); err != nil {
+		t.Logf("close ws conn: %v", err)
+	}
+}
+
+func TestFlowTeardownReasonsHTTPAndWebSocket(t *testing.T) {
+	holdRelease := make(chan struct{})
+	streamReady := make(chan struct{}, 16)
+	hangEntered := make(chan struct{}, 4)
+	gw := newTestGateway(t, testGatewaySpec{
+		StartGrantPruner: true,
+		OnCleanupFirst:   func() { close(holdRelease) },
+		Hosts:            []string{"reason.example.com", "ttl-reason.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/hang") {
+				hangEntered <- struct{}{}
+				select {
+				case <-r.Context().Done():
+				case <-holdRelease:
+				}
+				return
+			}
+			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				wsEchoHandler(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.WriteString(w, "data: hold\n\n"); err != nil {
+				return
+			}
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				return
+			}
+			streamReady <- struct{}{}
+			select {
+			case <-r.Context().Done():
+			case <-holdRelease:
+			}
+		}),
+		RulesYAML: `
+  - id: allow-reason
+    principal: worker-test
+    effect: allow
+    hosts: [reason.example.com]
+    ports: [443]
+    allow_websocket: true
+`,
+	})
+
+	// 1. revoked (HTTP + WebSocket)
+	rRev, err := gw.H1Client(t, "reason.example.com").Get("https://reason.example.com/http-revoked")
+	if err != nil {
+		t.Fatalf("GET /http-revoked: %v", err)
+	}
+	<-streamReady
+	wsRev, wsRevBR := openTestWSUpgrade(t, gw, "reason.example.com", "/ws-revoked")
+	if n := gw.Flows.RevokeByPrincipal("worker-test", "reason.example.com"); n != 2 {
+		t.Fatalf("RevokeByPrincipal = %d, want 2", n)
+	}
+	drainHTTPAndWS(t, rRev, wsRev, wsRevBR)
+	waitAuditCompletedError(t, gw, "/http-revoked", "revoked")
+	waitAuditCompletedError(t, gw, "/ws-revoked", "revoked")
+
+	// 2. grant-expired (HTTP + WebSocket)
+	if _, err := gw.Store.AddGrant("worker-test", "ttl-reason.example.com", 443, []string{"GET"}, []string{"/**"}, 120*time.Millisecond, true); err != nil {
+		t.Fatalf("AddGrant ttl: %v", err)
+	}
+	rExp, err := gw.H1Client(t, "ttl-reason.example.com").Get("https://ttl-reason.example.com/http-expired")
+	if err != nil {
+		t.Fatalf("GET /http-expired: %v", err)
+	}
+	<-streamReady
+	wsExp, wsExpBR := openTestWSUpgrade(t, gw, "ttl-reason.example.com", "/ws-expired")
+	drainHTTPAndWS(t, rExp, wsExp, wsExpBR)
+	waitAuditCompletedError(t, gw, "/http-expired", "grant-expired")
+	waitAuditCompletedError(t, gw, "/ws-expired", "grant-expired")
+
+	// 3. client-canceled (HTTP + WebSocket handshake)
+	cCtx, cCancel := context.WithCancel(context.Background())
+	reqCancel, err := http.NewRequestWithContext(cCtx, http.MethodGet, "https://reason.example.com/hang-http", nil)
+	if err != nil {
+		t.Fatalf("NewRequest /hang-http: %v", err)
+	}
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		if resp, dErr := gw.H1Client(t, "reason.example.com").Do(reqCancel); dErr == nil {
+			if cErr := resp.Body.Close(); cErr != nil {
+				t.Errorf("close canceled resp: %v", cErr)
+			}
+		}
+	}()
+	<-hangEntered
+	cCancel()
+	<-clientDone
+	waitAuditCompletedError(t, gw, "/hang-http", "client-canceled")
+
+	wsHang := gw.DialTLS(t, "reason.example.com")
+	if _, err := io.WriteString(wsHang, "GET /hang-ws HTTP/1.1\r\nHost: reason.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"); err != nil {
+		t.Fatalf("write /hang-ws: %v", err)
+	}
+	<-hangEntered
+	if err := wsHang.Close(); err != nil {
+		t.Fatalf("close wsHang: %v", err)
+	}
+	waitAuditCompletedError(t, gw, "/hang-ws", "client-canceled")
+
+	// 4. reload (HTTP + WebSocket)
+	rRel, err := gw.H1Client(t, "reason.example.com").Get("https://reason.example.com/http-reload")
+	if err != nil {
+		t.Fatalf("GET /http-reload: %v", err)
+	}
+	<-streamReady
+	wsRel, wsRelBR := openTestWSUpgrade(t, gw, "reason.example.com", "/ws-reload")
+	idx := strings.Index(gw.BaseYAML, "rules:\n")
+	if err := os.WriteFile(gw.CfgPath, []byte(gw.BaseYAML[:idx]), 0o600); err != nil {
+		t.Fatalf("write no-rules config: %v", err)
+	}
+	if _, _, _, err := gw.Store.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	drainHTTPAndWS(t, rRel, wsRel, wsRelBR)
+	waitAuditCompletedError(t, gw, "/http-reload", "reload")
+	waitAuditCompletedError(t, gw, "/ws-reload", "reload")
+}

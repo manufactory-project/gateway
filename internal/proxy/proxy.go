@@ -118,13 +118,13 @@ func NewServer(opts Options) (*Server, error) {
 
 	opts.Store.OnReload(s.onConfigReload)
 	opts.Store.SetOnGrantExpired(func(g config.Grant) {
-		s.flows.RevokeByGrant(g.ID)
+		s.flows.RevokeByGrantWithReason(g.ID, TeardownGrantExpired)
 	})
 	return s, nil
 }
 
 func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) int {
-	revoked := s.flows.RevokeWhere(func(info FlowInfo) bool {
+	revoked := s.flows.RevokeWhereWithReason(func(info FlowInfo) bool {
 		if info.Link != s.link.Name {
 			return false
 		}
@@ -139,7 +139,7 @@ func (s *Server) onConfigReload(_, _ *config.Snapshot, wipedGrantIDs []string) i
 			return true
 		}
 		return false
-	})
+	}, TeardownReload)
 	s.transport.CloseIdleConnections()
 	return len(revoked)
 }
@@ -529,7 +529,8 @@ func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
 }
 
 func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
-	reqCtx, reqCancel := context.WithCancel(rc.r.Context())
+	parentCtx := rc.r.Context()
+	reqCtx, reqCancel := context.WithCancel(parentCtx)
 	defer reqCancel()
 
 	af := s.flows.register(FlowInfo{
@@ -542,7 +543,7 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		RuleID:    rc.dec.RuleID,
 		GrantID:   rc.dec.GrantID,
 		Protocol:  rc.proto,
-	}, reqCancel, guestConnFromContext(rc.r.Context()))
+	}, reqCancel, guestConnFromContext(parentCtx))
 	defer s.flows.unregister(af.info.ID)
 	rc.flowID = af.info.ID
 
@@ -578,8 +579,12 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 			rc.deny(w, http.StatusRequestEntityTooLarge, "body-too-large")
 			return
 		}
-		if rc.r.Context().Err() != nil && !af.isTornDown() {
-			rc.auditCompleted(statusClientClosedRequest, countingBody.n.Load(), 0, "client-canceled")
+		if reason := af.reason(); reason != "" {
+			rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, reason)
+			return
+		}
+		if parentCtx.Err() != nil {
+			rc.auditCompleted(statusClientClosedRequest, countingBody.n.Load(), 0, TeardownClientCanceled)
 			return
 		}
 		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, err.Error())
@@ -601,8 +606,14 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 
 	bytesIn, copyErr := writeProxiedResponse(w, resp, rc.dec.HasBindings || len(rc.subPairs) > 0, redactor)
 	errText := ""
-	if copyErr != nil {
-		errText = copyErr.Error()
+	if reason := af.reason(); reason != "" {
+		errText = reason
+	} else if copyErr != nil {
+		if parentCtx.Err() != nil {
+			errText = TeardownClientCanceled
+		} else {
+			errText = copyErr.Error()
+		}
 	}
 	rc.auditCompleted(resp.StatusCode, countingBody.n.Load(), bytesIn, errText)
 	if copyErr != nil {

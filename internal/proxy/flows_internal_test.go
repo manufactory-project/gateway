@@ -30,7 +30,7 @@ func TestActiveFlowSetUpstreamConnAfterTeardownClosesImmediately(t *testing.T) {
 	}
 
 	// Teardown runs BEFORE upstream connection is attached.
-	af.teardown()
+	af.teardown(TeardownRevoked)
 	if ctx.Err() == nil {
 		t.Fatal("teardown did not cancel flow context")
 	}

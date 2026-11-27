@@ -19,39 +19,53 @@ const wsHandshakeTimeout = 30 * time.Second
 
 var errWSEgressCapExceeded = errors.New("websocket egress byte cap exceeded")
 
+func wsCancelOrErr(af *activeFlow, ctx context.Context, fallback string) (status int, errText string, canceled bool) {
+	if reason := af.reason(); reason != "" {
+		return http.StatusBadGateway, reason, true
+	}
+	if ctx.Err() != nil {
+		return statusClientClosedRequest, TeardownClientCanceled, true
+	}
+	return http.StatusBadGateway, fallback, false
+}
+
 func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activeFlow) {
 	upConn, err := s.dialWebSocketUpstream(rc.r.Context(), rc.host, rc.dstPort)
 	if err != nil {
-		rc.auditCompleted(http.StatusBadGateway, 0, 0, err.Error())
-		http.Error(w, "upstream websocket connect failed", http.StatusBadGateway)
+		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), err.Error())
+		rc.auditCompleted(status, 0, 0, errText)
+		if !canceled {
+			http.Error(w, "upstream websocket connect failed", http.StatusBadGateway)
+		}
 		return
 	}
 	af.setUpstreamConn(upConn)
 	defer closeQuietly(upConn)
 
 	if rc.r.Context().Err() != nil {
-		rc.auditCompleted(http.StatusBadGateway, 0, 0, rc.r.Context().Err().Error())
+		status, errText, _ := wsCancelOrErr(af, rc.r.Context(), rc.r.Context().Err().Error())
+		rc.auditCompleted(status, 0, 0, errText)
 		return
 	}
 
 	outReq := buildWSUpgradeRequest(rc)
 	upReader, resp, err := performWSHandshake(rc.r.Context(), upConn, outReq, wsHandshakeTimeout)
 	if err != nil {
-		if rc.r.Context().Err() != nil && !af.isTornDown() {
-			rc.auditCompleted(statusClientClosedRequest, 0, 0, "client-canceled")
-			return
+		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), err.Error())
+		rc.auditCompleted(status, 0, 0, errText)
+		if !canceled {
+			http.Error(w, "upstream response failed", http.StatusBadGateway)
 		}
-		rc.auditCompleted(http.StatusBadGateway, 0, 0, err.Error())
-		http.Error(w, "upstream response failed", http.StatusBadGateway)
 		return
 	}
 
 	if resp.StatusCode != http.StatusSwitchingProtocols || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") {
-		handleNonWSResponse(w, rc, resp)
+		handleNonWSResponse(w, rc, af, resp)
 		return
 	}
 	if rc.r.Context().Err() != nil {
-		rc.auditCompleted(http.StatusBadGateway, 0, 0, rc.r.Context().Err().Error())
+		status, errText, _ := wsCancelOrErr(af, rc.r.Context(), rc.r.Context().Err().Error())
+		rc.auditCompleted(status, 0, 0, errText)
 		return
 	}
 
@@ -64,7 +78,11 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	defer closeQuietly(clientConn)
 
 	if err := writeWS101Response(clientConn, resp.Header); err != nil {
-		rc.auditCompleted(http.StatusSwitchingProtocols, 0, 0, err.Error())
+		errText := err.Error()
+		if reason := af.reason(); reason != "" {
+			errText = reason
+		}
+		rc.auditCompleted(http.StatusSwitchingProtocols, 0, 0, errText)
 		return
 	}
 
@@ -77,6 +95,8 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	errText := ""
 	if egressErr != nil {
 		errText = fmt.Sprintf("ws-egress-cap-exceeded:%d", egressCap)
+	} else if reason := af.reason(); reason != "" {
+		errText = reason
 	}
 	rc.auditCompleted(http.StatusSwitchingProtocols, bytesOut, bytesIn, errText)
 }
@@ -144,7 +164,7 @@ func performWSHandshake(ctx context.Context, upConn net.Conn, outReq *http.Reque
 	return upReader, resp, nil
 }
 
-func handleNonWSResponse(w http.ResponseWriter, rc *reqContext, resp *http.Response) {
+func handleNonWSResponse(w http.ResponseWriter, rc *reqContext, af *activeFlow, resp *http.Response) {
 	defer closeQuietly(resp.Body)
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		rc.auditCompleted(http.StatusBadGateway, 0, 0, "unexpected-101-non-websocket")
@@ -155,8 +175,14 @@ func handleNonWSResponse(w http.ResponseWriter, rc *reqContext, resp *http.Respo
 	w.WriteHeader(resp.StatusCode)
 	bytesIn, copyErr := copyStreaming(w, resp.Body)
 	errText := ""
-	if copyErr != nil {
-		errText = copyErr.Error()
+	if reason := af.reason(); reason != "" {
+		errText = reason
+	} else if copyErr != nil {
+		if rc.r.Context().Err() != nil {
+			errText = TeardownClientCanceled
+		} else {
+			errText = copyErr.Error()
+		}
 	}
 	rc.auditCompleted(resp.StatusCode, 0, bytesIn, errText)
 	if copyErr != nil {

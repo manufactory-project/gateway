@@ -26,14 +26,23 @@ type FlowInfo struct {
 	StartedAt time.Time `json:"started_at"`
 }
 
+// Teardown reason tokens recorded in completion audit events.
+const (
+	TeardownRevoked        = "revoked"
+	TeardownGrantExpired   = "grant-expired"
+	TeardownReload         = "reload"
+	TeardownClientCanceled = "client-canceled"
+)
+
 type activeFlow struct {
 	info      FlowInfo
 	cancel    context.CancelFunc
 	guestConn net.Conn
 
-	mu       sync.Mutex
-	upConn   net.Conn
-	tornDown bool
+	mu             sync.Mutex
+	upConn         net.Conn
+	tornDown       bool
+	teardownReason string
 }
 
 // setUpstreamConn attaches c to the flow, or closes c immediately if teardown already ran.
@@ -51,22 +60,23 @@ func (f *activeFlow) setUpstreamConn(c net.Conn) {
 	f.mu.Unlock()
 }
 
-func (f *activeFlow) isTornDown() bool {
+func (f *activeFlow) reason() string {
 	f.mu.Lock()
-	td := f.tornDown
+	r := f.teardownReason
 	f.mu.Unlock()
-	return td
+	return r
 }
 
 // teardown immediately cancels the request context, closes the guest connection,
 // and closes any gateway-owned WebSocket upstream socket.
-func (f *activeFlow) teardown() {
+func (f *activeFlow) teardown(reason string) {
 	f.mu.Lock()
 	if f.tornDown {
 		f.mu.Unlock()
 		return
 	}
 	f.tornDown = true
+	f.teardownReason = reason
 	up := f.upConn
 	f.mu.Unlock()
 
@@ -152,17 +162,22 @@ func (r *FlowRegistry) Count() int {
 func (r *FlowRegistry) RevokeByID(flowID string) int {
 	return r.revokeMatching(func(info FlowInfo) bool {
 		return info.ID == flowID
-	})
+	}, TeardownRevoked)
 }
 
 // RevokeByGrant tears down every active flow running under grantID.
 func (r *FlowRegistry) RevokeByGrant(grantID string) int {
+	return r.RevokeByGrantWithReason(grantID, TeardownRevoked)
+}
+
+// RevokeByGrantWithReason tears down every active flow running under grantID with a specific teardown reason.
+func (r *FlowRegistry) RevokeByGrantWithReason(grantID, reason string) int {
 	if grantID == "" {
 		return 0
 	}
 	return r.revokeMatching(func(info FlowInfo) bool {
 		return info.GrantID == grantID
-	})
+	}, reason)
 }
 
 // RevokeByPrincipal tears down every active flow for principal (optionally filtered to exact host).
@@ -176,12 +191,17 @@ func (r *FlowRegistry) RevokeByPrincipal(principal, host string) int {
 			return false
 		}
 		return true
-	})
+	}, TeardownRevoked)
 }
 
 // RevokeWhere tears down every active flow matching pred, fires onRevoke, and returns the terminated FlowInfos.
 func (r *FlowRegistry) RevokeWhere(pred func(FlowInfo) bool) []FlowInfo {
-	revoked := r.teardownWhere(pred)
+	return r.RevokeWhereWithReason(pred, TeardownRevoked)
+}
+
+// RevokeWhereWithReason tears down every active flow matching pred with reason, fires onRevoke, and returns the terminated FlowInfos.
+func (r *FlowRegistry) RevokeWhereWithReason(pred func(FlowInfo) bool, reason string) []FlowInfo {
+	revoked := r.teardownWhere(pred, reason)
 	if len(revoked) > 0 {
 		r.mu.RLock()
 		cb := r.onRevoke
@@ -197,10 +217,10 @@ func (r *FlowRegistry) RevokeWhere(pred func(FlowInfo) bool) []FlowInfo {
 func (r *FlowRegistry) drainLink(linkName string) {
 	r.teardownWhere(func(info FlowInfo) bool {
 		return info.Link == linkName
-	})
+	}, TeardownRevoked)
 }
 
-func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool) []FlowInfo {
+func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool, reason string) []FlowInfo {
 	r.mu.RLock()
 	snapshot := make([]*activeFlow, 0, len(r.flows))
 	for _, af := range r.flows {
@@ -230,14 +250,14 @@ func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool) []FlowInfo {
 
 	revoked := make([]FlowInfo, 0, len(targets))
 	for _, af := range targets {
-		af.teardown()
+		af.teardown(reason)
 		revoked = append(revoked, af.info)
 	}
 	return revoked
 }
 
-func (r *FlowRegistry) revokeMatching(pred func(FlowInfo) bool) int {
-	return len(r.RevokeWhere(pred))
+func (r *FlowRegistry) revokeMatching(pred func(FlowInfo) bool, reason string) int {
+	return len(r.RevokeWhereWithReason(pred, reason))
 }
 
 func newFlowID() string {
