@@ -65,6 +65,7 @@ func TestSlice6CRevocationMetricsAndTeardownRace(t *testing.T) {
 	holdRelease := make(chan struct{})
 	streamStarted := make(chan struct{}, 8)
 	var wsUpWrites atomic.Int32
+	var httpRaceHits atomic.Int32
 
 	upSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -82,6 +83,9 @@ func TestSlice6CRevocationMetricsAndTeardownRace(t *testing.T) {
 			<-holdRelease
 		case "/ws-race":
 			wsUpWrites.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/ok":
+			httpRaceHits.Add(1)
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -163,10 +167,7 @@ rules:
 	guardDialer := netguard.NewDialer(netguard.Options{Store: store})
 	upPort := tcpPort(t, upSrv.Listener.Addr())
 
-	var (
-		raceHTTPConn atomic.Pointer[closeTrackingConn]
-		raceWSConn   atomic.Pointer[closeTrackingConn]
-	)
+	var raceWSConn atomic.Pointer[closeTrackingConn]
 
 	srv, err := proxy.NewServer(proxy.Options{
 		Link:               store.Current().Config.Links[0],
@@ -188,11 +189,9 @@ rules:
 			}
 			switch host {
 			case "race-http.example.com":
-				// Trigger teardown BEFORE DialContext returns (so BEFORE GotConn -> setUpstreamConn!).
-				tc := &closeTrackingConn{Conn: conn}
-				raceHTTPConn.Store(tc)
+				// Trigger teardown during dial: reqCancel() aborts the transport RoundTrip before sending the HTTP request.
 				flows.RevokeByPrincipal("worker-c", "race-http.example.com")
-				return tc, nil
+				return conn, nil
 			case "race-ws.example.com":
 				// Trigger teardown BEFORE DialContext returns (so BEFORE serveWebSocket -> setUpstreamConn!).
 				tc := &closeTrackingConn{Conn: conn}
@@ -282,22 +281,17 @@ rules:
 		t.Fatalf("expected gatewayd_revocations_total 2 after reload teardown, got:\n%s", m)
 	}
 
-	// --- Item 13a: HTTP path teardown racing before setUpstreamConn closes upstream socket immediately ---
+	// --- Item 13a: HTTP path teardown during dial cancels RoundTrip so upstream never receives request ---
 	if r, err := makeClient("race-http.example.com").Get("https://race-http.example.com/ok"); err == nil {
 		if cErr := r.Body.Close(); cErr != nil {
 			t.Logf("close race-http body: %v", cErr)
 		}
+		if r.StatusCode == http.StatusOK {
+			t.Fatal("revoked HTTP request succeeded despite teardown during dial")
+		}
 	}
-	tcHTTP := raceHTTPConn.Load()
-	if tcHTTP == nil {
-		t.Fatal("race-http dial never ran")
-	}
-	deadline := time.Now().Add(time.Second)
-	for !tcHTTP.closed.Load() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !tcHTTP.closed.Load() {
-		t.Fatal("HTTP upstream socket leaked open when teardown raced before setUpstreamConn")
+	if httpRaceHits.Load() != 0 {
+		t.Fatalf("revoked HTTP request reached upstream /ok: hits=%d", httpRaceHits.Load())
 	}
 
 	// --- Item 13b: WebSocket path teardown racing before setUpstreamConn closes upstream socket & never writes ---
@@ -324,7 +318,7 @@ rules:
 	if tcWS == nil {
 		t.Fatal("race-ws dial never ran")
 	}
-	deadline = time.Now().Add(time.Second)
+	deadline := time.Now().Add(time.Second)
 	for !tcWS.closed.Load() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}

@@ -12,7 +12,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/netip"
 	"net/textproto"
 	"path"
@@ -110,19 +109,7 @@ func NewServer(opts Options) (*Server, error) {
 
 	hCfg := opts.Store.Current().Config.HTTP
 	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			c, err := dialFn(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			if af := activeFlowFromContext(ctx); af != nil {
-				af.setUpstreamConn(c)
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-			}
-			return c, nil
-		},
+		DialContext: dialFn,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    opts.UpstreamRoots, // nil uses system roots; never InsecureSkipVerify
@@ -532,13 +519,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	outURL.Scheme = scheme
 	outURL.Host = net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
 
-	flowCtx := withActiveFlow(reqCtx, af)
-	traceCtx := httptrace.WithClientTrace(flowCtx, &httptrace.ClientTrace{
-		GotConn: func(ci httptrace.GotConnInfo) {
-			af.setUpstreamConn(ci.Conn)
-		},
-	})
-	outReq, err := http.NewRequestWithContext(traceCtx, r.Method, outURL.String(), countingBody)
+	outReq, err := http.NewRequestWithContext(reqCtx, r.Method, outURL.String(), countingBody)
 	if err != nil {
 		deny(http.StatusBadGateway, "build-request-failed", dec.RuleID, host, secretNames)
 		return

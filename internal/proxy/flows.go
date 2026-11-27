@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/hex"
 	"net"
 	"strings"
@@ -68,20 +67,11 @@ func (f *activeFlow) teardown() {
 	if f.guestConn != nil {
 		closeQuietly(f.guestConn)
 	}
-	// Never close a shared upstream HTTP/2 connection pooled across other guests/grants:
-	// f.cancel() immediately sends RST_STREAM for this stream while leaving other connections'
-	// streams intact. Exclusive HTTP/1.1 and WebSocket upstream sockets are closed directly.
-	if up != nil && !isSharedH2Conn(up) {
+	// Direct upstream close applies only to WebSockets, where gatewayd owns the raw socket.
+	// Transport-managed HTTP/H2/SSE flows rely on reqCancel() + guestConn.Close().
+	if up != nil {
 		closeQuietly(up)
 	}
-}
-
-func isSharedH2Conn(c net.Conn) bool {
-	tc, ok := c.(*tls.Conn)
-	if !ok {
-		return false
-	}
-	return tc.ConnectionState().NegotiatedProtocol == "h2"
 }
 
 // FlowRegistry tracks every active per-request/per-stream flow independently so
@@ -240,18 +230,4 @@ func guestConnFromContext(ctx context.Context) net.Conn {
 		return nil
 	}
 	return c
-}
-
-type activeFlowCtxKey struct{}
-
-func withActiveFlow(ctx context.Context, af *activeFlow) context.Context {
-	return context.WithValue(ctx, activeFlowCtxKey{}, af)
-}
-
-func activeFlowFromContext(ctx context.Context) *activeFlow {
-	af, ok := ctx.Value(activeFlowCtxKey{}).(*activeFlow)
-	if !ok {
-		return nil
-	}
-	return af
 }
