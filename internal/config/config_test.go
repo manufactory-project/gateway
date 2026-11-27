@@ -21,18 +21,18 @@ func TestMain(m *testing.M) {
 
 const validYAML = `
 ca:
-  cert_path: /etc/gatewayd/ca/ca.crt
-  key_path: /etc/gatewayd/ca/ca.key
+  cert_path: /etc/gateway/ca/ca.crt
+  key_path: /etc/gateway/ca/ca.key
 audit:
-  dir: /var/log/gatewayd/audit
+  dir: /var/log/gateway/audit
 metrics:
   listen: 127.0.0.1:9102
 dataplane:
-  ready_file: /run/gatewayd/dataplane.ready
+  ready_file: /run/gateway/dataplane.ready
   dhcp:
     user: dnsmasq
-    lease_file: /var/lib/gatewayd/dnsmasq.leases
-    config_path: /run/gatewayd/dnsmasq.conf
+    lease_file: /var/lib/gateway/dnsmasq.leases
+    config_path: /run/gateway/dnsmasq.conf
 records:
   forge.internal.example: 10.10.20.5
 links:
@@ -62,7 +62,7 @@ rules:
         header: Authorization
         scheme: basic
         placeholder: mf_ph_forgejo
-        secret_file: /run/credentials/gatewayd/forgejo
+        secret_file: /run/credentials/gateway/forgejo
   - id: codex-ws
     principal: worker-codex
     effect: allow
@@ -153,12 +153,12 @@ func TestConfigValidationInvariants(t *testing.T) {
 		},
 		{
 			name:      "reject duplicate placeholder across bindings",
-			yaml:      validYAML + "\n  - id: dup-ph\n    principal: worker-codex\n    effect: allow\n    hosts: [api.example.com]\n    ports: [443]\n    bindings:\n      - name: b2\n        host: api.example.com\n        header: Authorization\n        scheme: bearer\n        placeholder: mf_ph_forgejo\n        secret_file: /run/credentials/gatewayd/other\n",
+			yaml:      validYAML + "\n  - id: dup-ph\n    principal: worker-codex\n    effect: allow\n    hosts: [api.example.com]\n    ports: [443]\n    bindings:\n      - name: b2\n        host: api.example.com\n        header: Authorization\n        scheme: bearer\n        placeholder: mf_ph_forgejo\n        secret_file: /run/credentials/gateway/other\n",
 			wantError: "duplicate placeholder",
 		},
 		{
 			name:      "reject missing ready_file when Linux link exists",
-			yaml:      strings.Replace(validYAML, "  ready_file: /run/gatewayd/dataplane.ready\n", "", 1),
+			yaml:      strings.Replace(validYAML, "  ready_file: /run/gateway/dataplane.ready\n", "", 1),
 			wantError: "dataplane.ready_file",
 		},
 		{
@@ -186,7 +186,7 @@ func TestConfigValidationInvariants(t *testing.T) {
 
 func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(validYAML), 0o600); err != nil {
 		t.Fatalf("write initial yaml: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 
 func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testing.T) {
 	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(validYAML), 0o600); err != nil {
 		t.Fatalf("write validYAML: %v", err)
 	}
@@ -315,14 +315,14 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		name string
 		yaml string
 	}{
-		{"ca", strings.Replace(validYAML, "/etc/gatewayd/ca/ca.crt", "/etc/gatewayd/ca/new.crt", 1)},
-		{"audit", strings.Replace(validYAML, "/var/log/gatewayd/audit", "/var/log/gatewayd/audit2", 1)},
-		{"admin", validYAML + "\nadmin:\n  socket: /run/gatewayd/other.sock\n"},
+		{"ca", strings.Replace(validYAML, "/etc/gateway/ca/ca.crt", "/etc/gateway/ca/new.crt", 1)},
+		{"audit", strings.Replace(validYAML, "/var/log/gateway/audit", "/var/log/gateway/audit2", 1)},
+		{"admin", validYAML + "\nadmin:\n  socket: /run/gateway/other.sock\n"},
 		{"metrics", strings.Replace(validYAML, "127.0.0.1:9102", "127.0.0.1:9103", 1)},
 		{"fake_cidr", validYAML + "\ndns:\n  fake_cidr: 198.19.0.0/16\n"},
 		{"links_gateway_ip", strings.Replace(validYAML, "gateway_ip: 10.200.0.1", "gateway_ip: 10.200.0.2", 1)},
 		{"principals", strings.ReplaceAll(validYAML, "worker-codex", "worker-renamed")},
-		{"dataplane_ready_file", strings.Replace(validYAML, "/run/gatewayd/dataplane.ready", "/run/gatewayd/other.ready", 1)},
+		{"dataplane_ready_file", strings.Replace(validYAML, "/run/gateway/dataplane.ready", "/run/gateway/other.ready", 1)},
 		{"dataplane_dhcp", strings.Replace(validYAML, "user: dnsmasq", "user: nobody", 1)},
 		{"dataplane_verify_sysctls", strings.Replace(validYAML, "dataplane:\n", "dataplane:\n  verify_sysctls: false\n", 1)},
 		{"http_max_header_bytes", validYAML + "\nhttp:\n  max_header_bytes: 65536\n"},

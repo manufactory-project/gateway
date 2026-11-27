@@ -483,7 +483,7 @@ func checkUnreachableService(ctx context.Context, name, addr string, timeout tim
 }
 
 func checkUnreachableHTTP(ctx context.Context, name, addr, hostHeader string, timeout time.Duration) Result {
-	const expect = "unreachable (timeout or gatewayd 403)"
+	const expect = "unreachable (timeout or gateway 403)"
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp4", addr)
 	if err != nil {
@@ -492,7 +492,7 @@ func checkUnreachableHTTP(ctx context.Context, name, addr, hostHeader string, ti
 	}
 	defer closeQuietly(conn)
 
-	// Port 80 is DNATed to gatewayd, which must refuse IP-literal Host with 403.
+	// Port 80 is DNATed to gateway, which must refuse IP-literal Host with 403.
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return Result{Check: name, Expect: expect, Got: fmt.Sprintf("set deadline: %v", err), Pass: false}
 	}
@@ -694,7 +694,7 @@ func rawHTTPSGet(
 	if hold > 0 {
 		connHdr = "keep-alive"
 	}
-	reqLine := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: gatewayd-probe\r\nConnection: %s\r\n\r\n", path, hostHeader, connHdr)
+	reqLine := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: gateway-probe\r\nConnection: %s\r\n\r\n", path, hostHeader, connHdr)
 	if _, err := io.WriteString(tlsConn, reqLine); err != nil {
 		return 0, err
 	}

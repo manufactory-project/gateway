@@ -161,7 +161,7 @@ func TestDialerConnectTimeSSRFRebindingAndRecordsPin(t *testing.T) {
 	}
 	port := uint16(tcpAddr.Port)
 
-	cfgPath := filepath.Join(t.TempDir(), "gatewayd.yaml")
+	cfgPath := filepath.Join(t.TempDir(), "gateway.yaml")
 	cfgYAML := `
 ca:
   cert_path: /tmp/ca.crt

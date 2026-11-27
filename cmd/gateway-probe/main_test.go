@@ -640,7 +640,7 @@ func TestBypassPort80Returns200(t *testing.T) {
 		t.Fatalf("expected Got == HTTP 200, got %q", res.Got)
 	}
 
-	// Positive control: a mock returning gatewayd's 403 passes.
+	// Positive control: a mock returning gateway's 403 passes.
 	denyLn, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen deny tcp: %v", err)
@@ -665,7 +665,7 @@ func TestBypassPort80Returns200(t *testing.T) {
 
 	okRes := checkUnreachableHTTP(context.Background(), "unreachable_metadata", denyLn.Addr().String(), "169.254.169.254", 2*time.Second)
 	if !okRes.Pass {
-		t.Fatalf("expected gatewayd 403 to PASS port-80 unreachable check, got: %+v", okRes)
+		t.Fatalf("expected gateway 403 to PASS port-80 unreachable check, got: %+v", okRes)
 	}
 }
 

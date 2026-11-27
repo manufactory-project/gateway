@@ -21,29 +21,29 @@ func TestMain(m *testing.M) {
 
 func loadExampleConfig(t *testing.T) *config.Config {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "examples", "gatewayd.yaml"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "examples", "gateway.yaml"))
 	if err != nil {
-		t.Fatalf("read examples/gatewayd.yaml: %v", err)
+		t.Fatalf("read examples/gateway.yaml: %v", err)
 	}
 	// Example config must use <forge-ip> placeholder and never hardcode a literal IPv4 in records:.
 	if !strings.Contains(string(raw), "<forge-ip>") {
-		t.Fatal("examples/gatewayd.yaml must contain <forge-ip> placeholder")
+		t.Fatal("examples/gateway.yaml must contain <forge-ip> placeholder")
 	}
 	var doc struct {
 		Records map[string]string `yaml:"records"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("unmarshal records from examples/gatewayd.yaml: %v", err)
+		t.Fatalf("unmarshal records from examples/gateway.yaml: %v", err)
 	}
 	for host, val := range doc.Records {
 		if addr, err := netip.ParseAddr(strings.TrimSpace(val)); err == nil && addr.Is4() {
-			t.Fatalf("examples/gatewayd.yaml records[%q] must not contain literal IPv4 address %q", host, val)
+			t.Fatalf("examples/gateway.yaml records[%q] must not contain literal IPv4 address %q", host, val)
 		}
 	}
 	replaced := strings.ReplaceAll(string(raw), "<forge-ip>", "10.10.20.5")
 	cfg, err := config.Parse([]byte(replaced))
 	if err != nil {
-		t.Fatalf("parse examples/gatewayd.yaml with sample IP: %v", err)
+		t.Fatalf("parse examples/gateway.yaml with sample IP: %v", err)
 	}
 	return cfg
 }
@@ -66,7 +66,7 @@ func TestRenderNftablesInvariants(t *testing.T) {
 		`iifname @sandbox_ifs meta nfproto ipv6 drop`,
 		`iifname "sbx0" fib daddr type local ip daddr 10.200.0.1 udp dport { 53, 67 } accept`,
 		`iifname @sandbox_ifs fib daddr type local drop`,
-		// All guest :53 (any destination IP) must be DNATed to gatewayd's DNS.
+		// All guest :53 (any destination IP) must be DNATed to gateway's DNS.
 		`iifname "sbx0" udp dport 53 dnat ip to 10.200.0.1:10053`,
 		`iifname "sbx0" tcp dport 53 dnat ip to 10.200.0.1:10053`,
 		`iifname "sbx0" tcp dport 443 dnat ip to 10.200.0.1:10443`,
@@ -151,7 +151,7 @@ func TestIPCommandsAndSysctlsAndDnsmasq(t *testing.T) {
 		"\nno-ping\n",
 		"\nbind-interfaces\n",
 		"\nuser=dnsmasq\n",
-		"\ndhcp-leasefile=/var/lib/gatewayd/dnsmasq.leases\n",
+		"\ndhcp-leasefile=/var/lib/gateway/dnsmasq.leases\n",
 		"\ninterface=sbx0\n",
 		"\ndhcp-range=interface:sbx0,10.200.0.2,10.200.0.14,255.255.255.240,12h\n",
 		"\ndhcp-option=interface:sbx0,option:router,10.200.0.1\n",

@@ -54,7 +54,7 @@ rules:
     hosts: [api.anthropic.com]
     ports: [443]
 `, auditDir, dnsPort)
-	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
 		b.Fatalf("write config: %v", err)
 	}

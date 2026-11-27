@@ -1,9 +1,8 @@
 # Binaries and build outputs
 /bin/
 /dist/
-/gatewayd
-/gwctl
-/gatewayd-probe
+/gateway
+/gateway-probe
 *.test
 *.out
 coverage.*

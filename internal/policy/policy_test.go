@@ -18,7 +18,7 @@ func TestMain(m *testing.M) {
 
 func makeStore(t *testing.T, yamlBody string, nowFn func() time.Time) *config.Store {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "gatewayd.yaml")
+	p := filepath.Join(t.TempDir(), "gateway.yaml")
 	if err := os.WriteFile(p, []byte(yamlBody), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

@@ -189,7 +189,7 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		}
 	}
 	baseYAML := sb.String()
-	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(baseYAML), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

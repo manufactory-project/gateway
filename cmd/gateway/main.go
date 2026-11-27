@@ -21,7 +21,7 @@ import (
 	"github.com/manufactory-project/gateway/internal/netsetup"
 )
 
-const defaultSocket = "/run/gatewayd/admin.sock"
+const defaultSocket = "/run/gateway/admin.sock"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {

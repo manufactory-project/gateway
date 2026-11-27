@@ -1,6 +1,6 @@
-# `gatewayd` Threat Model (v0.1)
+# `gateway` Threat Model (v0.1)
 
-`gatewayd` treats every connected guest as hostile. A guest may be steered by prompt injection,
+`gateway` treats every connected guest as hostile. A guest may be steered by prompt injection,
 untrusted repository content, or malicious code it executes, up to and including root inside the
 guest. Containment does not depend on guest cooperation, agent discipline, or in-guest sandboxing;
 the locked plain-Go wire suite is the living verification inventory.
@@ -20,7 +20,7 @@ the locked plain-Go wire suite is the living verification inventory.
 2. **Keep declared secrets out of the guest.**
    Declared API keys and credentials stay behind the host/gateway-container filesystem boundary
    through a `file`-only secret provider. Guests hold only inert `mf_ph_*` placeholders for
-   declared secrets. `gatewayd` substitutes a secret only into the exact `(host, header, scheme)`
+   declared secrets. `gateway` substitutes a secret only into the exact `(host, header, scheme)`
    declared by a Binding, unconditionally strips `Proxy-Authorization` and any remaining `mf_ph_*`
    (including decoded Basic Auth) from every outbound request, forces `Accept-Encoding: identity`
    on bound hosts (failing closed `502` on compressed responses), and scrubs literal, URL-encoded,
@@ -31,7 +31,7 @@ the locked plain-Go wire suite is the living verification inventory.
    Every DNS query and HTTP request is evaluated against an explicit default-deny allowlist per link
    principal and written to a fail-closed structured JSONL audit log (paths only or query strings
    redacted; never header values). Active flows are tracked per request/stream and torn down
-   immediately (`cancel()` + `conn.Close()`) on `gwctl revoke`, TTL expiry, or `SIGHUP` rule/grant
+   immediately (`cancel()` + `conn.Close()`) on `gateway revoke`, TTL expiry, or `SIGHUP` rule/grant
    removal.
 
 ## Accepted Residuals (By Design)
@@ -57,30 +57,30 @@ the locked plain-Go wire suite is the living verification inventory.
   unconditionally alongside denied HTTP requests and DNS queries; disk usage from denial floods is
   bounded by audit segment rotation (`audit.max_file_bytes`) and retention pruning
   (`audit.retain_days`).
-- **DNS label leakage under wildcard rules:** Because `gatewayd` resolves allowlisted hostnames
+- **DNS label leakage under wildcard rules:** Because `gateway` resolves allowlisted hostnames
   upstream when dialing, wildcard allow rules (`*.example.com`) let a guest leak guest-chosen
-  labels to that zone's authoritative DNS servers via `gatewayd`'s upstream resolver. Prefer
+  labels to that zone's authoritative DNS servers via `gateway`'s upstream resolver. Prefer
   exact-host rules wherever possible (mandatory for multi-product subscription vendor domains).
-- **Globally routed host and LAN addresses:** `gatewayd`'s connect-time guard denies loopback,
+- **Globally routed host and LAN addresses:** `gateway`'s connect-time guard denies loopback,
   link-local, RFC 1918, CGNAT, and IANA special-purpose ranges, and restricts IPv6 to global unicast
-  `2000::/3` minus special ranges. Inside a gateway container, `gatewayd` cannot distinguish
+  `2000::/3` minus special ranges. Inside a gateway container, `gateway` cannot distinguish
   globally routed host or LAN unicast IPv4/IPv6 addresses from ordinary internet destinations by
   prefix alone, so an allowlisted domain resolving to such an address is reachable.
 - **CA private key at rest:** The operator-supplied `ca_cert` is the trust anchor every guest
   accepts for any hostname, and `ca_key` is the private key that signs leaf certificates under it.
   `ca_key` sits behind the host/gateway-container filesystem boundary; anyone holding `ca_key` plus
-  a network position between a guest and `gatewayd` can impersonate any TLS server to guests.
-  `gatewayd` always verifies upstream TLS certificates against system roots, so `ca_key` alone
+  a network position between a guest and `gateway` can impersonate any TLS server to guests.
+  `gateway` always verifies upstream TLS certificates against system roots, so `ca_key` alone
   confers no upstream interception. Because the CA carries no name constraints, guests cannot scope
-  what they trust `gatewayd` to intercept.
+  what they trust `gateway` to intercept.
 
 ## Policy Precedence & Reload Semantics
 
 - **Rule precedence:** Evaluation is most-specific-first: host (exact before wildcard, longer
   wildcard suffix before shorter), then path, then method; `deny` wins only on an exact rank tie.
   A narrower `allow` or a path-scoped ephemeral grant outranks a host-wide `deny`. The emergency
-  stop for any live session is `gwctl revoke` or removing the matching `allow` rule and reloading.
-- **Live reload semantics:** On `SIGHUP` or `gwctl reload`, all ephemeral grants are wiped, active
+  stop for any live session is `gateway revoke` or removing the matching `allow` rule and reloading.
+- **Live reload semantics:** On `SIGHUP` or `gateway reload`, all ephemeral grants are wiped, active
   flows that are no longer allowed (by host, port, method, or path) are torn down immediately via
   `cancel()` + `conn.Close()`, and open WebSockets are torn down if a `Binding` is added to their
   host. Changes to `ws_max_egress_bytes`, `records`, or `bindings` otherwise apply only to new

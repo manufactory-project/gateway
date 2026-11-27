@@ -129,7 +129,7 @@ func TestAdminSocketPermissionsAndRoutes(t *testing.T) {
 	dir := t.TempDir()
 	auditDir := filepath.Join(dir, "audit")
 	sockPath := filepath.Join(dir, "admin.sock")
-	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	cfgPath := filepath.Join(dir, "gateway.yaml")
 
 	cfgYAML := fmt.Sprintf(`
 ca:
@@ -355,7 +355,7 @@ rules:
     ports: [443]
 `, mitmCert, mitmKey, auditDir, sockPath, metricsPort, httpsPort, httpPort, dnsPort)
 
-	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -664,9 +664,9 @@ rules:
 	}
 	mText := string(mBody)
 	for _, want := range []string{
-		"gatewayd_requests_total",
-		`gatewayd_reloads_total{result="ok"}`,
-		"gatewayd_active_flows",
+		"gateway_requests_total",
+		`gateway_reloads_total{result="ok"}`,
+		"gateway_active_flows",
 	} {
 		if !strings.Contains(mText, want) {
 			t.Errorf("/metrics missing %q\n%s", want, mText)

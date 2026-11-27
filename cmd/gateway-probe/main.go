@@ -1,5 +1,5 @@
-// Command gatewayd-probe is a static, stdlib-only guest probe that verifies
-// gatewayd and Linux nftables containment with positive controls and emits
+// Command gateway-probe is a static, stdlib-only guest probe that verifies
+// gateway and Linux nftables containment with positive controls and emits
 // one JSON line per check ({check, expect, got, pass}).
 package main
 
@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		if _, wErr := fmt.Fprintf(os.Stderr, "gatewayd-probe: %v\n", err); wErr != nil {
+		if _, wErr := fmt.Fprintf(os.Stderr, "gateway-probe: %v\n", err); wErr != nil {
 			os.Exit(1)
 		}
 		os.Exit(1)
@@ -35,7 +35,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func parseFlags(args []string, stderr io.Writer) (probeConfig, error) {
-	fs := flag.NewFlagSet("gatewayd-probe", flag.ContinueOnError)
+	fs := flag.NewFlagSet("gateway-probe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
 	var cfg probeConfig

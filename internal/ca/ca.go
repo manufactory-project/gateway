@@ -1,5 +1,5 @@
 // Package ca loads operator-supplied MITM CA keypairs, initializes new CAs for
-// `gwctl ca init`, and mints/caches per-SNI ECDSA P-256 leaf certificates using
+// `gateway ca init`, and mints/caches per-SNI ECDSA P-256 leaf certificates using
 // RWMutex + singleflight so no lock is ever held during keygen or signing.
 package ca
 
@@ -68,7 +68,7 @@ func Init(certPath, keyPath string) (CA, error) {
 	now := time.Now().UTC()
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "gatewayd MITM CA"},
+		Subject:               pkix.Name{CommonName: "gateway MITM CA"},
 		NotBefore:             now.Add(-caNotBeforeSkew),
 		NotAfter:              now.Add(caValidity),
 		IsCA:                  true,

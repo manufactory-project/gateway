@@ -59,7 +59,7 @@ func TestGatewayNetsetupDryRunAndStartupGuards(t *testing.T) {
 	dir := t.TempDir()
 
 	// 1. `gateway netsetup --dry-run` against example config (with sample IP).
-	rawEx, err := os.ReadFile(filepath.Join("..", "..", "examples", "gatewayd.yaml"))
+	rawEx, err := os.ReadFile(filepath.Join("..", "..", "examples", "gateway.yaml"))
 	if err != nil {
 		t.Fatalf("read example config: %v", err)
 	}
@@ -205,7 +205,7 @@ rules:
     hosts: [api.anthropic.com]
     ports: [443]
 `, certPath, keyPath, auditDir)
-	cfgPath := filepath.Join(dir, "gatewayd.yaml")
+	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Real Incus E2E harness for gatewayd (Phase 3 / Step 2).
+# Real Incus E2E harness for gateway (Phase 3 / Step 2).
 # Runs against a throwaway Incus project whose name is passed in via --project.
 # Refuses an existing project, prints exact Incus commands and asks for
 # confirmation before creating anything, and destroys the project on exit
@@ -240,9 +240,8 @@ g1_exec() {
 echo "==> Building static Linux binaries"
 (
   cd "$REPO_ROOT"
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$TMPDIR_WORK/gatewayd" ./cmd/gatewayd
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$TMPDIR_WORK/gwctl" ./cmd/gwctl
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$TMPDIR_WORK/gatewayd-probe" ./cmd/gatewayd-probe
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$TMPDIR_WORK/gateway" ./cmd/gateway
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$TMPDIR_WORK/gateway-probe" ./cmd/gateway-probe
 )
 
 echo "==> Creating throwaway Incus project, networks, and containers"
@@ -294,35 +293,34 @@ gw_exec bash -ceu '
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq nftables dnsmasq-base conntrack iproute2 jq ca-certificates curl sudo >/dev/null
-  getent group gatewayd >/dev/null 2>&1 || groupadd --system gatewayd
-  id -u gatewayd >/dev/null 2>&1 || useradd --system --gid gatewayd --no-create-home --shell /usr/sbin/nologin gatewayd
+  getent group gateway >/dev/null 2>&1 || groupadd --system gateway
+  id -u gateway >/dev/null 2>&1 || useradd --system --gid gateway --no-create-home --shell /usr/sbin/nologin gateway
   id -u dnsmasq  >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin dnsmasq
-  install -d -o root -g gatewayd -m 0750 /etc/gatewayd /etc/gatewayd/ca
-  install -d -o dnsmasq -g "$(id -gn dnsmasq)" -m 0750 /var/lib/gatewayd
+  install -d -o root -g gateway -m 0750 /etc/gateway /etc/gateway/ca
+  install -d -o dnsmasq -g "$(id -gn dnsmasq)" -m 0750 /var/lib/gateway
 '
 
-sed "s|httpbingo\.org|${UPSTREAM_HOST}|g" "$REPO_ROOT/examples/two-links.yaml" > "$TMPDIR_WORK/gatewayd.yaml"
+sed "s|httpbingo\.org|${UPSTREAM_HOST}|g" "$REPO_ROOT/examples/two-links.yaml" > "$TMPDIR_WORK/gateway.yaml"
 
-incus file push "$TMPDIR_WORK/gatewayd" "${GW_INST}/usr/local/bin/gatewayd" --project "$PROJECT" --mode 0755
-incus file push "$TMPDIR_WORK/gwctl" "${GW_INST}/usr/local/bin/gwctl" --project "$PROJECT" --mode 0755
-incus file push "$TMPDIR_WORK/gatewayd.yaml" "${GW_INST}/etc/gatewayd/gatewayd.yaml" --project "$PROJECT" --mode 0640
-incus file push "$REPO_ROOT/deploy/gatewayd.service" "${GW_INST}/etc/systemd/system/gatewayd.service" --project "$PROJECT" --mode 0644
-incus file push "$REPO_ROOT/deploy/gatewayd-dhcp.service" "${GW_INST}/etc/systemd/system/gatewayd-dhcp.service" --project "$PROJECT" --mode 0644
+incus file push "$TMPDIR_WORK/gateway" "${GW_INST}/usr/local/bin/gateway" --project "$PROJECT" --mode 0755
+incus file push "$TMPDIR_WORK/gateway.yaml" "${GW_INST}/etc/gateway/gateway.yaml" --project "$PROJECT" --mode 0640
+incus file push "$REPO_ROOT/deploy/gateway.service" "${GW_INST}/etc/systemd/system/gateway.service" --project "$PROJECT" --mode 0644
+incus file push "$REPO_ROOT/deploy/gateway-dhcp.service" "${GW_INST}/etc/systemd/system/gateway-dhcp.service" --project "$PROJECT" --mode 0644
 
 gw_exec bash -ceu '
-  chown root:gatewayd /etc/gatewayd/gatewayd.yaml
-  /usr/local/bin/gwctl ca init --cert /etc/gatewayd/ca/ca.crt --key /etc/gatewayd/ca/ca.key
-  chown root:gatewayd /etc/gatewayd/ca/ca.crt /etc/gatewayd/ca/ca.key
-  chmod 0644 /etc/gatewayd/ca/ca.crt
-  chmod 0640 /etc/gatewayd/ca/ca.key
+  chown root:gateway /etc/gateway/gateway.yaml
+  /usr/local/bin/gateway ca init --cert /etc/gateway/ca/ca.crt --key /etc/gateway/ca/ca.key
+  chown root:gateway /etc/gateway/ca/ca.crt /etc/gateway/ca/ca.key
+  chmod 0644 /etc/gateway/ca/ca.crt
+  chmod 0640 /etc/gateway/ca/ca.key
   systemctl daemon-reload
 '
 
-incus file pull "${GW_INST}/etc/gatewayd/ca/ca.crt" "$TMPDIR_WORK/ca.crt" --project "$PROJECT"
+incus file pull "${GW_INST}/etc/gateway/ca/ca.crt" "$TMPDIR_WORK/ca.crt" --project "$PROJECT"
 
 for ginst in "$G0_INST" "$G1_INST"; do
-  incus file push "$TMPDIR_WORK/gatewayd-probe" "${ginst}/usr/local/bin/gatewayd-probe" --project "$PROJECT" --mode 0755
-  incus file push "$TMPDIR_WORK/ca.crt" "${ginst}/usr/local/share/ca-certificates/gatewayd-mitm.crt" --project "$PROJECT" --mode 0644
+  incus file push "$TMPDIR_WORK/gateway-probe" "${ginst}/usr/local/bin/gateway-probe" --project "$PROJECT" --mode 0755
+  incus file push "$TMPDIR_WORK/ca.crt" "${ginst}/usr/local/share/ca-certificates/gateway-mitm.crt" --project "$PROJECT" --mode 0644
   incus exec "$ginst" --project "$PROJECT" -- update-ca-certificates >/dev/null
 done
 
@@ -333,40 +331,40 @@ if [[ -z "$LAN_ADDR" ]]; then
 fi
 echo "    gw mgmt IP: ${GW_MGMT_IP}, LAN test target: ${LAN_ADDR}"
 
-start_gatewayd_service() {
-  if ! gw_exec systemctl start gatewayd.service; then
+start_gateway_service() {
+  if ! gw_exec systemctl start gateway.service; then
     gw_exec bash -ceu '
-      status="$(systemctl show -p ExecMainStatus --value gatewayd.service || true)"
-      result="$(systemctl show -p Result --value gatewayd.service || true)"
-      journal="$(journalctl -u gatewayd.service -n 40 --no-pager || true)"
+      status="$(systemctl show -p ExecMainStatus --value gateway.service || true)"
+      result="$(systemctl show -p Result --value gateway.service || true)"
+      journal="$(journalctl -u gateway.service -n 40 --no-pager || true)"
       if [[ "$status" == "226" ]] || echo "$journal" | grep -q "226/NAMESPACE"; then
-        echo "FAIL: gatewayd.service failed with status=226/NAMESPACE (result=${result})" >&2
-        echo "--- journalctl -u gatewayd.service ---" >&2
+        echo "FAIL: gateway.service failed with status=226/NAMESPACE (result=${result})" >&2
+        echo "--- journalctl -u gateway.service ---" >&2
         echo "$journal" >&2
         echo "--- systemd-resolved state in gateway container ---" >&2
         systemctl is-active systemd-resolved 2>&1 || true
         exit 1
       fi
-      echo "FAIL: gatewayd.service failed to start (ExecMainStatus=${status}, Result=${result})" >&2
+      echo "FAIL: gateway.service failed to start (ExecMainStatus=${status}, Result=${result})" >&2
       echo "$journal" >&2
       exit 1
     '
     exit 1
   fi
   sleep 1
-  if ! gw_exec systemctl is-active --quiet gatewayd.service; then
+  if ! gw_exec systemctl is-active --quiet gateway.service; then
     gw_exec bash -ceu '
-      status="$(systemctl show -p ExecMainStatus --value gatewayd.service || true)"
-      journal="$(journalctl -u gatewayd.service -n 40 --no-pager || true)"
+      status="$(systemctl show -p ExecMainStatus --value gateway.service || true)"
+      journal="$(journalctl -u gateway.service -n 40 --no-pager || true)"
       if [[ "$status" == "226" ]] || echo "$journal" | grep -q "226/NAMESPACE"; then
-        echo "FAIL: gatewayd.service exited with status=226/NAMESPACE" >&2
-        echo "--- journalctl -u gatewayd.service ---" >&2
+        echo "FAIL: gateway.service exited with status=226/NAMESPACE" >&2
+        echo "--- journalctl -u gateway.service ---" >&2
         echo "$journal" >&2
         echo "--- systemd-resolved state in gateway container ---" >&2
         systemctl is-active systemd-resolved 2>&1 || true
         exit 1
       fi
-      echo "FAIL: gatewayd.service is not active (ExecMainStatus=${status})" >&2
+      echo "FAIL: gateway.service is not active (ExecMainStatus=${status})" >&2
       echo "$journal" >&2
       exit 1
     '
@@ -377,89 +375,89 @@ start_gatewayd_service() {
 echo "==> Step 2.1: Fail-closed startup"
 gw_exec bash -ceu '
   nft delete table inet gw 2>/dev/null || true
-  rm -f /run/gatewayd/dataplane.ready
+  rm -f /run/gateway/dataplane.ready
 '
 gw_exec bash -eu <<'EOF'
   set +e
-  timeout 5s sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/tmp/fc-sysctl.out 2>/tmp/fc-sysctl.err
+  timeout 5s sudo -u gateway /usr/local/bin/gateway run --config /etc/gateway/gateway.yaml >/tmp/fc-sysctl.out 2>/tmp/fc-sysctl.err
   rc=$?
   set -e
   err_msg="$(cat /tmp/fc-sysctl.err)"
   rm -f /tmp/fc-sysctl.out /tmp/fc-sysctl.err
   if [[ "$rc" -eq 0 ]]; then
-    echo "FAIL: gatewayd exited 0 with unconfigured sysctls" >&2
+    echo "FAIL: gateway exited 0 with unconfigured sysctls" >&2
     exit 1
   fi
   if [[ "$rc" -eq 124 ]]; then
-    echo "FAIL: gatewayd stayed running (timeout 5s) with unconfigured sysctls" >&2
+    echo "FAIL: gateway stayed running (timeout 5s) with unconfigured sysctls" >&2
     exit 1
   fi
   if ! echo "$err_msg" | grep -q "sysctl"; then
     echo "FAIL: expected sysctl error on stderr, got: ${err_msg}" >&2
     exit 1
   fi
-  echo "    PASS (sysctl): gatewayd exited non-zero (rc=${rc}): ${err_msg}"
+  echo "    PASS (sysctl): gateway exited non-zero (rc=${rc}): ${err_msg}"
 EOF
 
 gw_exec bash -eu <<'EOF'
-  /usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml
+  /usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml
   nft delete table inet gw
-  rm -f /run/gatewayd/dataplane.ready
+  rm -f /run/gateway/dataplane.ready
   set +e
-  timeout 5s sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/tmp/fc-ready.out 2>/tmp/fc-ready.err
+  timeout 5s sudo -u gateway /usr/local/bin/gateway run --config /etc/gateway/gateway.yaml >/tmp/fc-ready.out 2>/tmp/fc-ready.err
   rc=$?
   set -e
   err_msg="$(cat /tmp/fc-ready.err)"
   rm -f /tmp/fc-ready.out /tmp/fc-ready.err
   if [[ "$rc" -eq 0 ]]; then
-    echo "FAIL: gatewayd exited 0 without table inet gw or ready_file (valid sysctls)" >&2
+    echo "FAIL: gateway exited 0 without table inet gw or ready_file (valid sysctls)" >&2
     exit 1
   fi
   if [[ "$rc" -eq 124 ]]; then
-    echo "FAIL: gatewayd stayed running (timeout 5s) without table inet gw or ready_file (valid sysctls)" >&2
+    echo "FAIL: gateway stayed running (timeout 5s) without table inet gw or ready_file (valid sysctls)" >&2
     exit 1
   fi
   if ! echo "$err_msg" | grep -q "ready_file"; then
     echo "FAIL: expected ready_file error on stderr, got: ${err_msg}" >&2
     exit 1
   fi
-  echo "    PASS (ready_file): gatewayd exited non-zero (rc=${rc}): ${err_msg}"
+  echo "    PASS (ready_file): gateway exited non-zero (rc=${rc}): ${err_msg}"
 EOF
 
-start_gatewayd_service
+start_gateway_service
 
 echo "    Deleting table inet gw while keeping ready_file..."
 gw_exec nft delete table inet gw
-if gw_exec /usr/local/bin/gwctl dataplane check --config /etc/gatewayd/gatewayd.yaml >/dev/null 2>&1; then
-  echo "FAIL: gwctl dataplane check passed after deleting table inet gw" >&2
+if gw_exec /usr/local/bin/gateway dataplane check --config /etc/gateway/gateway.yaml >/dev/null 2>&1; then
+  echo "FAIL: gateway dataplane check passed after deleting table inet gw" >&2
   exit 1
 fi
-echo "    PASS: gwctl dataplane check failed without table inet gw"
+echo "    PASS: gateway dataplane check failed without table inet gw"
 
-echo "    Recording direct gatewayd start with stale ready_file (without netsetup)..."
+echo "    Recording direct gateway start with stale ready_file (without netsetup)..."
 gw_exec bash -ceu '
-  cp /run/gatewayd/dataplane.ready /tmp/stale.ready
-  systemctl stop gatewayd.service
-  install -d -o gatewayd -g gatewayd -m 0755 /run/gatewayd
-  mv /tmp/stale.ready /run/gatewayd/dataplane.ready
+  cp /run/gateway/dataplane.ready /tmp/stale.ready
+  systemctl stop gateway.service
+  install -d -o gateway -g gateway -m 0755 /run/gateway
+  mv /tmp/stale.ready /run/gateway/dataplane.ready
   set +e
-  timeout 2s sudo -u gatewayd /usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml >/tmp/stale-start.out 2>/tmp/stale-start.err
+  timeout 2s sudo -u gateway /usr/local/bin/gateway run --config /etc/gateway/gateway.yaml >/tmp/stale-start.out 2>/tmp/stale-start.err
   rc=$?
   echo "    stale-ready-file direct start exit code: $rc (124 = stayed running until timeout)"
   head -n 5 /tmp/stale-start.err || true
-  rm -f /run/gatewayd/dataplane.ready /tmp/stale-start.out /tmp/stale-start.err
+  rm -f /run/gateway/dataplane.ready /tmp/stale-start.out /tmp/stale-start.err
 '
 
-echo "==> Starting gatewayd.service and gatewayd-dhcp.service"
-start_gatewayd_service
-gw_exec systemctl start gatewayd-dhcp.service
+echo "==> Starting gateway.service and gateway-dhcp.service"
+start_gateway_service
+gw_exec systemctl start gateway-dhcp.service
 sleep 1
-gw_exec systemctl is-active --quiet gatewayd.service
-gw_exec systemctl is-active --quiet gatewayd-dhcp.service
+gw_exec systemctl is-active --quiet gateway.service
+gw_exec systemctl is-active --quiet gateway-dhcp.service
 
 echo "==> Step 2.2: Data plane and privileges"
 gw_exec nft list table inet gw >/dev/null
-gw_exec /usr/local/bin/gwctl dataplane check --config /etc/gatewayd/gatewayd.yaml
+gw_exec /usr/local/bin/gateway dataplane check --config /etc/gateway/gateway.yaml
 
 gw_exec bash -eu <<'EOF'
   check_sysctl() {
@@ -479,25 +477,25 @@ gw_exec bash -eu <<'EOF'
     check_sysctl "net.ipv6.conf.${iface}.disable_ipv6" 1
   done
 
-  gw_pid="$(systemctl show -p MainPID --value gatewayd.service)"
+  gw_pid="$(systemctl show -p MainPID --value gateway.service)"
   grep -E "^(Uid|CapEff|CapPrm|CapAmb):" "/proc/${gw_pid}/status"
   uid="$(awk '/^Uid:/{print $2}' "/proc/${gw_pid}/status")"
-  [[ "$uid" != "0" ]] || { echo "FAIL: gatewayd running as root" >&2; exit 1; }
+  [[ "$uid" != "0" ]] || { echo "FAIL: gateway running as root" >&2; exit 1; }
   for cap in CapEff CapPrm CapAmb; do
     val="$(awk -v c="${cap}:" '$1==c{print $2}' "/proc/${gw_pid}/status")"
-    [[ "$val" == "0000000000000000" ]] || { echo "FAIL: gatewayd ${cap}=${val}" >&2; exit 1; }
+    [[ "$val" == "0000000000000000" ]] || { echo "FAIL: gateway ${cap}=${val}" >&2; exit 1; }
   done
 
   ss_out="$(ss -ltnup)"
   echo "$ss_out"
   echo "$ss_out" | awk '
-    /"gatewayd"/ {
+    /"gateway"/ {
       gw_count++
       addr = $5
       sub(/:[^:]+$/, "", addr)
       sub(/%.*$/, "", addr)
       if (addr == "0.0.0.0" || addr == "*" || addr == "[::]" || addr == "::") {
-        printf "FAIL: gatewayd has wildcard local address: %s\n", $0 > "/dev/stderr"
+        printf "FAIL: gateway has wildcard local address: %s\n", $0 > "/dev/stderr"
         bad = 1
       }
     }
@@ -514,7 +512,7 @@ gw_exec bash -eu <<'EOF'
     }
     END {
       if (gw_count < 1) {
-        print "FAIL: gatewayd has zero listeners in ss -ltnup" > "/dev/stderr"
+        print "FAIL: gateway has zero listeners in ss -ltnup" > "/dev/stderr"
         bad = 1
       }
       if (dm_count < 1) {
@@ -608,7 +606,7 @@ echo "    guest1: ip=${G1_IP} gw=${G1_GW}"
 [[ "$G1_GW" == "10.200.0.17" ]] || { echo "FAIL: guest1 gw=${G1_GW} want 10.200.0.17" >&2; exit 1; }
 
 gw_exec bash -ceu '
-  dm_pid="$(systemctl show -p MainPID --value gatewayd-dhcp.service)"
+  dm_pid="$(systemctl show -p MainPID --value gateway-dhcp.service)"
   grep -E "^(Uid|CapEff|CapPrm):" "/proc/${dm_pid}/status"
   uid="$(awk "/^Uid:/{print \$2}" "/proc/${dm_pid}/status")"
   [[ "$uid" != "0" ]] || { echo "FAIL: dnsmasq running as root" >&2; exit 1; }
@@ -619,7 +617,7 @@ gw_exec bash -ceu '
 '
 
 run_probe_guest0() {
-  g0_exec /usr/local/bin/gatewayd-probe \
+  g0_exec /usr/local/bin/gateway-probe \
     --allow-host "$UPSTREAM_HOST" \
     --link-ip 10.200.0.1 \
     --https-port 10443 \
@@ -630,7 +628,7 @@ run_probe_guest0() {
 }
 
 run_probe_guest1() {
-  g1_exec /usr/local/bin/gatewayd-probe \
+  g1_exec /usr/local/bin/gateway-probe \
     --allow-host "$UPSTREAM_HOST" \
     --link-ip 10.200.0.17 \
     --https-port 10443 \
@@ -664,7 +662,7 @@ start_guest_peer_listener() {
 }
 
 # Run a guest probe, re-running up to 3 times ONLY if every failing check is in
-# the public-upstream set AND gatewayd's audit proves gatewayd forwarded the
+# the public-upstream set AND gateway's audit proves gateway forwarded the
 # request and the upstream returned 4xx/5xx. Containment failures never retry.
 run_probe_with_upstream_retry() {
   local principal="$1"
@@ -676,7 +674,7 @@ run_probe_with_upstream_retry() {
   while true; do
     attempt=$((attempt + 1))
     local audit_before
-    audit_before="$(gw_exec bash -ceu 'cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | wc -l')"
+    audit_before="$(gw_exec bash -ceu 'cat /var/log/gateway/audit/*.jsonl 2>/dev/null | wc -l')"
     local out_file="$TMPDIR_WORK/probe-${principal}-try${attempt}.jsonl"
     local audit_file="$TMPDIR_WORK/audit-${principal}-try${attempt}.jsonl"
 
@@ -692,7 +690,7 @@ run_probe_with_upstream_retry() {
       return 0
     fi
 
-    gw_exec bash -ceu "cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))" >"$audit_file"
+    gw_exec bash -ceu "cat /var/log/gateway/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))" >"$audit_file"
 
     echo "    WARN: ${principal} probe attempt ${attempt} failed (rc=${probe_rc}); checking upstream audit evidence..."
     local retry_ok=0
@@ -775,7 +773,7 @@ PY
   done
 }
 
-echo "==> Step 2.4: Verifying LAN control from gateway, guest :8080 controls, and running gatewayd-probe"
+echo "==> Step 2.4: Verifying LAN control from gateway, guest :8080 controls, and running gateway-probe"
 lan_host="${LAN_ADDR%:*}"
 lan_port="${LAN_ADDR##*:}"
 if ! gw_exec bash -ceu "timeout 5s bash -c 'exec 3<>/dev/tcp/${lan_host}/${lan_port}'"; then
@@ -815,8 +813,8 @@ with open(path, "r", encoding="utf-8") as fh:
         if not s:
             continue
         if not s.startswith("{"):
-            # Skip non-JSON stderr summary lines emitted by gatewayd-probe after JSONL output.
-            if s.startswith("gatewayd-probe:"):
+            # Skip non-JSON stderr summary lines emitted by gateway-probe after JSONL output.
+            if s.startswith("gateway-probe:"):
                 continue
             sys.stderr.write(f"FAIL: unexpected non-JSON line in probe output: {s}\n")
             sys.exit(1)
@@ -875,19 +873,19 @@ run_same_ip_step() {
   gw_exec conntrack -F >/dev/null 2>&1 || return 2
 
   local audit_before
-  audit_before="$(gw_exec bash -ceu 'cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | wc -l')" || return 2
+  audit_before="$(gw_exec bash -ceu 'cat /var/log/gateway/audit/*.jsonl 2>/dev/null | wc -l')" || return 2
 
   local out0="$TMPDIR_WORK/same0-${src_port}.jsonl"
   local out1="$TMPDIR_WORK/same1-${src_port}.jsonl"
   # Start guest0 slightly ahead with a longer hold so its conntrack entries are
   # established when guest1 sends the identical 4-tuple (10.77.0.50:<src_port>).
-  g0_exec /usr/local/bin/gatewayd-probe \
+  g0_exec /usr/local/bin/gateway-probe \
     --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 8s \
     --allow-host "$UPSTREAM_HOST" >"$out0" 2>&1 &
   local pid0=$!
   [[ -n "$pid0" ]] || return 2
   sleep 1
-  g1_exec /usr/local/bin/gatewayd-probe \
+  g1_exec /usr/local/bin/gateway-probe \
     --same-ip --src-ip "$static_ip" --src-port "$src_port" --hold 6s \
     --allow-host "$UPSTREAM_HOST" >"$out1" 2>&1 &
   local pid1=$!
@@ -915,7 +913,7 @@ run_same_ip_step() {
   fi
 
   local audit_delta
-  audit_delta="$(gw_exec bash -ceu "cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))")" || return 2
+  audit_delta="$(gw_exec bash -ceu "cat /var/log/gateway/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))")" || return 2
   local g0_audited=0 g1_audited=0
   if echo "$audit_delta" | grep -q "\"principal\":\"guest0\".*\"src_ip\":\"${static_ip}\""; then
     g0_audited=1
@@ -969,7 +967,7 @@ run_same_ip_step 45001 normal
 restore_guests_dhcp
 
 restore_dataplane() {
-  gw_exec /usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml
+  gw_exec /usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml
 }
 
 if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then

@@ -39,12 +39,12 @@ tasks:
           echo "lint: internal/admin must not depend on proxy, secret, policy, or netguard" >&2
           exit 1
         fi
-        if go list -deps ./cmd/gatewayd-probe | grep -E 'github\.com/manufactory-project/gateway/internal/(proxy|secret|policy|netguard)$'; then
-          echo "lint: cmd/gatewayd-probe must not depend on proxy, secret, policy, or netguard" >&2
+        if go list -deps ./cmd/gateway-probe | grep -E 'github\.com/manufactory-project/gateway/internal/(proxy|secret|policy|netguard)$'; then
+          echo "lint: cmd/gateway-probe must not depend on proxy, secret, policy, or netguard" >&2
           exit 1
         fi
-        if go list -deps ./cmd/gatewayd-probe | grep -v '^github\.com/manufactory-project/gateway/cmd/gatewayd-probe$' | grep -E '^[^/]+\.[^/]+/'; then
-          echo "lint: cmd/gatewayd-probe must be stdlib-only" >&2
+        if go list -deps ./cmd/gateway-probe | grep -v '^github\.com/manufactory-project/gateway/cmd/gateway-probe$' | grep -E '^[^/]+\.[^/]+/'; then
+          echo "lint: cmd/gateway-probe must be stdlib-only" >&2
           exit 1
         fi
       - |

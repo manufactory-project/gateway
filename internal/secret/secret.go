@@ -1,4 +1,4 @@
-// Package secret implements gatewayd's file-only secret placeholder substitution,
+// Package secret implements gateway's file-only secret placeholder substitution,
 // unconditional post-substitution placeholder stripping, and streaming
 // sliding-window identity response redaction.
 package secret

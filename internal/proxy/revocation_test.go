@@ -219,7 +219,7 @@ func TestRevocationMetricsOnTTLExpiryAndReload(t *testing.T) {
 		return rec.Body.String()
 	}
 
-	// 1. TTL expiry teardown increments gatewayd_revocations_total.
+	// 1. TTL expiry teardown increments gateway_revocations_total.
 	if _, err := gw.Store.AddGrant("worker-test", "ttl.example.com", 443, []string{"GET"}, []string{"/hold"}, 100*time.Millisecond, false); err != nil {
 		t.Fatalf("AddGrant TTL: %v", err)
 	}
@@ -234,11 +234,11 @@ func TestRevocationMetricsOnTTLExpiryAndReload(t *testing.T) {
 	if err := rTTL.Body.Close(); err != nil {
 		t.Logf("close rTTL: %v", err)
 	}
-	if m := scrapeRevocations(); !strings.Contains(m, "gatewayd_revocations_total 1\n") {
-		t.Fatalf("expected gatewayd_revocations_total 1 after TTL expiry, got:\n%s", m)
+	if m := scrapeRevocations(); !strings.Contains(m, "gateway_revocations_total 1\n") {
+		t.Fatalf("expected gateway_revocations_total 1 after TTL expiry, got:\n%s", m)
 	}
 
-	// 2. Reload teardown increments gatewayd_revocations_total.
+	// 2. Reload teardown increments gateway_revocations_total.
 	rRel, err := gw.H1Client(t, "reload.example.com").Get("https://reload.example.com/hold")
 	if err != nil {
 		t.Fatalf("GET reload /hold: %v", err)
@@ -257,8 +257,8 @@ func TestRevocationMetricsOnTTLExpiryAndReload(t *testing.T) {
 	if err := rRel.Body.Close(); err != nil {
 		t.Logf("close rRel: %v", err)
 	}
-	if m := scrapeRevocations(); !strings.Contains(m, "gatewayd_revocations_total 2\n") {
-		t.Fatalf("expected gatewayd_revocations_total 2 after reload teardown, got:\n%s", m)
+	if m := scrapeRevocations(); !strings.Contains(m, "gateway_revocations_total 2\n") {
+		t.Fatalf("expected gateway_revocations_total 2 after reload teardown, got:\n%s", m)
 	}
 }
 
@@ -571,7 +571,7 @@ func TestWebSocketRevokedDuringHandshake(t *testing.T) {
 			bound = time.Second
 		}
 
-		// 1. Upstream connection must be closed by gatewayd within bound.
+		// 1. Upstream connection must be closed by gateway within bound.
 		select {
 		case <-upClosed:
 		case <-time.After(bound):

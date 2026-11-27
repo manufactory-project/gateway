@@ -1,30 +1,30 @@
-# Two-link gatewayd v0.1 example with allow rules for one test upstream.
+# Two-link gateway v0.1 example with allow rules for one test upstream.
 
 ca:
-  cert_path: /etc/gatewayd/ca/ca.crt
-  key_path: /etc/gatewayd/ca/ca.key
+  cert_path: /etc/gateway/ca/ca.crt
+  key_path: /etc/gateway/ca/ca.key
 
 audit:
-  # Managed by LogsDirectory=gatewayd/audit in deploy/gatewayd.service.
-  dir: /var/log/gatewayd/audit
+  # Managed by LogsDirectory=gateway/audit in deploy/gateway.service.
+  dir: /var/log/gateway/audit
   retain_days: 30
   max_file_bytes: 104857600
   stdout_json: true
 
 admin:
-  socket: /run/gatewayd/admin.sock
-  socket_group: gatewayd
+  socket: /run/gateway/admin.sock
+  socket_group: gateway
 
 metrics:
   listen: 127.0.0.1:9102
 
 dataplane:
   verify_sysctls: true
-  ready_file: /run/gatewayd/dataplane.ready
+  ready_file: /run/gateway/dataplane.ready
   dhcp:
     user: dnsmasq
-    lease_file: /var/lib/gatewayd/dnsmasq.leases
-    config_path: /run/gatewayd/dnsmasq.conf
+    lease_file: /var/lib/gateway/dnsmasq.leases
+    config_path: /run/gateway/dnsmasq.conf
     lease_time: 12h
 
 dns:

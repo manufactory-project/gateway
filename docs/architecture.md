@@ -1,10 +1,10 @@
-# `gatewayd` Architecture (v0.1)
+# `gateway` Architecture (v0.1)
 
 ## 1. Process Model
 
-`gatewayd` separates host network privilege from the guest-facing data plane across four components:
+`gateway` separates host network privilege from the guest-facing data plane across three runtime roles (plus operator subcommands in the same binary):
 
-1. **`gatewayd netsetup --config <path>` (root, one-shot via systemd `ExecStartPre=+`):**
+1. **`gateway netsetup --config <path>` (root, one-shot via systemd `ExecStartPre=+`):**
    Removes any stale `dataplane.ready_file` first, generates and applies kernel sysctls, per-link
    `ip addr` / `ip rule` / `ip route` configuration, atomic `nft -f` ruleset (`table inet gw`),
    and the DHCP-only `dnsmasq` config from the single YAML config, and writes `dataplane.ready_file`
@@ -13,13 +13,13 @@
    Runs with `--port=0 --dhcp-broadcast --no-ping --bind-interfaces --user=<dhcp.user>` and one
    `--interface` per sandbox link so it drops root and all network capabilities (`CAP_NET_ADMIN`,
    `CAP_NET_RAW`).
-3. **`gatewayd --config <path>` (unprivileged, zero `CAP_NET_ADMIN`):**
+3. **`gateway run --config <path>` (unprivileged, zero `CAP_NET_ADMIN`):**
    Verifies `dataplane.ready_file` and sysctls at startup (refusing to start on mismatch), loads
    the operator-supplied MITM CA, opens the fail-closed JSONL audit sink, and serves per-link
    explicit-bind DNS, HTTPS, and HTTP listeners plus the local Unix-socket Admin API (`0660`) and
    optional explicit-bind Prometheus `/metrics` listener.
-4. **`gwctl` (operator CLI):**
-   Talks to `gatewayd` over the local Unix domain socket (`status`, `reload`, `flows`, `revoke`,
+4. **`gateway` operator subcommands:**
+   Talk to the running daemon over the local Unix domain socket (`status`, `reload`, `flows`, `revoke`,
    `grants`, `grant`, `grant revoke`) and provides offline `ca init` and root `dataplane check`.
 
 ## 2. Guest Packet and Request Path
@@ -68,9 +68,9 @@ Guest packet on sandbox interface (sbxN)
   H2 stream, SSE stream, and WebSocket independently (never keyed by TCP connection). `teardown()`
   calls `reqCancel()` and `guestConn.Close()` for transport-managed flows (letting `http.Transport`
   abort dials/handshakes, send H2 `RST_STREAM`, and close stalled H1 sockets without pool races)
-  and additionally closes `upConn` directly for WebSockets, where `gatewayd` owns the raw socket.
+  and additionally closes `upConn` directly for WebSockets, where `gateway` owns the raw socket.
   Every teardown (explicit revoke, grant expiry, or config reload) increments
-  `gatewayd_revocations_total`.
+  `gateway_revocations_total`.
 - **Live config reload:** `config.Store.Reload` (triggered by `SIGHUP` or `POST /v1/reload`)
   re-parses and validates YAML strictly (`KnownFields(true)`). Any change to restart-only sections
   (`ca`, `audit`, `admin`, `metrics`, `dns.fake_cidr`, `dataplane`, `http.max_header_bytes`,
@@ -78,12 +78,12 @@ Guest packet on sandbox interface (sbxN)
   success, the snapshot swaps atomically, all ephemeral TTL grants are wiped, and per-link
   `onConfigReload` callbacks tear down flows that are no longer allowed and WebSockets on hosts
   that gained a secret binding.
-- **Grant TTL expiry & WebSocket grants:** One `config.Store.RunGrantPruner` goroutine owned by `cmd/gatewayd`
+- **Grant TTL expiry & WebSocket grants:** One `config.Store.RunGrantPruner` goroutine owned by `cmd/gateway`
   periodically prunes expired grants and invokes all registered `SetOnGrantExpired` callbacks
   across links so expired grant flows tear down immediately. Ephemeral grants (`POST /v1/grants`)
   may carry `allow_websocket`, using the default egress cap (`http.ws_max_egress_bytes`, 64 MiB
   by default), and are refused on any host with a secret binding for that principal.
-- **Audit sink:** One `audit.Writer` owned by `cmd/gatewayd` is shared across all link DNS/proxy
+- **Audit sink:** One `audit.Writer` owned by `cmd/gateway` is shared across all link DNS/proxy
   servers and the Admin server, and closed last during graceful shutdown.
 
 ## 4. Package Graph and Dependency Rules
@@ -107,10 +107,9 @@ Service packages:
   internal/proxy   -> audit, ca, config, netguard, policy, secret   (uses OnRequest callback; never imports metrics)
 
 Binaries:
-  cmd/gwctl          -> admin, ca, config, netsetup
-                        (lint-enforced: transitive deps must NEVER include proxy, secret, policy, netguard)
-  cmd/gatewayd       -> wires all internal packages + adminFlowAdapter
-  cmd/gatewayd-probe -> static stdlib-only guest probe (lint-enforced: stdlib-only, no proxy/secret/policy/netguard)
+  cmd/gateway       -> wires all internal packages + adminFlowAdapter
+                       (internal/admin is lint-enforced never to import proxy, secret, policy, netguard)
+  cmd/gateway-probe -> static stdlib-only guest probe (lint-enforced: stdlib-only, no proxy/secret/policy/netguard)
 ```
 
 ## 5. Fail-Closed Points
@@ -138,7 +137,7 @@ Binaries:
 `audit.Writer.WriteSync` sanitizes peer strings, strips query strings (preserving `has_query`),
 never records header values, and writes each JSONL record synchronously under a mutex before
 answering DNS queries or dialing upstream. Any write or rotation failure marks the sink unhealthy,
-increments `gatewayd_audit_write_errors_total`, and returns an error so callers fail closed
+increments `gateway_audit_write_errors_total`, and returns an error so callers fail closed
 (`SERVFAIL` / `503`). `WriteSync` does **not** call `fsync`, so the last OS-buffered records can
 be lost on sudden power loss or kernel crash. Disk consumption is bounded by size and daily
 rotation (`audit.max_file_bytes`) plus retention pruning (`audit.retain_days`). Operators inspect
@@ -148,7 +147,7 @@ Loki.
 ## 7. Deliberate Non-Features and Documented Deviations
 
 - **No built-in audit query/follow API (`NOW.md:67` deviation, owner-approved):** `GET /v1/audit`
-  and `gwctl audit` were deliberately cut. Use `tail -F <dir>/*.jsonl | jq` or Loki.
+  and `gateway audit` were deliberately cut. Use `tail -F <dir>/*.jsonl | jq` or Loki.
 - **No per-stream HTTP/2 teardown:** Revoking a flow/grant cancels the request context and closes
   the guest connection; other streams multiplexed on the same guest H2 connection drop and
   reconnect, while separate guest connections remain untouched.
@@ -158,38 +157,38 @@ Loki.
 - **Transport-managed upstream teardown (`NOW.md:64` deviation):** For `http.Transport`-managed
   HTTP/H2/SSE requests, teardown calls `reqCancel()` + `guestConn.Close()` instead of poking into
   `http.Transport`'s connection pool to close upstream sockets directly. Direct `upConn.Close()` is
-  used only for WebSockets, where `gatewayd` owns the raw socket.
+  used only for WebSockets, where `gateway` owns the raw socket.
 
 ## 8. Deploying
 
 Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
 
-- **`deploy/gatewayd.service`:** `Type=simple` under `User=gatewayd` / `Group=gatewayd` with
-  `ExecStartPre=+/usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml` (privileged
+- **`deploy/gateway.service`:** `Type=simple` under `User=gateway` / `Group=gateway` with
+  `ExecStartPre=+/usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml` (privileged
   one-shot setup), `CapabilityBoundingSet=` and `AmbientCapabilities=` both empty,
   `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
-  `RuntimeDirectory=gatewayd` (admin socket, `dataplane.ready`, and generated `dnsmasq.conf`), and
-  `LogsDirectory=gatewayd/audit` (creating and granting write access to `/var/log/gatewayd/audit`
-  only). When `gatewayd.service` stops, `RuntimeDirectory=gatewayd` deletes `/run/gatewayd`,
+  `RuntimeDirectory=gateway` (admin socket, `dataplane.ready`, and generated `dnsmasq.conf`), and
+  `LogsDirectory=gateway/audit` (creating and granting write access to `/var/log/gateway/audit`
+  only). When `gateway.service` stops, `RuntimeDirectory=gateway` deletes `/run/gateway`,
   including `dataplane.ready`.
-- **`deploy/gatewayd-dhcp.service`:** Ordered `After=gatewayd.service` and
-  `Requires=gatewayd.service`. Runs
-  `/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gatewayd/dnsmasq.conf` with no flags
+- **`deploy/gateway-dhcp.service`:** Ordered `After=gateway.service` and
+  `Requires=gateway.service`. Runs
+  `/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gateway/dnsmasq.conf` with no flags
   duplicated from the config `netsetup` generates. Starts as root (no `User=`, no empty
   `CapabilityBoundingSet=`) so `dnsmasq` can bind UDP `:67` and then drop privileges itself via
   `user=`.
-- **Non-root / `CapEff` guarantee:** Once running, `gatewayd`'s `/proc/<pid>/status` shows a
+- **Non-root / `CapEff` guarantee:** Once running, `gateway`'s `/proc/<pid>/status` shows a
   non-root `Uid` and `CapEff`, `CapPrm`, and `CapAmb` all `0000000000000000`. Because `netsetup`
   emits unconditional `dhcp-broadcast` and `no-ping`, `dnsmasq` drops to its non-root `user=` with
   `CapEff` and `CapPrm` both `0000000000000000` and opens only UDP `:67` (zero `:53` sockets),
   verified on live containers.
-- **Stale-ready-file behaviour:** Because unprivileged `gatewayd` has zero `CAP_NET_ADMIN`, it
+- **Stale-ready-file behaviour:** Because unprivileged `gateway` has zero `CAP_NET_ADMIN`, it
   checks kernel sysctls and `dataplane.ready` existence at startup rather than reading
   `table inet gw` directly. If `table inet gw` is deleted while a stale `dataplane.ready` file and
-  valid sysctls remain, starting `gatewayd` directly without `netsetup` keeps running (`rc 124`
-  under `timeout`), whereas root `gwctl dataplane check` inspects `table inet gw` directly and
+  valid sysctls remain, starting `gateway` directly without `netsetup` keeps running (`rc 124`
+  under `timeout`), whereas root `gateway dataplane check` inspects `table inet gw` directly and
   fails. In normal deployment, the guards against a stale ready file are systemd always re-running
-  `ExecStartPre=+ gatewayd netsetup` (which deletes any stale ready file first and reloads
-  `table inet gw`), `RuntimeDirectory=gatewayd` deleting `/run/gatewayd` on service stop, and
-  `net.ipv4.ip_forward=0` keeping forwarding disabled. Note that `gwctl dataplane check` also writes
-  `dataplane.ready` when it succeeds, making it a second writer alongside `gatewayd netsetup`.
+  `ExecStartPre=+ gateway netsetup` (which deletes any stale ready file first and reloads
+  `table inet gw`), `RuntimeDirectory=gateway` deleting `/run/gateway` on service stop, and
+  `net.ipv4.ip_forward=0` keeping forwarding disabled. Note that `gateway dataplane check` also writes
+  `dataplane.ready` when it succeeds, making it a second writer alongside `gateway netsetup`.

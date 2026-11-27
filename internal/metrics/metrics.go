@@ -1,4 +1,4 @@
-// Package metrics exposes gatewayd's Prometheus /metrics endpoint on an explicit
+// Package metrics exposes gateway's Prometheus /metrics endpoint on an explicit
 // non-wildcard IP:port listener.
 package metrics
 
@@ -17,7 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Collector owns gatewayd's isolated Prometheus registry and metric instruments.
+// Collector owns gateway's isolated Prometheus registry and metric instruments.
 type Collector struct {
 	registry         *prometheus.Registry
 	auditWriteErrors prometheus.Counter
@@ -33,30 +33,30 @@ type Options struct {
 	ActiveGrants func() int
 }
 
-// NewCollector creates a dedicated Prometheus registry with all gatewayd metrics registered.
+// NewCollector creates a dedicated Prometheus registry with all gateway metrics registered.
 func NewCollector(opts Options) *Collector {
 	reg := prometheus.NewRegistry()
 
 	c := &Collector{
 		registry: reg,
 		auditWriteErrors: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "gatewayd_audit_write_errors_total",
+			Name: "gateway_audit_write_errors_total",
 			Help: "Total number of failed fail-closed audit sink writes.",
 		}),
 		requestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "gatewayd_requests_total",
-			Help: "Total HTTP/TLS/WebSocket requests handled by gatewayd.",
+			Name: "gateway_requests_total",
+			Help: "Total HTTP/TLS/WebSocket requests handled by gateway.",
 		}, []string{"principal", "effect", "status"}),
 		dnsQueriesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "gatewayd_dns_queries_total",
-			Help: "Total fake-IP DNS queries handled by gatewayd.",
+			Name: "gateway_dns_queries_total",
+			Help: "Total fake-IP DNS queries handled by gateway.",
 		}, []string{"principal", "effect"}),
 		reloadsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "gatewayd_reloads_total",
-			Help: "Total configuration reloads attempted by gatewayd.",
+			Name: "gateway_reloads_total",
+			Help: "Total configuration reloads attempted by gateway.",
 		}, []string{"result"}),
 		revocationsTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "gatewayd_revocations_total",
+			Name: "gateway_revocations_total",
 			Help: "Total live flows torn down by revocation or reload.",
 		}),
 	}
@@ -71,35 +71,35 @@ func NewCollector(opts Options) *Collector {
 
 	if opts.ActiveFlows != nil {
 		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "gatewayd_active_flows",
+			Name: "gateway_active_flows",
 			Help: "Number of currently active in-flight flows.",
 		}, func() float64 { return float64(opts.ActiveFlows()) }))
 	}
 	if opts.ActiveGrants != nil {
 		reg.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-			Name: "gatewayd_active_grants",
+			Name: "gateway_active_grants",
 			Help: "Number of currently active in-memory TTL grants.",
 		}, func() float64 { return float64(opts.ActiveGrants()) }))
 	}
 	return c
 }
 
-// IncAuditWriteError increments gatewayd_audit_write_errors_total.
+// IncAuditWriteError increments gateway_audit_write_errors_total.
 func (c *Collector) IncAuditWriteError() {
 	c.auditWriteErrors.Inc()
 }
 
-// ObserveRequest increments gatewayd_requests_total.
+// ObserveRequest increments gateway_requests_total.
 func (c *Collector) ObserveRequest(principal, effect string, status int) {
 	c.requestsTotal.WithLabelValues(principal, effect, strconv.Itoa(status)).Inc()
 }
 
-// ObserveDNSQuery increments gatewayd_dns_queries_total.
+// ObserveDNSQuery increments gateway_dns_queries_total.
 func (c *Collector) ObserveDNSQuery(principal, effect string) {
 	c.dnsQueriesTotal.WithLabelValues(principal, effect).Inc()
 }
 
-// ObserveReload increments gatewayd_reloads_total.
+// ObserveReload increments gateway_reloads_total.
 func (c *Collector) ObserveReload(ok bool) {
 	if ok {
 		c.reloadsTotal.WithLabelValues("ok").Inc()
@@ -108,7 +108,7 @@ func (c *Collector) ObserveReload(ok bool) {
 	c.reloadsTotal.WithLabelValues("error").Inc()
 }
 
-// AddRevocations adds n to gatewayd_revocations_total.
+// AddRevocations adds n to gateway_revocations_total.
 func (c *Collector) AddRevocations(n int) {
 	if n > 0 {
 		c.revocationsTotal.Add(float64(n))

@@ -92,13 +92,13 @@ func TestMetricsExplicitBindAndExposition(t *testing.T) {
 
 	text := string(body)
 	for _, want := range []string{
-		"gatewayd_audit_write_errors_total 1",
-		`gatewayd_requests_total{effect="allow",principal="worker-claude",status="200"} 1`,
-		`gatewayd_dns_queries_total{effect="deny",principal="worker-claude"} 1`,
-		`gatewayd_reloads_total{result="ok"} 1`,
-		"gatewayd_revocations_total 2",
-		"gatewayd_active_flows 3",
-		"gatewayd_active_grants 1",
+		"gateway_audit_write_errors_total 1",
+		`gateway_requests_total{effect="allow",principal="worker-claude",status="200"} 1`,
+		`gateway_dns_queries_total{effect="deny",principal="worker-claude"} 1`,
+		`gateway_reloads_total{result="ok"} 1`,
+		"gateway_revocations_total 2",
+		"gateway_active_flows 3",
+		"gateway_active_grants 1",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("/metrics output missing %q\nfull:\n%s", want, text)

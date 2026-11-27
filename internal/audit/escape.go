@@ -1,5 +1,5 @@
 // Package audit provides a fail-closed, bounded, structured JSONL audit log
-// for gatewayd. Header values are never part of the Event schema, query strings
+// for gateway. Header values are never part of the Event schema, query strings
 // are stripped before recording, and peer-supplied strings are escaped.
 package audit
 

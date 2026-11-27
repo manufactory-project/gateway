@@ -13,7 +13,7 @@ import (
 	"github.com/manufactory-project/gateway/internal/config"
 )
 
-// Client talks to gatewayd's Admin API over its local Unix domain socket.
+// Client talks to gateway's Admin API over its local Unix domain socket.
 type Client struct {
 	httpClient *http.Client
 	transport  *http.Transport

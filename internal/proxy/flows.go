@@ -52,7 +52,7 @@ func (f *activeFlow) setUpstreamConn(c net.Conn) {
 }
 
 // teardown immediately cancels the request context, closes the guest connection,
-// and closes any gatewayd-owned WebSocket upstream socket.
+// and closes any gateway-owned WebSocket upstream socket.
 func (f *activeFlow) teardown() {
 	f.mu.Lock()
 	if f.tornDown {
@@ -69,7 +69,7 @@ func (f *activeFlow) teardown() {
 	if f.guestConn != nil {
 		closeQuietly(f.guestConn)
 	}
-	// Direct upstream close applies only to WebSockets, where gatewayd owns the raw socket.
+	// Direct upstream close applies only to WebSockets, where gateway owns the raw socket.
 	// Transport-managed HTTP/H2/SSE flows rely on reqCancel() + guestConn.Close().
 	if up != nil {
 		closeQuietly(up)

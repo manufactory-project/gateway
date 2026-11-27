@@ -1,4 +1,4 @@
-// Package config loads, strictly validates, and atomically reloads gatewayd YAML configuration.
+// Package config loads, strictly validates, and atomically reloads gateway YAML configuration.
 package config
 
 import (
@@ -36,7 +36,7 @@ const (
 	PlaceholderPrefix          = "mf_ph_"
 )
 
-// Config is the validated, normalized gatewayd configuration.
+// Config is the validated, normalized gateway configuration.
 type Config struct {
 	CA        CAConfig          `yaml:"ca"`
 	Audit     AuditConfig       `yaml:"audit"`

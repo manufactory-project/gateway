@@ -1,14 +1,14 @@
 [Unit]
-Description=gatewayd egress-only network gateway
+Description=gateway egress-only network gateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=gatewayd
-Group=gatewayd
-ExecStartPre=+/usr/local/bin/gatewayd netsetup --config /etc/gatewayd/gatewayd.yaml
-ExecStart=/usr/local/bin/gatewayd --config /etc/gatewayd/gatewayd.yaml
+User=gateway
+Group=gateway
+ExecStartPre=+/usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml
+ExecStart=/usr/local/bin/gateway run --config /etc/gateway/gateway.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 CapabilityBoundingSet=
@@ -17,8 +17,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-RuntimeDirectory=gatewayd
-LogsDirectory=gatewayd/audit
+RuntimeDirectory=gateway
+LogsDirectory=gateway/audit
 
 [Install]
 WantedBy=multi-user.target
