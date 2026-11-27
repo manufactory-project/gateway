@@ -37,7 +37,6 @@ type Options struct {
 	Evaluator          *policy.Evaluator
 	Audit              *audit.Writer
 	Leaves             *ca.LeafCache
-	SNILimiter         *ca.DeniedSNILimiter
 	Dialer             *netguard.Dialer
 	DialContext        func(ctx context.Context, network, addr string) (net.Conn, error)
 	UpstreamRoots      *x509.CertPool
@@ -55,7 +54,6 @@ type Server struct {
 	eval          *policy.Evaluator
 	audit         *audit.Writer
 	leaves        *ca.LeafCache
-	sniLimiter    *ca.DeniedSNILimiter
 	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
 	upstreamRoots *x509.CertPool
 	secrets       secret.Resolver
@@ -88,11 +86,6 @@ func NewServer(opts Options) (*Server, error) {
 			return nil, errors.New("proxy: dialer or dialContext is required")
 		}
 		dialFn = opts.Dialer.DialContext
-	}
-	sniLim := opts.SNILimiter
-	if sniLim == nil {
-		h := opts.Store.Current().Config.HTTP
-		sniLim = ca.NewDeniedSNILimiter(h.DeniedSNIRatePerSec, h.DeniedSNIBurst)
 	}
 	secrets := opts.Secrets
 	if secrets == nil {
@@ -129,7 +122,6 @@ func NewServer(opts Options) (*Server, error) {
 		eval:          opts.Evaluator,
 		audit:         opts.Audit,
 		leaves:        opts.Leaves,
-		sniLimiter:    sniLim,
 		dialContext:   dialFn,
 		upstreamRoots: opts.UpstreamRoots,
 		secrets:       secrets,
@@ -313,9 +305,6 @@ func (s *Server) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 }
 
 func (s *Server) auditDeniedSNI(srcIP, sni, reason, ruleID string) {
-	if !s.sniLimiter.Allow(s.link.Principal) {
-		return
-	}
 	ev := audit.Event{
 		Kind:      audit.KindRequest,
 		Principal: s.link.Principal,

@@ -27,8 +27,6 @@ const (
 	DefaultMaxRequestBodyBytes = 32 << 20 // 32 MiB
 	DefaultWSMaxEgressBytes    = 64 << 20 // 64 MiB
 	DefaultMaxHeaderBytes      = 32 << 10 // 32 KiB
-	DefaultDeniedSNIRate       = 10.0
-	DefaultDeniedSNIBurst      = 20
 	DefaultAuditRetainDays     = 30
 	DefaultAuditMaxFileBytes   = 100 << 20 // 100 MiB
 	DefaultHTTPSPort           = 10443
@@ -102,13 +100,11 @@ type DNSConfig struct {
 	TTLSeconds uint32 `yaml:"ttl_seconds"`
 }
 
-// HTTPConfig configures MITM HTTP/2/WS limits and denied-SNI rate limiting.
+// HTTPConfig configures MITM HTTP/2/WS size and header limits.
 type HTTPConfig struct {
-	MaxRequestBodyBytes int64   `yaml:"max_request_body_bytes"`
-	WSMaxEgressBytes    int64   `yaml:"ws_max_egress_bytes"`
-	MaxHeaderBytes      int     `yaml:"max_header_bytes"`
-	DeniedSNIRatePerSec float64 `yaml:"denied_sni_rate_per_sec"`
-	DeniedSNIBurst      int     `yaml:"denied_sni_burst"`
+	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
+	WSMaxEgressBytes    int64 `yaml:"ws_max_egress_bytes"`
+	MaxHeaderBytes      int   `yaml:"max_header_bytes"`
 }
 
 // LinkConfig maps one sandbox link interface and subnet to one principal.
@@ -231,12 +227,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.HTTP.MaxHeaderBytes == 0 {
 		cfg.HTTP.MaxHeaderBytes = DefaultMaxHeaderBytes
 	}
-	if cfg.HTTP.DeniedSNIRatePerSec == 0 {
-		cfg.HTTP.DeniedSNIRatePerSec = DefaultDeniedSNIRate
-	}
-	if cfg.HTTP.DeniedSNIBurst == 0 {
-		cfg.HTTP.DeniedSNIBurst = DefaultDeniedSNIBurst
-	}
 	if cfg.Dataplane.DHCP.LeaseTime == "" {
 		cfg.Dataplane.DHCP.LeaseTime = DefaultDHCPLeaseTime
 	}
@@ -355,12 +345,6 @@ func validateHTTP(h HTTPConfig) error {
 	}
 	if h.MaxHeaderBytes <= 0 {
 		return fmt.Errorf("http.max_header_bytes must be > 0, got %d", h.MaxHeaderBytes)
-	}
-	if h.DeniedSNIRatePerSec <= 0 {
-		return fmt.Errorf("http.denied_sni_rate_per_sec must be > 0, got %v", h.DeniedSNIRatePerSec)
-	}
-	if h.DeniedSNIBurst <= 0 {
-		return fmt.Errorf("http.denied_sni_burst must be > 0, got %d", h.DeniedSNIBurst)
 	}
 	return nil
 }

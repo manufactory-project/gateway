@@ -53,6 +53,10 @@ the locked plain-Go wire suite is the living verification inventory.
   scrubbed (v0.1 handles only literal, URL-encoded, and JSON-escaped forms).
 - **DHCP parser attack surface:** `dnsmasq`'s DHCP parser is a second guest-facing process, holding
   no network capabilities.
+- **Denial-flood audit volume:** Denied SNIs never mint a leaf certificate and are audited
+  unconditionally alongside denied HTTP requests and DNS queries; disk usage from denial floods is
+  bounded by audit segment rotation (`audit.max_file_bytes`) and retention pruning
+  (`audit.retain_days`).
 - **DNS label leakage under wildcard rules:** Because `gatewayd` resolves allowlisted hostnames
   upstream when dialing, wildcard allow rules (`*.example.com`) let a guest leak guest-chosen
   labels to that zone's authoritative DNS servers via `gatewayd`'s upstream resolver. Prefer

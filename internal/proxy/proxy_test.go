@@ -286,8 +286,6 @@ http:
   max_request_body_bytes: 128
   ws_max_egress_bytes: 64
   max_header_bytes: 32768
-  denied_sni_rate_per_sec: 100
-  denied_sni_burst: 100
 records:
   api.example.com: 127.0.0.1
   ws.example.com: 127.0.0.1

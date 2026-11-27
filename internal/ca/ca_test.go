@@ -129,20 +129,6 @@ func TestLeafCacheSingleflightConcurrencyAndEviction(t *testing.T) {
 		t.Fatal("expected oldest leaf api.anthropic.com to be evicted and reminted with a new serial")
 	}
 
-	// DeniedSNILimiter enforces burst cap.
-	lim := ca.NewDeniedSNILimiter(1, 2)
-	for i := 0; i < 2; i++ {
-		if !lim.Allow("p1") {
-			t.Fatalf("expected burst call %d allowed", i+1)
-		}
-	}
-	if lim.Allow("p1") {
-		t.Fatal("expected 3rd immediate call to be rate-limited")
-	}
-	if !lim.Allow("p2") {
-		t.Fatal("other principal must have independent rate-limit bucket")
-	}
-
 	// Keep os import cleanly used by verifying key file mode 0600 on Linux.
 	fi, err := os.Stat(filepath.Join(dir, "ca.key"))
 	if err != nil {

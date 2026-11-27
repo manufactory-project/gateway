@@ -177,7 +177,6 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		return errors.Join(err, auditWriter.Close())
 	}
 	leaves := ca.NewLeafCache(mitmCA)
-	sniLim := ca.NewDeniedSNILimiter(cfg.HTTP.DeniedSNIRatePerSec, cfg.HTTP.DeniedSNIBurst)
 	dialer := netguard.NewDialer(netguard.Options{Store: store})
 
 	var (
@@ -225,15 +224,14 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		dnsServers = append(dnsServers, ds)
 
 		ps, err := proxy.NewServer(proxy.Options{
-			Link:       link,
-			Store:      store,
-			Evaluator:  eval,
-			Audit:      auditWriter,
-			Leaves:     leaves,
-			SNILimiter: sniLim,
-			Dialer:     dialer,
-			Flows:      flows,
-			OnRequest:  collector.ObserveRequest,
+			Link:      link,
+			Store:     store,
+			Evaluator: eval,
+			Audit:     auditWriter,
+			Leaves:    leaves,
+			Dialer:    dialer,
+			Flows:     flows,
+			OnRequest: collector.ObserveRequest,
 		})
 		if err != nil {
 			return errors.Join(err, shutdownAll())

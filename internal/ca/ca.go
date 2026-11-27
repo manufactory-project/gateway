@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"golang.org/x/sync/singleflight"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -290,42 +289,6 @@ func (c *LeafCache) mint(name string, now time.Time) (*tls.Certificate, time.Tim
 		Certificate: [][]byte{der},
 		PrivateKey:  key,
 	}, notAfter, nil
-}
-
-// DeniedSNILimiter rate-limits denied-SNI TLS handshake work per principal.
-type DeniedSNILimiter struct {
-	limit rate.Limit
-	burst int
-
-	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
-}
-
-// NewDeniedSNILimiter creates a per-principal token-bucket rate limiter.
-func NewDeniedSNILimiter(ratePerSec float64, burst int) *DeniedSNILimiter {
-	if ratePerSec <= 0 {
-		ratePerSec = 10
-	}
-	if burst <= 0 {
-		burst = 20
-	}
-	return &DeniedSNILimiter{
-		limit:    rate.Limit(ratePerSec),
-		burst:    burst,
-		limiters: make(map[string]*rate.Limiter),
-	}
-}
-
-// Allow reports whether principal has budget for another denied-SNI handshake.
-func (l *DeniedSNILimiter) Allow(principal string) bool {
-	l.mu.Lock()
-	lim, ok := l.limiters[principal]
-	if !ok {
-		lim = rate.NewLimiter(l.limit, l.burst)
-		l.limiters[principal] = lim
-	}
-	l.mu.Unlock()
-	return lim.Allow()
 }
 
 func randomSerial() (*big.Int, error) {

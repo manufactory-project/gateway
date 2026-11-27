@@ -35,8 +35,6 @@ http:
   max_request_body_bytes: 33554432
   ws_max_egress_bytes: 67108864
   max_header_bytes: 32768
-  denied_sni_rate_per_sec: 10
-  denied_sni_burst: 20
 
 records:
   forge.internal.example: <forge-ip>
