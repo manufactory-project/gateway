@@ -14,9 +14,8 @@ the locked plain-Go wire suite is the living verification inventory.
    guards, default-`drop`), kernel sysctls (`ip_forward=0`, IPv6 forwarding off, `rp_filter=2`,
    ARP suppression), fake-IP DNS (zero upstream query forwarding), dial-by-name, and connect-time
    `Dialer.Control` checks (`Unmap()` before prefix matching). Explicit opt-in exceptions to
-   private-IP unreachability are scoped strictly to per-`(principal, host, port, matchedRule)`
-   private-IP pins or static `records` overrides (see also the globally routed host/LAN residual
-   below).
+   private-IP unreachability are scoped strictly to static `records` overrides (`host -> exact IP`)
+   (see also the globally routed host/LAN residual below).
 
 2. **Keep declared secrets out of the guest.**
    Declared API keys and credentials stay behind the host/gateway-container filesystem boundary
@@ -50,6 +49,10 @@ the locked plain-Go wire suite is the living verification inventory.
   upstream on bound host A and later served back from unbound host B is not scrubbed. On a bound
   host, an upstream API that ignores `Accept-Encoding: identity` and insists on returning a
   compressed `Content-Encoding` fails closed (`502`).
+- **Base64-encoded Basic Auth echoes:** A Basic Auth binding echoed back base64-encoded is not
+  scrubbed (v0.1 handles only literal, URL-encoded, and JSON-escaped forms).
+- **DHCP parser attack surface:** `dnsmasq`'s DHCP parser is a second guest-facing process, holding
+  no network capabilities.
 - **DNS label leakage under wildcard rules:** Because `gatewayd` resolves allowlisted hostnames
   upstream when dialing, wildcard allow rules (`*.example.com`) let a guest leak guest-chosen
   labels to that zone's authoritative DNS servers via `gatewayd`'s upstream resolver. Prefer

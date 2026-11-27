@@ -1,0 +1,98 @@
+# Example gatewayd v0.1 configuration.
+# Replace <forge-ip> with your LAN Forgejo IP before deploying.
+
+ca:
+  cert_path: /etc/gatewayd/ca/ca.crt
+  key_path: /etc/gatewayd/ca/ca.key
+
+audit:
+  dir: /var/log/gatewayd/audit
+  retain_days: 30
+  max_file_bytes: 104857600
+  stdout_json: true
+
+admin:
+  socket: /run/gatewayd/admin.sock
+  socket_group: gatewayd
+
+metrics:
+  listen: 127.0.0.1:9102
+
+dataplane:
+  verify_sysctls: true
+  ready_file: /run/gatewayd/dataplane.ready
+  dhcp:
+    user: dnsmasq
+    lease_file: /var/lib/gatewayd/dnsmasq.leases
+    config_path: /run/gatewayd/dnsmasq.conf
+    lease_time: 12h
+
+dns:
+  fake_cidr: 198.18.0.0/15
+  ttl_seconds: 60
+
+http:
+  max_request_body_bytes: 33554432
+  ws_max_egress_bytes: 67108864
+  max_header_bytes: 32768
+  denied_sni_rate_per_sec: 10
+  denied_sni_burst: 20
+
+records:
+  forge.internal.example: <forge-ip>
+
+links:
+  - name: sbx0
+    interface: sbx0
+    principal: worker-claude
+    subnet: 10.200.0.0/28
+    gateway_ip: 10.200.0.1
+    https_port: 10443
+    http_port: 10080
+    dns_port: 10053
+    ct_zone: 101
+    route_table: 101
+
+  - name: sbx1
+    interface: sbx1
+    principal: worker-codex
+    subnet: 10.200.0.16/28
+    gateway_ip: 10.200.0.17
+    https_port: 10443
+    http_port: 10080
+    dns_port: 10053
+    ct_zone: 102
+    route_table: 102
+
+rules:
+  - id: claude-anthropic-api
+    principal: worker-claude
+    effect: allow
+    hosts: [api.anthropic.com]
+    ports: [443]
+    methods: [POST]
+    paths: ["/v1/**"]
+
+  - id: claude-forgejo
+    principal: worker-claude
+    effect: allow
+    hosts: [forge.internal.example]
+    ports: [443]
+    methods: [GET, POST]
+    paths: ["/**"]
+    bindings:
+      - name: forgejo-token
+        host: forge.internal.example
+        header: Authorization
+        scheme: basic
+        placeholder: mf_ph_forgejo_token
+        secret_file: /run/credentials/gatewayd/forgejo-token
+
+  - id: codex-chatgpt-ws
+    principal: worker-codex
+    effect: allow
+    hosts: [chatgpt.com]
+    ports: [443]
+    methods: [GET, POST]
+    paths: ["/backend-api/codex/**"]
+    allow_websocket: true
