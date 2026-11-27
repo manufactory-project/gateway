@@ -16,11 +16,15 @@ import (
 	"time"
 )
 
+func logf(w io.Writer, format string, args ...any) {
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		return
+	}
+}
+
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		if _, wErr := fmt.Fprintf(os.Stderr, "gateway-probe: %v\n", err); wErr != nil {
-			os.Exit(1)
-		}
+		logf(os.Stderr, "gateway-probe: %v\n", err)
 		os.Exit(1)
 	}
 }

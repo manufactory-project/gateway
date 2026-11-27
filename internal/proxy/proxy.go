@@ -194,17 +194,27 @@ func (s *Server) Start() error {
 	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
-		if err := s.httpsSrv.Serve(httpsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return
-		}
+		serveUntilClosed(s.httpsSrv, httpsLn)
 	}()
 	go func() {
 		defer s.wg.Done()
-		if err := s.httpSrv.Serve(cappedHTTPLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return
-		}
+		serveUntilClosed(s.httpSrv, cappedHTTPLn)
 	}()
 	return nil
+}
+
+func serveUntilClosed(srv *http.Server, ln net.Listener) {
+	// Shutdown closes the listener and causes Serve to return http.ErrServerClosed.
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return
+	}
+}
+
+func auditBestEffort(w *audit.Writer, ev audit.Event) {
+	// WriteSync already notifies OnWriteError on sink failure.
+	if err := w.WriteSync(ev); err != nil {
+		return
+	}
 }
 
 type cappedListener struct {
@@ -310,9 +320,7 @@ func (s *Server) auditDeniedSNI(srcIP, sni, reason, ruleID string) {
 		Reason:    reason,
 		RuleID:    ruleID,
 	}
-	if err := s.audit.WriteSync(ev); err != nil {
-		return
-	}
+	auditBestEffort(s.audit, ev)
 }
 
 type reqContext struct {
@@ -411,9 +419,7 @@ func (rc *reqContext) auditCompleted(status int, bytesOut, bytesIn int64, errTex
 	ev.BytesOut = bytesOut
 	ev.BytesIn = bytesIn
 	ev.Error = errText
-	if err := rc.srv.audit.WriteSync(ev); err != nil {
-		return
-	}
+	auditBestEffort(rc.srv.audit, ev)
 }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint16) {

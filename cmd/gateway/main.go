@@ -24,9 +24,7 @@ const defaultSocket = "/run/gateway/admin.sock"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		if _, wErr := fmt.Fprintf(os.Stderr, "gateway: %v\n", err); wErr != nil {
-			os.Exit(1)
-		}
+		logf(os.Stderr, "gateway: %v\n", err)
 		os.Exit(1)
 	}
 }

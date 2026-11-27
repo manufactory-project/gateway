@@ -233,6 +233,12 @@ func NewServer(listenAddr string, collector *Collector) (*Server, error) {
 	}, nil
 }
 
+func serveUntilClosed(srv *http.Server, ln net.Listener) {
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return
+	}
+}
+
 // Start binds the explicit TCP listener and serves /metrics.
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.listenAddr)
@@ -251,9 +257,7 @@ func (s *Server) Start() error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if err := s.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return
-		}
+		serveUntilClosed(s.srv, ln)
 	}()
 	return nil
 }

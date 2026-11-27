@@ -186,16 +186,11 @@ func (s *Server) Start() error {
 	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
-		if err := s.udpSrv.ActivateAndServe(); err != nil {
-			// Shutdown closes the socket, which causes ActivateAndServe to return.
-			return
-		}
+		serveDNSUntilClosed(s.udpSrv)
 	}()
 	go func() {
 		defer s.wg.Done()
-		if err := s.tcpSrv.ActivateAndServe(); err != nil {
-			return
-		}
+		serveDNSUntilClosed(s.tcpSrv)
 	}()
 
 	<-udpReady
@@ -376,6 +371,13 @@ func (s *Server) auditMalformed(proto string) {
 	}
 	if s.onQuery != nil {
 		s.onQuery(s.link.Principal, string(audit.EffectDeny))
+	}
+}
+
+func serveDNSUntilClosed(srv *mdns.Server) {
+	// Shutdown closes the underlying socket, causing ActivateAndServe to exit.
+	if err := srv.ActivateAndServe(); err != nil {
+		return
 	}
 }
 

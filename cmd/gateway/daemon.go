@@ -234,6 +234,20 @@ func (rt *daemonRuntime) startControl(cfg *config.Config, store *config.Store, f
 	return nil
 }
 
+func logf(w io.Writer, format string, args ...any) {
+	// Diagnostic stderr writes are best-effort; nothing actionable if stderr is closed.
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		return
+	}
+}
+
+func auditBestEffort(w *audit.Writer, ev audit.Event) {
+	// WriteSync already notifies OnWriteError on sink failure.
+	if err := w.WriteSync(ev); err != nil {
+		return
+	}
+}
+
 func handleSIGHUPReload(snap *config.Snapshot, revokedFlows int, reloadErr error, collector *metrics.Collector, auditWriter *audit.Writer, stderr io.Writer) {
 	if reloadErr != nil {
 		collector.ObserveReload(false)
@@ -242,25 +256,19 @@ func handleSIGHUPReload(snap *config.Snapshot, revokedFlows int, reloadErr error
 			Reason: "sighup-reload-failed",
 			Error:  reloadErr.Error(),
 		}); aErr != nil {
-			if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (audit error: %v): %v\n", aErr, reloadErr); wErr != nil {
-				return
-			}
+			logf(stderr, "gateway: SIGHUP reload failed (audit error: %v): %v\n", aErr, reloadErr)
 			return
 		}
-		if _, wErr := fmt.Fprintf(stderr, "gateway: SIGHUP reload failed (keeping prior config): %v\n", reloadErr); wErr != nil {
-			return
-		}
+		logf(stderr, "gateway: SIGHUP reload failed (keeping prior config): %v\n", reloadErr)
 		return
 	}
 	collector.ObserveReload(true)
-	if aErr := auditWriter.WriteSync(audit.Event{
+	auditBestEffort(auditWriter, audit.Event{
 		Kind:         audit.KindLifecycle,
 		Reason:       "sighup-reload",
 		ConfigHash:   snap.Hash,
 		RevokedFlows: &revokedFlows,
-	}); aErr != nil {
-		return
-	}
+	})
 }
 
 func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stderr io.Writer) error {
@@ -347,9 +355,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		Kind:   audit.KindLifecycle,
 		Reason: "stopped",
 	}); aErr != nil {
-		if _, wErr := fmt.Fprintf(stderr, "gateway: stopped audit write failed: %v\n", aErr); wErr != nil {
-			return rt.shutdownAll()
-		}
+		logf(stderr, "gateway: stopped audit write failed: %v\n", aErr)
 	}
 	return rt.shutdownAll()
 }
@@ -378,9 +384,7 @@ func registerGrantExpiredAudit(store *config.Store, auditWriter *audit.Writer, s
 			ExpiresAt: g.ExpiresAt.UTC().Format(time.RFC3339),
 			Reason:    "grant-expired",
 		}); aErr != nil {
-			if _, wErr := fmt.Fprintf(stderr, "gateway: grant-expired audit write failed: %v\n", aErr); wErr != nil {
-				return
-			}
+			logf(stderr, "gateway: grant-expired audit write failed: %v\n", aErr)
 		}
 	})
 }

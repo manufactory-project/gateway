@@ -339,6 +339,13 @@ func (w *Writer) latestSeqForDay(day string) (int, error) {
 	return best, nil
 }
 
+func (w *Writer) diagf(format string, args ...any) {
+	// Diagnostic writes are best-effort and must never abort pruning or rotation.
+	if _, err := fmt.Fprintf(w.diag, format, args...); err != nil {
+		return
+	}
+}
+
 func (w *Writer) pruneLocked(now time.Time) {
 	if w.retain <= 0 {
 		return
@@ -346,9 +353,7 @@ func (w *Writer) pruneLocked(now time.Time) {
 	cutoff := now.UTC().Add(-w.retain)
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
-		if _, dErr := fmt.Fprintf(w.diag, "audit: prune readdir %s: %v\n", w.dir, err); dErr != nil {
-			return
-		}
+		w.diagf("audit: prune readdir %s: %v\n", w.dir, err)
 		return
 	}
 	for _, e := range entries {
@@ -365,9 +370,7 @@ func (w *Writer) pruneLocked(now time.Time) {
 		}
 		if day.AddDate(0, 0, 1).Before(cutoff) {
 			if rmErr := os.Remove(filepath.Join(w.dir, e.Name())); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				if _, dErr := fmt.Fprintf(w.diag, "audit: prune remove %s: %v\n", e.Name(), rmErr); dErr != nil {
-					return
-				}
+				w.diagf("audit: prune remove %s: %v\n", e.Name(), rmErr)
 			}
 		}
 	}
@@ -387,9 +390,7 @@ func (w *Writer) pruneSizeLocked(now time.Time) {
 	}
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
-		if _, dErr := fmt.Fprintf(w.diag, "audit: size-prune readdir %s: %v\n", w.dir, err); dErr != nil {
-			return
-		}
+		w.diagf("audit: size-prune readdir %s: %v\n", w.dir, err)
 		return
 	}
 	activeName := segmentFileName(w.day, w.seq)
@@ -437,9 +438,7 @@ func (w *Writer) pruneSizeLocked(now time.Time) {
 			continue
 		}
 		if rmErr := os.Remove(filepath.Join(w.dir, seg.name)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-			if _, dErr := fmt.Fprintf(w.diag, "audit: size-prune remove %s: %v\n", seg.name, rmErr); dErr != nil {
-				return
-			}
+			w.diagf("audit: size-prune remove %s: %v\n", seg.name, rmErr)
 			continue
 		}
 		total -= seg.size
@@ -462,9 +461,7 @@ func (w *Writer) pruneSizeLocked(now time.Time) {
 	}
 	line = append(line, '\n')
 	if wErr := w.writeLineLocked(line); wErr != nil {
-		if _, dErr := fmt.Fprintf(w.diag, "audit: write audit-size-pruned event: %v\n", wErr); dErr != nil {
-			return
-		}
+		w.diagf("audit: write audit-size-pruned event: %v\n", wErr)
 	}
 }
 
