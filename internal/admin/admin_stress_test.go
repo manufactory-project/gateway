@@ -39,6 +39,36 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
+type testFlowAdapter struct {
+	flows *proxy.FlowRegistry
+}
+
+func (a testFlowAdapter) ListFlows() []admin.FlowInfo {
+	src := a.flows.List()
+	out := make([]admin.FlowInfo, len(src))
+	for i, f := range src {
+		out[i] = admin.FlowInfo{
+			ID:        f.ID,
+			Principal: f.Principal,
+			Link:      f.Link,
+			Host:      f.Host,
+			Port:      f.Port,
+			Method:    f.Method,
+			Path:      f.Path,
+			RuleID:    f.RuleID,
+			GrantID:   f.GrantID,
+			Protocol:  f.Protocol,
+			StartedAt: f.StartedAt,
+		}
+	}
+	return out
+}
+
+func (a testFlowAdapter) CountFlows() int                   { return a.flows.Count() }
+func (a testFlowAdapter) RevokeByID(id string) int          { return a.flows.RevokeByID(id) }
+func (a testFlowAdapter) RevokeByGrant(id string) int       { return a.flows.RevokeByGrant(id) }
+func (a testFlowAdapter) RevokeByPrincipal(p, h string) int { return a.flows.RevokeByPrincipal(p, h) }
+
 func tcpPort(t *testing.T, addr net.Addr) uint16 {
 	t.Helper()
 	ta, ok := addr.(*net.TCPAddr)
@@ -145,7 +175,7 @@ rules:
 	srv, err := admin.NewServer(admin.Options{
 		SocketPath: sockPath,
 		Store:      store,
-		Flows:      flows,
+		Flows:      testFlowAdapter{flows: flows},
 		Audit:      aw,
 		Metrics:    col,
 	})
@@ -390,7 +420,7 @@ rules:
 	aSrv, err := admin.NewServer(admin.Options{
 		SocketPath: sockPath,
 		Store:      store,
-		Flows:      flows,
+		Flows:      testFlowAdapter{flows: flows},
 		Audit:      aw,
 		Metrics:    col,
 	})

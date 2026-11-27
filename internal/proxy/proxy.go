@@ -32,15 +32,14 @@ import (
 
 // Options configures a per-link MITM proxy Server.
 type Options struct {
-	Link               config.LinkConfig
-	Store              *config.Store
-	Evaluator          *policy.Evaluator
-	Audit              *audit.Writer
-	Leaves             *ca.LeafCache
-	Dialer             *netguard.Dialer
-	DialContext        func(ctx context.Context, network, addr string) (net.Conn, error)
-	UpstreamRoots      *x509.CertPool
-	Secrets       secret.Resolver
+	Link          config.LinkConfig
+	Store         *config.Store
+	Evaluator     *policy.Evaluator
+	Audit         *audit.Writer
+	Leaves        *ca.LeafCache
+	Dialer        *netguard.Dialer
+	DialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
+	UpstreamRoots *x509.CertPool
 	Flows         *FlowRegistry
 	OnRequest     func(principal, effect string, status int)
 }
@@ -55,7 +54,6 @@ type Server struct {
 	leaves        *ca.LeafCache
 	dialContext   func(ctx context.Context, network, addr string) (net.Conn, error)
 	upstreamRoots *x509.CertPool
-	secrets       secret.Resolver
 	flows         *FlowRegistry
 	onRequest     func(principal, effect string, status int)
 
@@ -82,10 +80,6 @@ func NewServer(opts Options) (*Server, error) {
 			return nil, errors.New("proxy: dialer or dialContext is required")
 		}
 		dialFn = opts.Dialer.DialContext
-	}
-	secrets := opts.Secrets
-	if secrets == nil {
-		secrets = secret.FileResolver{}
 	}
 	flows := opts.Flows
 	if flows == nil {
@@ -116,7 +110,6 @@ func NewServer(opts Options) (*Server, error) {
 		leaves:        opts.Leaves,
 		dialContext:   dialFn,
 		upstreamRoots: opts.UpstreamRoots,
-		secrets:       secrets,
 		flows:         flows,
 		onRequest:     opts.OnRequest,
 		transport:     tr,
@@ -397,7 +390,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 	if !wantWS {
 		matchedBindings := s.eval.MatchBindings(s.link.Principal, host, dstPort, r.Method, r.URL.Path)
 		var subErr error
-		secretNames, subPairs, subErr = secret.ApplyRequest(outHeaders, matchedBindings, dstPort, s.secrets)
+		secretNames, subPairs, subErr = secret.ApplyRequest(outHeaders, matchedBindings, dstPort, secret.FileResolver{})
 		if subErr != nil {
 			var resErr *secret.ResolveError
 			var badNames []string
@@ -522,7 +515,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint1
 			http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
 			return
 		}
-		hostPairs, pairErr := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, host), subPairs, s.secrets)
+		hostPairs, pairErr := secret.ResolveHostPairs(s.eval.HostBindings(s.link.Principal, host), subPairs, secret.FileResolver{})
 		if pairErr != nil {
 			s.auditCompleted(srcIP, r, dstPort, host, dec, af.info.ID, secretNames, http.StatusBadGateway, countingBody.n.Load(), 0, "redaction-secret-unresolved")
 			http.Error(w, "bound secret unavailable for response redaction", http.StatusBadGateway)

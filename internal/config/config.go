@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"net/textproto"
@@ -17,8 +18,6 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/manufactory-project/gateway/internal/audit"
 )
 
 const (
@@ -28,6 +27,7 @@ const (
 	DefaultWSMaxEgressBytes    = 64 << 20 // 64 MiB
 	DefaultMaxHeaderBytes      = 32 << 10 // 32 KiB
 	DefaultAuditRetainDays     = 30
+	MaxAuditRetainDays         = int(math.MaxInt64 / int64(24*time.Hour))
 	DefaultAuditMaxFileBytes   = 100 << 20 // 100 MiB
 	DefaultHTTPSPort           = 10443
 	DefaultHTTPPort            = 10080
@@ -261,8 +261,8 @@ func validate(cfg *Config) error {
 	if cfg.Audit.Dir == "" {
 		return errors.New("audit.dir is required")
 	}
-	if cfg.Audit.RetainDays < 0 || cfg.Audit.RetainDays > audit.MaxRetainDays {
-		return fmt.Errorf("audit.retain_days %d out of range [0, %d]", cfg.Audit.RetainDays, audit.MaxRetainDays)
+	if cfg.Audit.RetainDays < 0 || cfg.Audit.RetainDays > MaxAuditRetainDays {
+		return fmt.Errorf("audit.retain_days %d out of range [0, %d]", cfg.Audit.RetainDays, MaxAuditRetainDays)
 	}
 	if cfg.Audit.MaxFileBytes < 0 {
 		return fmt.Errorf("audit.max_file_bytes must be >= 0, got %d", cfg.Audit.MaxFileBytes)

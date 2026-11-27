@@ -65,12 +65,12 @@ func TestProxySecretsIdentityRedactionAndLiveTeardown(t *testing.T) {
 	}
 
 	var (
-		upReceived       atomic.Int32
-		streamStarted    = make(chan struct{}, 16)
-		wsStarted        = make(chan struct{}, 4)
-		holdRelease      = make(chan struct{})
-		seenHeadersMu    sync.Mutex
-		lastSeenHeaders  http.Header
+		upReceived      atomic.Int32
+		streamStarted   = make(chan struct{}, 16)
+		wsStarted       = make(chan struct{}, 4)
+		holdRelease     = make(chan struct{})
+		seenHeadersMu   sync.Mutex
+		lastSeenHeaders http.Header
 	)
 
 	upSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

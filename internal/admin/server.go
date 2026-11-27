@@ -1,5 +1,5 @@
 // Package admin implements gatewayd's minimal Unix-domain-socket (0660) JSON Admin API
-// and its typed client for gwctl (NOW.md:67).
+// and its typed client for gwctl.
 package admin
 
 import (
@@ -10,20 +10,41 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/config"
 	"github.com/manufactory-project/gateway/internal/metrics"
-	"github.com/manufactory-project/gateway/internal/proxy"
 )
+
+// FlowInfo describes one active in-flight HTTP request, H2 stream, SSE stream, or WebSocket flow.
+type FlowInfo struct {
+	ID        string    `json:"id"`
+	Principal string    `json:"principal"`
+	Link      string    `json:"link"`
+	Host      string    `json:"host"`
+	Port      uint16    `json:"port"`
+	Method    string    `json:"method"`
+	Path      string    `json:"path"`
+	RuleID    string    `json:"rule_id,omitempty"`
+	GrantID   string    `json:"grant_id,omitempty"`
+	Protocol  string    `json:"protocol"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+// FlowManager exposes the minimal active-flow query and revocation operations needed by Admin.
+type FlowManager interface {
+	ListFlows() []FlowInfo
+	CountFlows() int
+	RevokeByID(flowID string) int
+	RevokeByGrant(grantID string) int
+	RevokeByPrincipal(principal, host string) int
+}
 
 // StatusResponse is returned by GET /v1/status.
 type StatusResponse struct {
@@ -70,7 +91,7 @@ type Options struct {
 	SocketPath  string
 	SocketGroup string
 	Store       *config.Store
-	Flows       *proxy.FlowRegistry
+	Flows       FlowManager
 	Audit       *audit.Writer
 	Metrics     *metrics.Collector
 }
@@ -80,7 +101,7 @@ type Server struct {
 	socketPath  string
 	socketGroup string
 	store       *config.Store
-	flows       *proxy.FlowRegistry
+	flows       FlowManager
 	audit       *audit.Writer
 	metrics     *metrics.Collector
 
@@ -187,7 +208,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, StatusResponse{
 		ConfigHash:       snap.Hash,
 		LoadedAt:         snap.LoadedAt,
-		ActiveFlows:      s.flows.Count(),
+		ActiveFlows:      s.flows.CountFlows(),
 		ActiveGrants:     len(s.store.ActiveGrants()),
 		AuditHealthy:     s.audit.Healthy(),
 		AuditWriteErrors: s.audit.WriteErrors(),
@@ -229,7 +250,7 @@ func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleFlows(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.flows.List())
+	writeJSON(w, http.StatusOK, s.flows.ListFlows())
 }
 
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
@@ -355,116 +376,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
-}
-
-// Client talks to gatewayd's Admin API over its local Unix domain socket.
-type Client struct {
-	httpClient *http.Client
-	transport  *http.Transport
-}
-
-// NewClient creates a Unix-socket Admin API Client.
-func NewClient(socketPath string) *Client {
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", socketPath)
-		},
-	}
-	return &Client{
-		httpClient: &http.Client{Transport: tr},
-		transport:  tr,
-	}
-}
-
-// Close closes idle Unix socket connections held by Client.
-func (c *Client) Close() {
-	c.transport.CloseIdleConnections()
-}
-
-// Status calls GET /v1/status.
-func (c *Client) Status(ctx context.Context) (StatusResponse, error) {
-	var out StatusResponse
-	err := c.doJSON(ctx, http.MethodGet, "/v1/status", nil, &out)
-	return out, err
-}
-
-// Reload calls POST /v1/reload.
-func (c *Client) Reload(ctx context.Context) (ReloadResponse, error) {
-	var out ReloadResponse
-	err := c.doJSON(ctx, http.MethodPost, "/v1/reload", nil, &out)
-	return out, err
-}
-
-// Flows calls GET /v1/flows.
-func (c *Client) Flows(ctx context.Context) ([]proxy.FlowInfo, error) {
-	var out []proxy.FlowInfo
-	err := c.doJSON(ctx, http.MethodGet, "/v1/flows", nil, &out)
-	return out, err
-}
-
-// Revoke calls POST /v1/revoke.
-func (c *Client) Revoke(ctx context.Context, req RevokeRequest) (RevokeResponse, error) {
-	var out RevokeResponse
-	err := c.doJSON(ctx, http.MethodPost, "/v1/revoke", req, &out)
-	return out, err
-}
-
-// Grants calls GET /v1/grants.
-func (c *Client) Grants(ctx context.Context) ([]config.Grant, error) {
-	var out []config.Grant
-	err := c.doJSON(ctx, http.MethodGet, "/v1/grants", nil, &out)
-	return out, err
-}
-
-// CreateGrant calls POST /v1/grants.
-func (c *Client) CreateGrant(ctx context.Context, req GrantRequest) (config.Grant, error) {
-	var out config.Grant
-	err := c.doJSON(ctx, http.MethodPost, "/v1/grants", req, &out)
-	return out, err
-}
-
-// DeleteGrant calls DELETE /v1/grants/{id}.
-func (c *Client) DeleteGrant(ctx context.Context, id string) (RevokeResponse, error) {
-	var out RevokeResponse
-	err := c.doJSON(ctx, http.MethodDelete, "/v1/grants/"+url.PathEscape(id), nil, &out)
-	return out, err
-}
-
-func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any) error {
-	var bodyReader io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		bodyReader = strings.NewReader(string(raw))
-	}
-	req, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, bodyReader)
-	if err != nil {
-		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			return
-		}
-	}()
-	if resp.StatusCode >= 400 {
-		rawErr, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			return fmt.Errorf("admin: %s %s status %d (read err: %w)", method, path, resp.StatusCode, readErr)
-		}
-		return fmt.Errorf("admin: %s %s status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(rawErr)))
-	}
-	if out == nil {
-		return nil
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
 }

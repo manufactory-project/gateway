@@ -132,8 +132,8 @@ func TestConfigValidationInvariants(t *testing.T) {
 			wantError: "does not match any declared link",
 		},
 		{
-			name: "reject overlapping link subnets",
-			yaml: strings.Replace(validYAML, "subnet: 10.200.0.16/28\n    gateway_ip: 10.200.0.17", "subnet: 10.200.0.0/24\n    gateway_ip: 10.200.0.20", 1),
+			name:      "reject overlapping link subnets",
+			yaml:      strings.Replace(validYAML, "subnet: 10.200.0.16/28\n    gateway_ip: 10.200.0.17", "subnet: 10.200.0.0/24\n    gateway_ip: 10.200.0.20", 1),
 			wantError: "overlaps subnet",
 		},
 		{

@@ -247,7 +247,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 			SocketPath:  cfg.Admin.Socket,
 			SocketGroup: cfg.Admin.SocketGroup,
 			Store:       store,
-			Flows:       flows,
+			Flows:       adminFlowAdapter{flows: flows},
 			Audit:       auditWriter,
 			Metrics:     collector,
 		})
@@ -327,4 +327,45 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		}
 	}
 	return shutdownAll()
+}
+
+type adminFlowAdapter struct {
+	flows *proxy.FlowRegistry
+}
+
+func (a adminFlowAdapter) ListFlows() []admin.FlowInfo {
+	src := a.flows.List()
+	out := make([]admin.FlowInfo, len(src))
+	for i, f := range src {
+		out[i] = admin.FlowInfo{
+			ID:        f.ID,
+			Principal: f.Principal,
+			Link:      f.Link,
+			Host:      f.Host,
+			Port:      f.Port,
+			Method:    f.Method,
+			Path:      f.Path,
+			RuleID:    f.RuleID,
+			GrantID:   f.GrantID,
+			Protocol:  f.Protocol,
+			StartedAt: f.StartedAt,
+		}
+	}
+	return out
+}
+
+func (a adminFlowAdapter) CountFlows() int {
+	return a.flows.Count()
+}
+
+func (a adminFlowAdapter) RevokeByID(flowID string) int {
+	return a.flows.RevokeByID(flowID)
+}
+
+func (a adminFlowAdapter) RevokeByGrant(grantID string) int {
+	return a.flows.RevokeByGrant(grantID)
+}
+
+func (a adminFlowAdapter) RevokeByPrincipal(principal, host string) int {
+	return a.flows.RevokeByPrincipal(principal, host)
 }

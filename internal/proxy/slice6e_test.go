@@ -52,16 +52,16 @@ func (r *stepResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.A
 }
 
 // TestSectionEWireInvariants covers every remaining NOW.md:104 wire test from Slice 6 Section E:
-// - H2 :authority and port mismatch (separate from H1 Host/SNI)
-// - Port 80 to a bound host: no substitution, placeholder stripped
-// - H2 grant isolation: (a) two multiplexed H2 streams under distinct grants on one conn;
-//   (b) separate conn under another grant untouched when first grant is revoked
-// - SIGHUP while a stream is open under a grant: grant wiped + stream torn down (cancel + conn.Close)
-// - Proxy 503 when audit sink cannot be written (upstream received == 0)
-// - No substitution of placeholder in body or query string
-// - git smart HTTP (GET /repo.git/info/refs + POST /repo.git/git-upload-pack) false-positive control
-// - Two-step DNS rebinding through the proxy (real netguard.Dialer)
-// - Subscription MITM auth + cookie passthrough with zero audit leakage
+//   - H2 :authority and port mismatch (separate from H1 Host/SNI)
+//   - Port 80 to a bound host: no substitution, placeholder stripped
+//   - H2 grant isolation: (a) two multiplexed H2 streams under distinct grants on one conn;
+//     (b) separate conn under another grant untouched when first grant is revoked
+//   - SIGHUP while a stream is open under a grant: grant wiped + stream torn down (cancel + conn.Close)
+//   - Proxy 503 when audit sink cannot be written (upstream received == 0)
+//   - No substitution of placeholder in body or query string
+//   - git smart HTTP (GET /repo.git/info/refs + POST /repo.git/git-upload-pack) false-positive control
+//   - Two-step DNS rebinding through the proxy (real netguard.Dialer)
+//   - Subscription MITM auth + cookie passthrough with zero audit leakage
 func TestSectionEWireInvariants(t *testing.T) {
 	dir := t.TempDir()
 	auditDir := filepath.Join(dir, "audit")
@@ -574,8 +574,8 @@ rules:
 		t.Fatalf("AddGrant gC: %v", err)
 	}
 
-	cMux := makeH2Client("h2grant.example.com")  // ONE shared H2 conn (MaxConnsPerHost: 1)
-	cSep := makeH2Client("h2grant.example.com")  // SEPARATE H2 conn
+	cMux := makeH2Client("h2grant.example.com") // ONE shared H2 conn (MaxConnsPerHost: 1)
+	cSep := makeH2Client("h2grant.example.com") // SEPARATE H2 conn
 
 	rA, err := cMux.Get("https://h2grant.example.com/stream-a")
 	if err != nil {
