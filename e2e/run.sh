@@ -663,6 +663,118 @@ start_guest_peer_listener() {
   "
 }
 
+# Run a guest probe, re-running up to 3 times ONLY if every failing check is in
+# the public-upstream set AND gatewayd's audit proves gatewayd forwarded the
+# request and the upstream returned 4xx/5xx. Containment failures never retry.
+run_probe_with_upstream_retry() {
+  local principal="$1"
+  local probe_fn="$2"
+  local quiet_on_pass="${3:-0}"
+  local max_reruns=3
+  local attempt=0
+
+  while true; do
+    attempt=$((attempt + 1))
+    local audit_before
+    audit_before="$(gw_exec bash -ceu 'cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | wc -l')"
+    local out_file="$TMPDIR_WORK/probe-${principal}-try${attempt}.jsonl"
+    local audit_file="$TMPDIR_WORK/audit-${principal}-try${attempt}.jsonl"
+
+    local probe_rc=0
+    "$probe_fn" >"$out_file" 2>&1 || probe_rc=$?
+    if [[ "$probe_rc" -eq 0 ]]; then
+      if [[ "$quiet_on_pass" -eq 0 ]]; then
+        cat "$out_file"
+      fi
+      if [[ "$attempt" -gt 1 ]]; then
+        echo "    PASS: ${principal} probe passed on re-run $((attempt - 1)) of ${max_reruns}"
+      fi
+      return 0
+    fi
+
+    gw_exec bash -ceu "cat /var/log/gatewayd/audit/*.jsonl 2>/dev/null | tail -n +$((audit_before + 1))" >"$audit_file"
+
+    echo "    WARN: ${principal} probe attempt ${attempt} failed (rc=${probe_rc}); checking upstream audit evidence..."
+    local retry_ok=0
+    python3 - "$out_file" "$audit_file" "$principal" "$UPSTREAM_HOST" <<'PY' || retry_ok=$?
+import json, sys
+
+probe_path, audit_path, principal, upstream = sys.argv[1:5]
+retryable = {
+    "transfer_upload_gt64k": ("POST", "/post"),
+    "transfer_download_gt64k": ("GET", "/bytes/70000"),
+    "allowed_tcp_443_by_name_control": ("GET", "/get"),
+    "sni_host_match_control": ("GET", "/get"),
+    "direct_https_dial_by_name_control": ("GET", "/get"),
+}
+
+failed_rows = []
+with open(probe_path, "r", encoding="utf-8") as fh:
+    for raw in fh:
+        s = raw.strip()
+        if not s or not s.startswith("{"):
+            continue
+        obj = json.loads(s)
+        if not obj.get("pass"):
+            failed_rows.append((obj["check"], s))
+
+if not failed_rows:
+    sys.stderr.write("    NO RETRY: probe exited non-zero with zero JSONL failure lines\n")
+    sys.exit(1)
+
+for chk, raw in failed_rows:
+    print(f"    failing check JSONL: {raw}")
+
+non_retryable = [chk for chk, _ in failed_rows if chk not in retryable]
+if non_retryable:
+    sys.stderr.write(f"    NO RETRY: containment/non-upstream check(s) failed: {non_retryable}\n")
+    sys.exit(1)
+
+audit_rows = []
+with open(audit_path, "r", encoding="utf-8") as fh:
+    for raw in fh:
+        s = raw.strip()
+        if not s or not s.startswith("{"):
+            continue
+        audit_rows.append((json.loads(s), s))
+
+for chk, _ in failed_rows:
+    want_method, want_path = retryable[chk]
+    matches = [
+        raw for obj, raw in audit_rows
+        if obj.get("kind") == "request"
+        and obj.get("principal") == principal
+        and obj.get("effect") == "allow"
+        and obj.get("host") == upstream
+        and obj.get("method") == want_method
+        and obj.get("path") == want_path
+        and 400 <= int(obj.get("status", 0)) <= 599
+    ]
+    if not matches:
+        sys.stderr.write(
+            f"    NO RETRY: no forwarded 4xx/5xx audit record for {chk} "
+            f"({principal} {want_method} {upstream}{want_path})\n"
+        )
+        sys.exit(1)
+    for m in matches:
+        print(f"    matching upstream 4xx/5xx audit: {m}")
+PY
+
+    if [[ "$retry_ok" -ne 0 ]]; then
+      cat "$out_file"
+      return "$probe_rc"
+    fi
+
+    if [[ "$attempt" -gt "$max_reruns" ]]; then
+      echo "    FAIL: ${principal} still failing after ${max_reruns} upstream re-runs" >&2
+      cat "$out_file"
+      return "$probe_rc"
+    fi
+    echo "    re-running ${principal} probe (re-run ${attempt} of ${max_reruns})..."
+    sleep 2
+  done
+}
+
 echo "==> Step 2.4: Verifying LAN control from gateway, guest :8080 controls, and running gatewayd-probe"
 lan_host="${LAN_ADDR%:*}"
 lan_port="${LAN_ADDR##*:}"
@@ -673,8 +785,8 @@ fi
 echo "    PASS: LAN control ${LAN_ADDR} accepts TCP from gateway container"
 start_guest_peer_listener "$G0_INST" "$G0_IP"
 start_guest_peer_listener "$G1_INST" "$G1_IP"
-run_probe_guest0
-run_probe_guest1
+run_probe_with_upstream_retry guest0 run_probe_guest0 0
+run_probe_with_upstream_retry guest1 run_probe_guest1 0
 
 restore_guests_dhcp() {
   configure_guest_dhcp "$G0_INST" "10.200.0.1" "10.200.0.0/28"
@@ -863,7 +975,7 @@ restore_dataplane() {
 if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then
   echo "==> Step 2.6 (defect): remove fib daddr type local guard"
   echo "    running green baseline (guest0 probe)..."
-  run_probe_guest0 >/dev/null
+  run_probe_with_upstream_retry guest0 run_probe_guest0 1
   echo "    PASS: baseline green"
   gw_exec bash -ceu '
     deleted=0
@@ -890,7 +1002,7 @@ if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then
     "unreachable_gateway_mgmt,peer_link_ip_unreachable" \
     "unreachable_gateway_mgmt,peer_link_ip_unreachable"
   echo "    verifying restore (guest0 probe)..."
-  run_probe_guest0 >/dev/null
+  run_probe_with_upstream_retry guest0 run_probe_guest0 1
   echo "    PASS: fib-local defect detected and dataplane restored"
 fi
 
@@ -932,7 +1044,7 @@ fi
 if [[ "$DEFECT_DROP_DNS_DNAT" -eq 1 ]]; then
   echo "==> Step 2.6 (defect): remove :53 DNAT"
   echo "    running green baseline (guest0 probe)..."
-  run_probe_guest0 >/dev/null
+  run_probe_with_upstream_retry guest0 run_probe_guest0 1
   echo "    PASS: baseline green"
   gw_exec bash -ceu '
     deleted=0
@@ -959,7 +1071,7 @@ if [[ "$DEFECT_DROP_DNS_DNAT" -eq 1 ]]; then
     "dns_redirect_udp_53,dns_redirect_tcp_53,dns_allow_a_control" \
     "dns_redirect_udp_53,dns_redirect_tcp_53,dns_allow_a_control,dns_refused_txt,dns_refused_mx,dns_refused_ns,dns_refused_srv,dns_refused_cname,dns_refused_non_allowlisted,dns_nodata_aaaa,dns_nodata_https,dns_nodata_svcb,allowed_tcp_443_by_name_control,transfer_upload_gt64k,transfer_download_gt64k"
   echo "    verifying restore (guest0 probe)..."
-  run_probe_guest0 >/dev/null
+  run_probe_with_upstream_retry guest0 run_probe_guest0 1
   echo "    PASS: DNS DNAT defect detected and dataplane restored"
 fi
 
