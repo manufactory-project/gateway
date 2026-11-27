@@ -70,15 +70,15 @@ func runAdminCmd(ctx context.Context, socketPath, cmd string, cmdArgs []string, 
 
 	switch cmd {
 	case "status":
-		return runStatus(ctx, client, jsonOut, stdout)
+		return runStatus(ctx, client, cmdArgs, jsonOut, stdout, stderr)
 	case "reload":
-		return runReload(ctx, client, jsonOut, stdout)
+		return runReload(ctx, client, cmdArgs, jsonOut, stdout, stderr)
 	case "flows":
-		return runFlows(ctx, client, jsonOut, stdout)
+		return runFlows(ctx, client, cmdArgs, jsonOut, stdout, stderr)
 	case "revoke":
 		return runRevoke(ctx, client, cmdArgs, jsonOut, stdout, stderr)
 	case "grants":
-		return runGrants(ctx, client, jsonOut, stdout)
+		return runGrants(ctx, client, cmdArgs, jsonOut, stdout, stderr)
 	case "grant":
 		return runGrant(ctx, client, cmdArgs, jsonOut, stdout, stderr)
 	default:
@@ -86,7 +86,22 @@ func runAdminCmd(ctx context.Context, socketPath, cmd string, cmdArgs []string, 
 	}
 }
 
-func runStatus(ctx context.Context, client *admin.Client, jsonOut bool, stdout io.Writer) error {
+func parseNoArgs(name string, args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: %s (unexpected arguments: %s)", name, strings.Join(fs.Args(), " "))
+	}
+	return nil
+}
+
+func runStatus(ctx context.Context, client *admin.Client, cmdArgs []string, jsonOut bool, stdout, stderr io.Writer) error {
+	if err := parseNoArgs("gateway status", cmdArgs, stderr); err != nil {
+		return err
+	}
 	st, err := client.Status(ctx)
 	if err != nil {
 		return err
@@ -99,7 +114,10 @@ func runStatus(ctx context.Context, client *admin.Client, jsonOut bool, stdout i
 	return err
 }
 
-func runReload(ctx context.Context, client *admin.Client, jsonOut bool, stdout io.Writer) error {
+func runReload(ctx context.Context, client *admin.Client, cmdArgs []string, jsonOut bool, stdout, stderr io.Writer) error {
+	if err := parseNoArgs("gateway reload", cmdArgs, stderr); err != nil {
+		return err
+	}
 	res, err := client.Reload(ctx)
 	if err != nil {
 		return err
@@ -111,7 +129,10 @@ func runReload(ctx context.Context, client *admin.Client, jsonOut bool, stdout i
 	return err
 }
 
-func runFlows(ctx context.Context, client *admin.Client, jsonOut bool, stdout io.Writer) error {
+func runFlows(ctx context.Context, client *admin.Client, cmdArgs []string, jsonOut bool, stdout, stderr io.Writer) error {
+	if err := parseNoArgs("gateway flows", cmdArgs, stderr); err != nil {
+		return err
+	}
 	flows, err := client.Flows(ctx)
 	if err != nil {
 		return err
@@ -138,6 +159,9 @@ func runRevoke(ctx context.Context, client *admin.Client, cmdArgs []string, json
 	if err := rfs.Parse(cmdArgs); err != nil {
 		return err
 	}
+	if rfs.NArg() != 0 {
+		return fmt.Errorf("usage: gateway revoke [--flow ID] [--grant ID] [--principal NAME [--host HOST]] (unexpected arguments: %s)", strings.Join(rfs.Args(), " "))
+	}
 	res, err := client.Revoke(ctx, admin.RevokeRequest{
 		FlowID:    *flowID,
 		GrantID:   *grantID,
@@ -154,7 +178,10 @@ func runRevoke(ctx context.Context, client *admin.Client, cmdArgs []string, json
 	return err
 }
 
-func runGrants(ctx context.Context, client *admin.Client, jsonOut bool, stdout io.Writer) error {
+func runGrants(ctx context.Context, client *admin.Client, cmdArgs []string, jsonOut bool, stdout, stderr io.Writer) error {
+	if err := parseNoArgs("gateway grants", cmdArgs, stderr); err != nil {
+		return err
+	}
 	grants, err := client.Grants(ctx)
 	if err != nil {
 		return err
@@ -171,20 +198,29 @@ func runGrants(ctx context.Context, client *admin.Client, jsonOut bool, stdout i
 	return nil
 }
 
+func runGrantRevoke(ctx context.Context, client *admin.Client, args []string, jsonOut bool, stdout, stderr io.Writer) error {
+	grfs := flag.NewFlagSet("gateway grant revoke", flag.ContinueOnError)
+	grfs.SetOutput(stderr)
+	if err := grfs.Parse(args); err != nil {
+		return err
+	}
+	if grfs.NArg() != 1 {
+		return errors.New("usage: gateway grant revoke <id>")
+	}
+	res, err := client.DeleteGrant(ctx, grfs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		return printJSON(stdout, res)
+	}
+	_, err = fmt.Fprintf(stdout, "revoked_grant=%v revoked_flows=%d\n", res.RevokedGrant, res.RevokedFlows)
+	return err
+}
+
 func runGrant(ctx context.Context, client *admin.Client, cmdArgs []string, jsonOut bool, stdout, stderr io.Writer) error {
 	if len(cmdArgs) > 0 && cmdArgs[0] == "revoke" {
-		if len(cmdArgs) != 2 {
-			return errors.New("usage: gateway grant revoke <id>")
-		}
-		res, err := client.DeleteGrant(ctx, cmdArgs[1])
-		if err != nil {
-			return err
-		}
-		if jsonOut {
-			return printJSON(stdout, res)
-		}
-		_, err = fmt.Fprintf(stdout, "revoked_grant=%v revoked_flows=%d\n", res.RevokedGrant, res.RevokedFlows)
-		return err
+		return runGrantRevoke(ctx, client, cmdArgs[1:], jsonOut, stdout, stderr)
 	}
 	gfs := flag.NewFlagSet("gateway grant", flag.ContinueOnError)
 	gfs.SetOutput(stderr)
@@ -196,6 +232,9 @@ func runGrant(ctx context.Context, client *admin.Client, cmdArgs []string, jsonO
 	ttl := gfs.String("ttl", "5m", "grant TTL duration")
 	if err := gfs.Parse(cmdArgs); err != nil {
 		return err
+	}
+	if gfs.NArg() != 0 {
+		return fmt.Errorf("usage: gateway grant --principal NAME --host HOST [--port 443|80] [--methods CSV] [--paths CSV] [--ttl 5m] (unexpected arguments: %s)", strings.Join(gfs.Args(), " "))
 	}
 	if *port > 65535 {
 		return fmt.Errorf("grant: port %d exceeds 65535", *port)
@@ -254,6 +293,9 @@ func runCA(args []string, asJSON bool, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: gateway ca init --cert <path> --key <path> (unexpected arguments: %s)", strings.Join(fs.Args(), " "))
+	}
 	if _, err := ca.Init(*certPath, *keyPath); err != nil {
 		return err
 	}
@@ -274,6 +316,9 @@ func runDataplane(ctx context.Context, args []string, asJSON bool, stdout, stder
 	procSysRoot := fs.String("proc-sys-root", "/proc/sys", "root directory for sysctl check")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: gateway dataplane check --config <path> (unexpected arguments: %s)", strings.Join(fs.Args(), " "))
 	}
 	if *cfgPath == "" {
 		return errors.New("dataplane check: --config is required")

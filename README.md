@@ -7,7 +7,7 @@ Linux-first, headless, egress-only network gateway for isolating sandboxed guest
 - **`cmd/gateway`** — single binary providing the daemon, root dataplane setup, and operator CLI:
   - `gateway run --config <path>`: unprivileged daemon (zero `CAP_NET_ADMIN`) serving per-link DNS, HTTPS, and HTTP listeners, Unix-socket Admin API (`/run/gateway/admin.sock`), and optional `/metrics`.
   - `gateway netsetup --config <path> [--dry-run]`: privileged one-shot setup applying kernel sysctls, per-link `ip` addresses/rules/routes, atomic `nftables` (`table inet gw`), DHCP-only `dnsmasq.conf`, and `dataplane.ready`.
-  - Operator subcommands (`--socket PATH`, `--json` before or after any subcommand):
+  - Operator subcommands (`--socket PATH` before the subcommand; `--json` before or after any subcommand):
     - `gateway status`
     - `gateway reload`
     - `gateway flows`

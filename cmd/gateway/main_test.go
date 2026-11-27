@@ -508,3 +508,122 @@ links:
 		t.Fatalf("gateway dataplane check must be read-only and not create ready_file %s (stat err=%v)", readyFile, err)
 	}
 }
+
+func TestGatewayCLIArgumentHandling(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	auditDir := filepath.Join(dir, "audit")
+	sockPath := filepath.Join(dir, "admin.sock")
+
+	if _, err := ca.Init(certPath, keyPath); err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+links:
+  - name: sbx0
+    principal: worker-claude
+    subnet: 127.0.28.0/28
+    gateway_ip: 127.0.28.1
+rules:
+  - id: r1
+    principal: worker-claude
+    effect: allow
+    hosts: [api.anthropic.com]
+    ports: [443]
+`, certPath, keyPath, auditDir)
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := aw.Close(); err != nil {
+			t.Errorf("audit close: %v", err)
+		}
+	})
+	aSrv, err := admin.NewServer(admin.Options{
+		SocketPath: sockPath,
+		Store:      store,
+		Flows:      adminFlowAdapter{flows: proxy.NewFlowRegistry()},
+		Audit:      aw,
+		Metrics:    metrics.NewCollector(metrics.Options{}),
+	})
+	if err != nil {
+		t.Fatalf("admin.NewServer: %v", err)
+	}
+	if err := aSrv.Start(); err != nil {
+		t.Fatalf("admin.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := aSrv.Shutdown(ctx); err != nil {
+			t.Errorf("admin.Shutdown: %v", err)
+		}
+	})
+
+	// --socket before status and before revoke works.
+	var statusOut, statusErr bytes.Buffer
+	if err := run(context.Background(), []string{"--socket", sockPath, "status"}, &statusOut, &statusErr); err != nil {
+		t.Fatalf("gateway --socket <sock> status failed: %v (stderr=%s)", err, statusErr.String())
+	}
+	if !strings.Contains(statusOut.String(), "audit_healthy=true") {
+		t.Fatalf("unexpected status output: %s", statusOut.String())
+	}
+
+	var revokeOut, revokeErr bytes.Buffer
+	if err := run(context.Background(), []string{"--socket", sockPath, "revoke", "--principal", "worker-claude"}, &revokeOut, &revokeErr); err != nil {
+		t.Fatalf("gateway --socket <sock> revoke failed: %v (stderr=%s)", err, revokeErr.String())
+	}
+	if !strings.Contains(revokeOut.String(), "revoked_flows=0") {
+		t.Fatalf("unexpected revoke output: %s", revokeOut.String())
+	}
+
+	// Unexpected positional arguments and unknown flags are rejected across all subcommands.
+	invalidCases := [][]string{
+		{"--socket", sockPath, "status", "extra"},
+		{"--socket", sockPath, "status", "--bogus"},
+		{"status", "--socket", sockPath},
+		{"--socket", sockPath, "reload", "extra"},
+		{"--socket", sockPath, "reload", "--bogus"},
+		{"--socket", sockPath, "flows", "extra"},
+		{"--socket", sockPath, "flows", "--bogus"},
+		{"--socket", sockPath, "grants", "extra"},
+		{"--socket", sockPath, "grants", "--bogus"},
+		{"--socket", sockPath, "revoke", "--principal", "worker-claude", "extra"},
+		{"--socket", sockPath, "revoke", "--bogus"},
+		{"--socket", sockPath, "grant", "--principal", "worker-claude", "--host", "example.com", "extra"},
+		{"--socket", sockPath, "grant", "--bogus"},
+		{"--socket", sockPath, "grant", "revoke"},
+		{"--socket", sockPath, "grant", "revoke", "id1", "extra"},
+		{"--socket", sockPath, "grant", "revoke", "--bogus"},
+		{"ca", "init", "--cert", filepath.Join(dir, "c2.crt"), "--key", filepath.Join(dir, "c2.key"), "extra"},
+		{"ca", "init", "--bogus"},
+		{"dataplane", "check", "--config", cfgPath, "extra"},
+		{"dataplane", "check", "--bogus"},
+	}
+	for _, args := range invalidCases {
+		var out, errBuf bytes.Buffer
+		err := run(context.Background(), args, &out, &errBuf)
+		if err == nil {
+			t.Errorf("expected gateway %v to fail with usage/flag error, got nil (stdout=%q)", args, out.String())
+			continue
+		}
+		if !strings.Contains(err.Error(), "usage:") && !strings.Contains(err.Error(), "flag provided but not defined") {
+			t.Errorf("gateway %v returned unexpected error %q (want usage or flag error)", args, err.Error())
+		}
+	}
+}
