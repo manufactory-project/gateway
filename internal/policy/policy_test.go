@@ -218,3 +218,28 @@ rules:
 		t.Fatalf("worst allowed glob on 32 KiB non-matching path took %v, want < 10ms", elapsed)
 	}
 }
+
+func TestGrantIsolationBetweenPrincipals(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	st := makeStore(t, policyYAML, func() time.Time { return now })
+	ev := policy.NewEvaluator(st)
+
+	g, err := st.AddGrant("worker-a", "iso-grant.example.com", 443, []string{"GET"}, []string{"/only-a"}, 5*time.Minute, false)
+	if err != nil {
+		t.Fatalf("AddGrant: %v", err)
+	}
+
+	if d := ev.DecideHost("worker-a", "iso-grant.example.com", 443); !d.Allow || d.GrantID != g.ID {
+		t.Fatalf("worker-a host-scope grant allow failed: %+v", d)
+	}
+	if d := ev.DecideRequest("worker-a", "iso-grant.example.com", 443, "GET", "/only-a"); !d.Allow || d.GrantID != g.ID {
+		t.Fatalf("worker-a request-scope grant allow failed: %+v", d)
+	}
+
+	if d := ev.DecideHost("worker-b", "iso-grant.example.com", 443); d.Allow {
+		t.Fatalf("worker-b must not be admitted at host scope by worker-a grant: %+v", d)
+	}
+	if d := ev.DecideRequest("worker-b", "iso-grant.example.com", 443, "GET", "/only-a"); d.Allow {
+		t.Fatalf("worker-b must not be admitted at request scope by worker-a grant: %+v", d)
+	}
+}
