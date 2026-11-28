@@ -36,12 +36,21 @@ ca:
   key_path: /tmp/ca.key
 audit:
   dir: /tmp/audit
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t216
+    ct_zone: 216
+    route_table: 216
     principal: worker-a
     subnet: 127.0.10.0/28
     gateway_ip: 127.0.10.1
   - name: sbx1
+    interface: t217
+    ct_zone: 217
+    route_table: 217
     principal: worker-b
     subnet: 127.0.20.0/28
     gateway_ip: 127.0.20.1
@@ -191,8 +200,14 @@ ca:
   key_path: /tmp/ca.key
 audit:
   dir: /tmp/audit
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t218
+    ct_zone: 218
+    route_table: 218
     principal: worker-a
     subnet: 127.0.10.0/28
     gateway_ip: 127.0.10.1
@@ -270,8 +285,14 @@ ca:
   key_path: /tmp/ca.key
 audit:
   dir: /tmp/audit
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t219
+    ct_zone: 219
+    route_table: 219
     principal: worker-a
     subnet: 127.0.10.0/28
     gateway_ip: 127.0.10.1
@@ -326,9 +347,12 @@ func twoPrincipalEvaluator(t *testing.T) *policy.Evaluator {
 	cfg := `
 ca: {cert_path: /tmp/ca.crt, key_path: /tmp/ca.key}
 audit: {dir: /tmp/audit}
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
-  - {name: a, principal: alice, subnet: 127.9.1.0/28, gateway_ip: 127.9.1.1}
-  - {name: b, principal: bob, subnet: 127.9.2.0/28, gateway_ip: 127.9.2.1}
+  - {name: a, principal: alice, subnet: 127.9.1.0/28, gateway_ip: 127.9.1.1, interface: t220, ct_zone: 220, route_table: 220}
+  - {name: b, principal: bob, subnet: 127.9.2.0/28, gateway_ip: 127.9.2.1, interface: t221, ct_zone: 221, route_table: 221}
 rules:
   - id: alice-bound
     principal: alice

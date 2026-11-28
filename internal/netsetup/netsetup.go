@@ -50,7 +50,7 @@ type IPCommand struct {
 // RenderNftables generates the atomic nftables ruleset for table inet gw from cfg.
 // All traffic to, from and through the retired interfaces is dropped.
 func RenderNftables(cfg *config.Config, retired ...string) (string, error) {
-	links := linuxLinks(cfg)
+	links := cfg.Links
 	if len(links) == 0 && len(retired) == 0 {
 		return "", errors.New("netsetup: no links declare a Linux interface")
 	}
@@ -168,7 +168,7 @@ func DesiredSysctls(cfg *config.Config) []Sysctl {
 		{Key: "net.ipv4.ip_forward", Value: "0"},
 		{Key: "net.ipv6.conf.all.forwarding", Value: "0"},
 	}
-	for _, l := range linuxLinks(cfg) {
+	for _, l := range cfg.Links {
 		out = append(out,
 			Sysctl{Key: fmt.Sprintf("net.ipv4.conf.%s.rp_filter", l.Interface), Value: "2"},
 			Sysctl{Key: fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6", l.Interface), Value: "1"},
@@ -183,7 +183,7 @@ func DesiredSysctls(cfg *config.Config) []Sysctl {
 // per-link scope-link routes, and source-based policy routing rules.
 func IPCommands(cfg *config.Config) []IPCommand {
 	var cmds []IPCommand
-	for _, l := range linuxLinks(cfg) {
+	for _, l := range cfg.Links {
 		addrWithPrefix := fmt.Sprintf("%s/%d", l.ParsedGatewayIP, l.ParsedSubnet.Bits())
 		gwHost := fmt.Sprintf("%s/32", l.ParsedGatewayIP)
 		tableStr := strconv.Itoa(l.RouteTable)
@@ -204,7 +204,7 @@ func IPCommands(cfg *config.Config) []IPCommand {
 // Unconditional dhcp-broadcast (no tag) + no-ping ensures dnsmasq drops both
 // CAP_NET_ADMIN and CAP_NET_RAW after binding port 67 and dropping to dhcp.user.
 func RenderDnsmasq(cfg *config.Config) (string, error) {
-	links := linuxLinks(cfg)
+	links := cfg.Links
 	if len(links) == 0 {
 		return "", errors.New("netsetup: no links declare a Linux interface")
 	}
@@ -355,7 +355,7 @@ func applyWithPaths(ctx context.Context, cfg *config.Config, procSysRoot string,
 		released := func(m managedInterface) bool { return slices.Contains(release, m.Name) }
 		rec.Interfaces = slices.DeleteFunc(rec.Interfaces, released)
 		retired = slices.DeleteFunc(retired, released)
-		if err := loadRuleset(ctx, renderRuleset(linuxLinks(cfg), interfaceNames(retired))); err != nil {
+		if err := loadRuleset(ctx, renderRuleset(cfg.Links, interfaceNames(retired))); err != nil {
 			return err
 		}
 		if err := saveRecord(cfg.Dataplane.StateFile, rec, expectedUID); err != nil {
@@ -548,16 +548,6 @@ func CheckNftTable(ctx context.Context) error {
 		return fmt.Errorf("netsetup: nft list table inet %s failed: %w: %s", NftTableName, err, strings.TrimSpace(stderr.String()))
 	}
 	return VerifyNftTableOutput(stdout.String())
-}
-
-func linuxLinks(cfg *config.Config) []config.LinkConfig {
-	var links []config.LinkConfig
-	for _, l := range cfg.Links {
-		if l.Interface != "" {
-			links = append(links, l)
-		}
-	}
-	return links
 }
 
 // dhcpPool computes a contiguous multi-address DHCP pool inside prefix excluding

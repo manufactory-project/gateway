@@ -203,17 +203,6 @@ func Parse(data []byte) (*Config, error) {
 	return &cfg, nil
 }
 
-// HasLinuxLinks reports whether any configured link declares a Linux interface
-// (in which case sysctls are always verified at startup and during dataplane check).
-func (c *Config) HasLinuxLinks() bool {
-	for _, l := range c.Links {
-		if l.Interface != "" {
-			return true
-		}
-	}
-	return false
-}
-
 func applyDefaults(cfg *Config) {
 	if cfg.Audit.RetainDays == 0 {
 		cfg.Audit.RetainDays = DefaultAuditRetainDays
@@ -305,17 +294,15 @@ func validate(cfg *Config) error {
 	if err := validateRecords(cfg); err != nil {
 		return err
 	}
-	declaredPrincipals, hasLinuxIf, err := validateLinks(cfg)
+	declaredPrincipals, err := validateLinks(cfg)
 	if err != nil {
 		return err
 	}
-	if hasLinuxIf {
-		if cfg.Dataplane.ReadyFile == "" || !filepath.IsAbs(cfg.Dataplane.ReadyFile) {
-			return fmt.Errorf("dataplane.ready_file %q must be an absolute path when any Linux link interface is configured", cfg.Dataplane.ReadyFile)
-		}
-		if err := validateDHCP(cfg.Dataplane.DHCP); err != nil {
-			return err
-		}
+	if !filepath.IsAbs(cfg.Dataplane.ReadyFile) {
+		return fmt.Errorf("dataplane.ready_file %q must be an absolute path", cfg.Dataplane.ReadyFile)
+	}
+	if err := validateDHCP(cfg.Dataplane.DHCP); err != nil {
+		return err
 	}
 	if !filepath.IsAbs(cfg.Dataplane.StateFile) {
 		return fmt.Errorf("dataplane.state_file %q must be an absolute path", cfg.Dataplane.StateFile)
@@ -443,9 +430,9 @@ type linkSubnet struct {
 	prefix netip.Prefix
 }
 
-func validateLinks(cfg *Config) (map[string]bool, bool, error) {
+func validateLinks(cfg *Config) (map[string]bool, error) {
 	if len(cfg.Links) == 0 {
-		return nil, false, errors.New("links: at least one link is required")
+		return nil, errors.New("links: at least one link is required")
 	}
 
 	principals := make(map[string]bool, len(cfg.Links))
@@ -455,75 +442,63 @@ func validateLinks(cfg *Config) (map[string]bool, bool, error) {
 	seenZones := make(map[uint16]bool, len(cfg.Links))
 	seenTables := make(map[int]bool, len(cfg.Links))
 	var subnets []linkSubnet
-	hasLinuxIf := false
 
 	for i := range cfg.Links {
 		l := &cfg.Links[i]
-		isLinux, err := validateLinkIdentity(i, l, seenNames, seenIfs, seenZones, seenTables)
-		if err != nil {
-			return nil, false, err
-		}
-		if isLinux {
-			hasLinuxIf = true
+		if err := validateLinkIdentity(i, l, seenNames, seenIfs, seenZones, seenTables); err != nil {
+			return nil, err
 		}
 		principals[l.Principal] = true
 
 		sub, err := validateLinkSubnetAndGateway(l, subnets, seenIPs)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		subnets = append(subnets, linkSubnet{name: l.Name, prefix: sub})
 
 		if err := validateLinkPorts(l); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
-	return principals, hasLinuxIf, nil
+	return principals, nil
 }
 
-func validateLinkIdentity(i int, l *LinkConfig, seenNames, seenIfs map[string]bool, seenZones map[uint16]bool, seenTables map[int]bool) (bool, error) {
+func validateLinkIdentity(i int, l *LinkConfig, seenNames, seenIfs map[string]bool, seenZones map[uint16]bool, seenTables map[int]bool) error {
 	if l.Name == "" || !isSafeIdentifier(l.Name) {
-		return false, fmt.Errorf("links[%d].name %q is invalid", i, l.Name)
+		return fmt.Errorf("links[%d].name %q is invalid", i, l.Name)
 	}
 	if seenNames[l.Name] {
-		return false, fmt.Errorf("links: duplicate link name %q", l.Name)
+		return fmt.Errorf("links: duplicate link name %q", l.Name)
 	}
 	seenNames[l.Name] = true
 
 	if l.Principal == "" || !isSafeIdentifier(l.Principal) {
-		return false, fmt.Errorf("links[%s].principal %q is invalid", l.Name, l.Principal)
+		return fmt.Errorf("links[%s].principal %q is invalid", l.Name, l.Principal)
 	}
 
-	hasLinuxIf := false
-	if l.Interface != "" {
-		hasLinuxIf = true
-		if !isValidIfName(l.Interface) {
-			return false, fmt.Errorf("links[%s].interface %q is invalid", l.Name, l.Interface)
-		}
-		if seenIfs[l.Interface] {
-			return false, fmt.Errorf("links: duplicate interface %q", l.Interface)
-		}
-		seenIfs[l.Interface] = true
-		if l.CTZone == 0 {
-			return false, fmt.Errorf("links[%s].ct_zone must be > 0 when interface is set", l.Name)
-		}
-		if l.RouteTable <= 0 || l.RouteTable == 253 || l.RouteTable == 254 || l.RouteTable == 255 {
-			return false, fmt.Errorf("links[%s].route_table %d is invalid (reserved or <= 0)", l.Name, l.RouteTable)
-		}
+	// Every link needs a dataplane: a link without one would be served unguarded.
+	if !isValidIfName(l.Interface) {
+		return fmt.Errorf("links[%s].interface %q is required and must be a valid interface name", l.Name, l.Interface)
 	}
-	if l.CTZone > 0 {
-		if seenZones[l.CTZone] {
-			return false, fmt.Errorf("links: duplicate ct_zone %d", l.CTZone)
-		}
-		seenZones[l.CTZone] = true
+	if seenIfs[l.Interface] {
+		return fmt.Errorf("links: duplicate interface %q", l.Interface)
 	}
-	if l.RouteTable > 0 {
-		if seenTables[l.RouteTable] {
-			return false, fmt.Errorf("links: duplicate route_table %d", l.RouteTable)
-		}
-		seenTables[l.RouteTable] = true
+	seenIfs[l.Interface] = true
+	if l.CTZone == 0 {
+		return fmt.Errorf("links[%s].ct_zone must be > 0", l.Name)
 	}
-	return hasLinuxIf, nil
+	if seenZones[l.CTZone] {
+		return fmt.Errorf("links: duplicate ct_zone %d", l.CTZone)
+	}
+	seenZones[l.CTZone] = true
+	if l.RouteTable <= 0 || l.RouteTable == 253 || l.RouteTable == 254 || l.RouteTable == 255 {
+		return fmt.Errorf("links[%s].route_table %d is invalid (reserved or <= 0)", l.Name, l.RouteTable)
+	}
+	if seenTables[l.RouteTable] {
+		return fmt.Errorf("links: duplicate route_table %d", l.RouteTable)
+	}
+	seenTables[l.RouteTable] = true
+	return nil
 }
 
 func validateLinkSubnetAndGateway(l *LinkConfig, prevSubnets []linkSubnet, seenIPs map[netip.Addr]bool) (netip.Prefix, error) {
@@ -580,10 +555,10 @@ func validateLinkPorts(l *LinkConfig) error {
 
 func validateDHCP(d DHCPConfig) error {
 	if d.User == "" || !isSafeIdentifier(d.User) {
-		return fmt.Errorf("dataplane.dhcp.user %q is required and must be a valid username when sandbox interfaces are configured", d.User)
+		return fmt.Errorf("dataplane.dhcp.user %q is required and must be a valid username", d.User)
 	}
 	if d.LeaseFile == "" || !filepath.IsAbs(d.LeaseFile) {
-		return fmt.Errorf("dataplane.dhcp.lease_file %q must be an absolute path when sandbox interfaces are configured", d.LeaseFile)
+		return fmt.Errorf("dataplane.dhcp.lease_file %q must be an absolute path", d.LeaseFile)
 	}
 	if d.ConfigPath != "" && !filepath.IsAbs(d.ConfigPath) {
 		return fmt.Errorf("dataplane.dhcp.config_path %q must be an absolute path", d.ConfigPath)

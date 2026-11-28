@@ -28,7 +28,7 @@ func TestAdmissionRecheckBlocksRevokedGrantBetweenAdmitAndRegister(t *testing.T)
 	if err != nil {
 		t.Fatalf("ca.Init: %v", err)
 	}
-	cfgYAML := "ca:\n  cert_path: " + certPath + "\n  key_path: " + keyPath + "\naudit:\n  dir: " + auditDir + "\nlinks:\n  - name: sbx0\n    principal: worker-test\n    subnet: 127.0.29.0/28\n    gateway_ip: 127.0.29.1\n"
+	cfgYAML := "ca:\n  cert_path: " + certPath + "\n  key_path: " + keyPath + "\naudit:\n  dir: " + auditDir + "\ndataplane:\n  ready_file: /run/gateway-dataplane/dataplane.ready\n  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}\nlinks:\n  - name: sbx0\n    interface: sbx0\n    ct_zone: 101\n    route_table: 101\n    principal: worker-test\n    subnet: 127.0.29.0/28\n    gateway_ip: 127.0.29.1\n"
 	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -109,7 +109,7 @@ func TestAdmissionRecheckBlocksWhenOnlyAllowWebSocketChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ca.Init: %v", err)
 	}
-	baseYAML := "ca:\n  cert_path: " + certPath + "\n  key_path: " + keyPath + "\naudit:\n  dir: " + auditDir + "\nlinks:\n  - name: sbx0\n    principal: worker-test\n    subnet: 127.0.29.0/28\n    gateway_ip: 127.0.29.1\nrules:\n  - id: allow-ws-recheck\n    principal: worker-test\n    effect: allow\n    hosts: [ws-recheck.example.com]\n    ports: [443]\n    paths: [\"/**\"]\n"
+	baseYAML := "ca:\n  cert_path: " + certPath + "\n  key_path: " + keyPath + "\naudit:\n  dir: " + auditDir + "\ndataplane:\n  ready_file: /run/gateway-dataplane/dataplane.ready\n  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}\nlinks:\n  - name: sbx0\n    interface: sbx0\n    ct_zone: 101\n    route_table: 101\n    principal: worker-test\n    subnet: 127.0.29.0/28\n    gateway_ip: 127.0.29.1\nrules:\n  - id: allow-ws-recheck\n    principal: worker-test\n    effect: allow\n    hosts: [ws-recheck.example.com]\n    ports: [443]\n    paths: [\"/**\"]\n"
 	cfgPath := filepath.Join(dir, "gateway.yaml")
 	if err := os.WriteFile(cfgPath, []byte(baseYAML+"    allow_websocket: false\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)

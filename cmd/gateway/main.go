@@ -331,10 +331,8 @@ func runDataplaneCheck(ctx context.Context, cfgPath, procSysRoot string, asJSON 
 	if err := netsetup.CheckNftTable(ctx); err != nil {
 		return err
 	}
-	if cfg.HasLinuxLinks() {
-		if err := netsetup.VerifySysctls(procSysRoot, cfg); err != nil {
-			return err
-		}
+	if err := netsetup.VerifySysctls(procSysRoot, cfg); err != nil {
+		return err
 	}
 	if asJSON {
 		return printJSON(stdout, map[string]string{"status": "ok", "table": "inet " + netsetup.NftTableName})

@@ -41,8 +41,14 @@ ca:
   key_path: /tmp/ca.key
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t211
+    ct_zone: 211
+    route_table: 211
     principal: worker-bench
     subnet: 127.0.39.0/28
     gateway_ip: 127.0.39.1

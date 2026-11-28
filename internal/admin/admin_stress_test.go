@@ -183,8 +183,14 @@ ca:
   key_path: /tmp/ca.key
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t207
+    ct_zone: 207
+    route_table: 207
     principal: worker-claude
     subnet: 127.0.21.0/28
     gateway_ip: 127.0.21.1
@@ -390,8 +396,14 @@ http:
 records:
   stress.example.com: 127.0.0.1
   ephemeral.example.com: 127.0.0.1
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t208
+    ct_zone: 208
+    route_table: 208
     principal: worker-stress
     subnet: 127.0.22.0/28
     gateway_ip: 127.0.22.1
@@ -778,8 +790,14 @@ ca:
   key_path: %s
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t209
+    ct_zone: 209
+    route_table: 209
     principal: worker-a
     subnet: 127.0.23.0/28
     gateway_ip: 127.0.23.1
@@ -1022,8 +1040,14 @@ func TestGrantRevokeAndReloadAuditCompleteness(t *testing.T) {
   key_path: %s
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t210
+    ct_zone: 210
+    route_table: 210
     principal: worker-a
     subnet: 127.0.24.0/28
     gateway_ip: 127.0.24.1

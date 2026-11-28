@@ -65,6 +65,26 @@ func freePorts(t *testing.T, ip string, n int) []uint16 {
 	return ports
 }
 
+// fakeSysctls builds a /proc/sys tree holding every sysctl the config requires.
+func fakeSysctls(t *testing.T, cfgPath string) string {
+	t.Helper()
+	cfg, _, err := config.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	root := t.TempDir()
+	for _, sc := range netsetup.DesiredSysctls(cfg) {
+		p := filepath.Join(root, strings.ReplaceAll(sc.Key, ".", string(os.PathSeparator)))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir sysctl %s: %v", p, err)
+		}
+		if err := os.WriteFile(p, []byte(sc.Value+"\n"), 0o644); err != nil {
+			t.Fatalf("write sysctl %s: %v", p, err)
+		}
+	}
+	return root
+}
+
 func TestGatewayNetsetupDryRunAndStartupGuards(t *testing.T) {
 	dir := t.TempDir()
 
@@ -130,8 +150,12 @@ metrics:
   listen: 127.0.0.1:%d
 dataplane:
   ready_file: %s
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t201
+    ct_zone: 201
+    route_table: 201
     principal: worker-claude
     subnet: 127.0.26.0/28
     gateway_ip: 127.0.26.1
@@ -150,8 +174,12 @@ rules:
 		t.Fatalf("write daemon yaml: %v", err)
 	}
 
-	if err := serveDaemon(context.Background(), cfgPath, "/proc/sys", &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
-		t.Fatal("expected daemon to refuse startup when ready_file is missing")
+	procSysRoot := fakeSysctls(t, cfgPath)
+	// A daemon that wrongly starts returns nil when startCtx ends, failing the assertion.
+	startCtx, startCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer startCancel()
+	if err := serveDaemon(startCtx, cfgPath, procSysRoot, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "ready_file") {
+		t.Fatalf("expected daemon to refuse startup when ready_file is missing, got %v", err)
 	}
 
 	// Positive control: once ready_file exists, daemon starts, answers /v1/status, and shuts down cleanly.
@@ -161,10 +189,17 @@ rules:
 	if err := os.WriteFile(readyFile, []byte("ok\n"), 0o644); err != nil {
 		t.Fatalf("write readyFile: %v", err)
 	}
+	// With the ready_file present, missing sysctls alone still refuse startup.
+	sysCtx, sysCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer sysCancel()
+	if err := serveDaemon(sysCtx, cfgPath, t.TempDir(), &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "sysctl") {
+		t.Fatalf("expected daemon to refuse startup without required sysctls, got %v", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(ctx, cfgPath, "/proc/sys", &bytes.Buffer{}, &bytes.Buffer{})
+		done <- serveDaemon(ctx, cfgPath, procSysRoot, &bytes.Buffer{}, &bytes.Buffer{})
 	}()
 
 	client := admin.NewClient(sockPath)
@@ -210,8 +245,14 @@ ca:
   key_path: %s
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t202
+    ct_zone: 202
+    route_table: 202
     principal: worker-claude
     subnet: 127.0.25.0/28
     gateway_ip: 127.0.25.1
@@ -342,8 +383,12 @@ admin:
   socket: %s
 dataplane:
   ready_file: %s
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t203
+    ct_zone: 203
+    route_table: 203
     principal: worker-claude
     subnet: 127.0.27.0/28
     gateway_ip: 127.0.27.1
@@ -362,10 +407,11 @@ rules:
 		t.Fatalf("write config: %v", err)
 	}
 
+	procSysRoot := fakeSysctls(t, cfgPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(ctx, cfgPath, "/proc/sys", &bytes.Buffer{}, &bytes.Buffer{})
+		done <- serveDaemon(ctx, cfgPath, procSysRoot, &bytes.Buffer{}, &bytes.Buffer{})
 	}()
 
 	client := admin.NewClient(sockPath)
@@ -489,16 +535,7 @@ links:
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
-	procSysRoot := filepath.Join(dir, "proc-sys")
-	for _, sc := range netsetup.DesiredSysctls(cfg) {
-		p := filepath.Join(procSysRoot, strings.ReplaceAll(sc.Key, ".", string(os.PathSeparator)))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatalf("mkdir sysctl %s: %v", p, err)
-		}
-		if err := os.WriteFile(p, []byte(sc.Value+"\n"), 0o644); err != nil {
-			t.Fatalf("write sysctl %s: %v", p, err)
-		}
-	}
+	procSysRoot := fakeSysctls(t, cfgPath)
 
 	binDir := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
@@ -550,8 +587,14 @@ ca:
   key_path: %s
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t204
+    ct_zone: 204
+    route_table: 204
     principal: worker-claude
     subnet: 127.0.28.0/28
     gateway_ip: 127.0.28.1
@@ -688,8 +731,14 @@ admin:
   socket: %s
 metrics:
   listen: 127.0.0.1:%d
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t205
+    ct_zone: 205
+    route_table: 205
     principal: worker-claude
     subnet: 127.0.29.0/28
     gateway_ip: 127.0.29.1
@@ -839,8 +888,14 @@ ca:
   key_path: %s
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t206
+    ct_zone: 206
+    route_table: 206
     principal: worker-claude
     subnet: 127.0.30.0/28
     gateway_ip: 127.0.30.1

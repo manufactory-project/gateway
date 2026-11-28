@@ -172,6 +172,11 @@ func TestConfigValidationInvariants(t *testing.T) {
 			wantError: "duplicate placeholder",
 		},
 		{
+			name:      "reject link without interface",
+			yaml:      strings.Replace(validYAML, "    interface: sbx0\n", "", 1),
+			wantError: "links[sbx0].interface",
+		},
+		{
 			name:      "reject missing ready_file when Linux link exists",
 			yaml:      strings.Replace(validYAML, "  ready_file: /run/gateway-dataplane/dataplane.ready\n", "", 1),
 			wantError: "dataplane.ready_file",

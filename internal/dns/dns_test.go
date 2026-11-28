@@ -84,8 +84,14 @@ audit:
 dns:
   fake_cidr: 198.18.0.0/15
   ttl_seconds: 60
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t212
+    ct_zone: 212
+    route_table: 212
     principal: worker-claude
     subnet: 127.0.11.0/28
     gateway_ip: 127.0.11.1
@@ -341,8 +347,14 @@ ca:
   key_path: /tmp/ca.key
 audit:
   dir: ` + auditDir + `
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t213
+    ct_zone: 213
+    route_table: 213
     principal: worker-malformed
     subnet: 127.0.12.0/28
     gateway_ip: 127.0.12.1

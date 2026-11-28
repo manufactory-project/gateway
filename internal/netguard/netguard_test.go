@@ -170,8 +170,14 @@ audit:
   dir: /tmp/audit
 records:
   pinned.lan.example: 127.0.0.1
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t214
+    ct_zone: 214
+    route_table: 214
     principal: worker-a
     subnet: 127.0.10.0/28
     gateway_ip: 127.0.10.1

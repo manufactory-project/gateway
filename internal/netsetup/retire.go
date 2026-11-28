@@ -189,7 +189,7 @@ func mergeRecord(prev record, live []string, cfg *config.Config) record {
 	for _, name := range live {
 		add(name)
 	}
-	for _, l := range linuxLinks(cfg) {
+	for _, l := range cfg.Links {
 		add(l.Interface, assignment{
 			GatewayIP:  l.ParsedGatewayIP,
 			PrefixBits: l.ParsedSubnet.Bits(),
@@ -206,7 +206,7 @@ func mergeRecord(prev record, live []string, cfg *config.Config) record {
 }
 
 func isConfigured(cfg *config.Config, name string) bool {
-	return slices.ContainsFunc(linuxLinks(cfg), func(l config.LinkConfig) bool { return l.Interface == name })
+	return slices.ContainsFunc(cfg.Links, func(l config.LinkConfig) bool { return l.Interface == name })
 }
 
 func retiredInterfaces(rec record, cfg *config.Config) []managedInterface {

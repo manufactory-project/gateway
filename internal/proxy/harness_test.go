@@ -217,7 +217,8 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 			fmt.Fprintf(&sb, "  %s: 127.0.0.1\n", h)
 		}
 	}
-	fmt.Fprintf(&sb, "links:\n  - name: sbx0\n    principal: %s\n    subnet: %s\n    gateway_ip: %s\n    https_port: %d\n    http_port: %d\n    dns_port: %d\n",
+	sb.WriteString("dataplane:\n  ready_file: /run/gateway-dataplane/dataplane.ready\n  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}\n")
+	fmt.Fprintf(&sb, "links:\n  - name: sbx0\n    interface: sbx0\n    ct_zone: 101\n    route_table: 101\n    principal: %s\n    subnet: %s\n    gateway_ip: %s\n    https_port: %d\n    http_port: %d\n    dns_port: %d\n",
 		principal, linkSubnet, linkIP, httpsPort, httpPort, dnsPort)
 	if spec.RulesYAML != "" {
 		sb.WriteString("rules:\n")

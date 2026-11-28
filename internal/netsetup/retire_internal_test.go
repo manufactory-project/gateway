@@ -16,7 +16,7 @@ const (
 `
 	testLinkSbx1 = `  - {name: sbx1, interface: sbx1, principal: worker-b, subnet: 10.200.0.16/28, gateway_ip: 10.200.0.17, ct_zone: 102, route_table: 102}
 `
-	testLinkNoInterface = `  - {name: local, principal: worker-c, subnet: 10.200.0.32/28, gateway_ip: 10.200.0.33}
+	testLinkSbx2 = `  - {name: sbx2, interface: sbx2, principal: worker-c, subnet: 10.200.0.32/28, gateway_ip: 10.200.0.33, ct_zone: 103, route_table: 103}
 `
 )
 
@@ -247,11 +247,13 @@ func TestRetiredInterfaceNeedNotExist(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(h.procRoot, "net", "ipv4", "conf", "sbx1")); err != nil {
 		t.Fatalf("remove sbx1: %v", err)
 	}
+	h.addInterface("sbx2")
 	h.write(h.ipFailures, "")
-	// Only the cleanup commands may fail; with no configured link every ip call is cleanup.
-	err := h.apply(testLinkNoInterface)
-	if err == nil || !strings.Contains(err.Error(), "no links declare a Linux interface") {
-		t.Fatalf("err = %v, want no-links error", err)
+	// Every ip call fails. Cleanup of the retired interfaces must not abort the run,
+	// so the first reported failure belongs to the configured link.
+	err := h.apply(testLinkSbx2)
+	if err == nil || !strings.Contains(err.Error(), "ip link set dev sbx2 up failed") {
+		t.Fatalf("err = %v, want the configured link's ip failure", err)
 	}
 	assertBlocked(t, h.read(h.loaded), "sbx0", "sbx1")
 }

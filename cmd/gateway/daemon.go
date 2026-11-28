@@ -167,15 +167,11 @@ func (rt *daemonRuntime) shutdownAll() error {
 
 func verifyStartupDataplane(cfg *config.Config, procSysRoot string) error {
 	// Startup dataplane checks (unprivileged; zero CAP_NET_ADMIN required).
-	if cfg.HasLinuxLinks() {
-		if err := netsetup.VerifySysctls(procSysRoot, cfg); err != nil {
-			return fmt.Errorf("startup sysctl check failed: %w", err)
-		}
+	if err := netsetup.VerifySysctls(procSysRoot, cfg); err != nil {
+		return fmt.Errorf("startup sysctl check failed: %w", err)
 	}
-	if cfg.Dataplane.ReadyFile != "" {
-		if _, err := os.Stat(cfg.Dataplane.ReadyFile); err != nil {
-			return fmt.Errorf("dataplane ready_file %s missing (run ExecStartPre=+ gateway netsetup first): %w", cfg.Dataplane.ReadyFile, err)
-		}
+	if _, err := os.Stat(cfg.Dataplane.ReadyFile); err != nil {
+		return fmt.Errorf("dataplane ready_file %s missing (run ExecStartPre=+ gateway netsetup first): %w", cfg.Dataplane.ReadyFile, err)
 	}
 	return nil
 }

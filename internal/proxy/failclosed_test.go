@@ -796,8 +796,14 @@ ca:
   key_path: %s
 audit:
   dir: %s
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
 links:
   - name: sbx0
+    interface: t215
+    ct_zone: 215
+    route_table: 215
     principal: worker-test
     subnet: %s
     gateway_ip: %s
