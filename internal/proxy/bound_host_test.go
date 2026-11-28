@@ -210,6 +210,25 @@ func TestUnreadableBoundSecretFailsBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestBodilessRequestsKeepZeroLengthUpstream(t *testing.T) {
+	var length atomic.Int64
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			length.Store(r.ContentLength)
+		}),
+		RulesYAML: openRule,
+	})
+	c := gw.H1Client(t, "api.example.com")
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		length.Store(-99)
+		resp := do(t, c, method, "https://api.example.com/x", nil)
+		if resp.StatusCode != http.StatusOK || length.Load() != 0 {
+			t.Fatalf("%s: status = %d, upstream ContentLength = %d; want 200 and 0", method, resp.StatusCode, length.Load())
+		}
+	}
+}
+
 func TestReloadRemovingTheAdmittingRuleTearsDownItsFlow(t *testing.T) {
 	release := make(chan struct{})
 	gw := newTestGateway(t, testGatewaySpec{

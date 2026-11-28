@@ -622,7 +622,13 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 	}
 
 	countingBody := &countingReadCloser{rc: http.MaxBytesReader(w, rc.r.Body, rc.maxBody)}
-	outReq, err := buildOutboundRequest(reqCtx, rc, countingBody)
+	// A nil body keeps a bodiless request bodiless; a non-nil reader with length 0
+	// would be sent upstream as a body of unknown length.
+	var body io.Reader
+	if rc.r.ContentLength != 0 {
+		body = countingBody
+	}
+	outReq, err := buildOutboundRequest(reqCtx, rc, body)
 	if err != nil {
 		rc.deny(w, http.StatusBadGateway, "build-request-failed")
 		return
