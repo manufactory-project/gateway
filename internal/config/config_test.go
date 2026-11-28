@@ -177,6 +177,46 @@ func TestConfigValidationInvariants(t *testing.T) {
 			wantError: "links[sbx0].interface",
 		},
 		{
+			name:      "reject zero ct_zone",
+			yaml:      strings.Replace(validYAML, "ct_zone: 101", "ct_zone: 0", 1),
+			wantError: "links[sbx0].ct_zone must be > 0",
+		},
+		{
+			name:      "reject 0 route_table",
+			yaml:      strings.Replace(validYAML, "route_table: 101", "route_table: 0", 1),
+			wantError: "links[sbx0].route_table 0 is invalid",
+		},
+		{
+			name:      "reject negative route_table",
+			yaml:      strings.Replace(validYAML, "route_table: 101", "route_table: -1", 1),
+			wantError: "links[sbx0].route_table -1 is invalid",
+		},
+		{
+			name:      "reject 253 route_table",
+			yaml:      strings.Replace(validYAML, "route_table: 101", "route_table: 253", 1),
+			wantError: "links[sbx0].route_table 253 is invalid",
+		},
+		{
+			name:      "reject 254 route_table",
+			yaml:      strings.Replace(validYAML, "route_table: 101", "route_table: 254", 1),
+			wantError: "links[sbx0].route_table 254 is invalid",
+		},
+		{
+			name:      "reject 255 route_table",
+			yaml:      strings.Replace(validYAML, "route_table: 101", "route_table: 255", 1),
+			wantError: "links[sbx0].route_table 255 is invalid",
+		},
+		{
+			name:      "reject missing dhcp.user",
+			yaml:      strings.Replace(validYAML, "    user: dnsmasq\n", "", 1),
+			wantError: "dataplane.dhcp.user",
+		},
+		{
+			name:      "reject missing dhcp.lease_file",
+			yaml:      strings.Replace(validYAML, "    lease_file: /var/lib/gateway/dnsmasq.leases\n", "", 1),
+			wantError: "dataplane.dhcp.lease_file",
+		},
+		{
 			name:      "reject missing ready_file when Linux link exists",
 			yaml:      strings.Replace(validYAML, "  ready_file: /run/gateway-dataplane/dataplane.ready\n", "", 1),
 			wantError: "dataplane.ready_file",
