@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -905,19 +904,8 @@ rules:
 	}
 }
 
-type grantExpiredOrderSpy struct {
-	flows        *proxy.FlowRegistry
-	seen         atomic.Bool
-	flowsAtAudit atomic.Int64
-}
-
-func (s *grantExpiredOrderSpy) Write(p []byte) (int, error) {
-	if bytes.Contains(p, []byte(`"reason":"grant-expired"`)) {
-		s.flowsAtAudit.Store(int64(s.flows.Count()))
-		s.seen.Store(true)
-	}
-	return len(p), nil
-}
+// auditEpoch is the instant the ordering test's audit clock reads when no flow is open.
+var auditEpoch = time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
 
 func TestGrantExpiryTearsDownFlowsBeforeAuditWrite(t *testing.T) {
 	dir := t.TempDir()
@@ -981,9 +969,14 @@ links:
 		t.Fatalf("NewStore: %v", err)
 	}
 	flows := proxy.NewFlowRegistry()
-	spy := &grantExpiredOrderSpy{flows: flows}
-	spy.flowsAtAudit.Store(-1)
-	aw, err := audit.NewWriter(audit.Options{Dir: auditDir, Stdout: spy})
+	// WriteSync stamps each record with Now before anything else it does. This
+	// clock encodes the open flow count into that stamp, so the audit file itself
+	// records how many flows were open when each record was written: the ordering
+	// is read from the authoritative sink, not from the asynchronous stdout mirror.
+	aw, err := audit.NewWriter(audit.Options{
+		Dir: auditDir,
+		Now: func() time.Time { return auditEpoch.Add(time.Duration(flows.Count())) },
+	})
 	if err != nil {
 		t.Fatalf("audit.NewWriter: %v", err)
 	}
@@ -1055,10 +1048,39 @@ links:
 		t.Logf("close resp body: %v", cErr)
 	}
 
-	if !spy.seen.Load() {
-		t.Fatal("grant-expired audit line was not observed")
+	flowsAtAudit := map[audit.Kind]int64{}
+	paths, err := filepath.Glob(filepath.Join(auditDir, "*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob audit: %v", err)
 	}
-	if got := spy.flowsAtAudit.Load(); got != 0 {
-		t.Fatalf("flows.Count() during grant-expired audit write = %d, want 0 (teardown must run before audit write)", got)
+	for _, path := range paths {
+		raw, rErr := os.ReadFile(path)
+		if rErr != nil {
+			t.Fatalf("read audit %s: %v", path, rErr)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			var ev audit.Event
+			if uErr := json.Unmarshal([]byte(line), &ev); uErr != nil {
+				t.Fatalf("unmarshal audit line %q: %v", line, uErr)
+			}
+			if ev.Reason == "grant-expired" {
+				flowsAtAudit["grant-expired"] = int64(ev.Time.Sub(auditEpoch))
+			}
+			if ev.Kind == audit.KindRequestAdmitted {
+				flowsAtAudit["admitted"] = int64(ev.Time.Sub(auditEpoch))
+			}
+		}
+	}
+	// Positive control: the clock reads the flow count, so the admission record,
+	// written while the request's flow is open, carries exactly one.
+	if got, ok := flowsAtAudit["admitted"]; !ok || got != 1 {
+		t.Fatalf("flows open at the admission record = %d (found %v), want 1", got, ok)
+	}
+	got, ok := flowsAtAudit["grant-expired"]
+	if !ok {
+		t.Fatal("grant-expired audit line was not written")
+	}
+	if got != 0 {
+		t.Fatalf("flows open when the grant-expired record was written = %d, want 0 (teardown must run before audit write)", got)
 	}
 }
