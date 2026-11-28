@@ -37,12 +37,12 @@ const statusClientClosedRequest = 499
 
 // Options configures a per-link MITM proxy Server.
 type Options struct {
-	Link           config.LinkConfig
-	Store          *config.Store
-	Evaluator      *policy.Evaluator
-	Audit          *audit.Writer
-	Leaves         *ca.LeafCache
-	Dialer         *netguard.Dialer
+	Link      config.LinkConfig
+	Store     *config.Store
+	Evaluator *policy.Evaluator
+	Audit     *audit.Writer
+	Leaves    *ca.LeafCache
+	Dialer    *netguard.Dialer
 	// DialContext is a test hook: tests redirect ports 443 and 80 to local mock
 	// upstreams, still through netguard.Dialer. Production leaves it nil.
 	DialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
