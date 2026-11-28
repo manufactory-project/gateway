@@ -49,7 +49,7 @@ Provided:
 
 - Default deny per principal, checked for each DNS lookup and each HTTP request.
 - A JSONL record of each DNS and request decision, naming the principal. Paths are recorded; query strings, headers and bodies are not. If the record cannot be written before a lookup is answered or a request is sent, it is refused. Connections dropped at the connection limit are only counted in metrics.
-- Limits on concurrent HTTP and HTTPS connections per link (DNS over TCP is not limited), request body size, header size, bytes a guest sends on a WebSocket, and total audit log size.
+- Limits on concurrent connections per link (HTTP and HTTPS together, and DNS over TCP separately; DNS over UDP is not limited), request body size, header size, bytes a guest sends on a WebSocket, and total audit log size.
 
 Not prevented:
 

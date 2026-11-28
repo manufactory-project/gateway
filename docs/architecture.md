@@ -103,14 +103,15 @@ There is no audit query API. Read the files, or ship stdout records to a log sys
 | `internal/config` | Schema, validation, reload, grants | none |
 | `internal/audit` | JSONL writer, rotation, pruning | none |
 | `internal/ca` | CA creation and loading, certificate cache | none |
+| `internal/connlimit` | Per-link connection cap | none |
 | `internal/metrics` | Prometheus collector and listener | none |
 | `internal/policy` | Rule and grant matching | `config` |
 | `internal/netguard` | Connect-by-name and address checks | `config` |
 | `internal/netsetup` | nftables, sysctls, `ip` and dnsmasq config | `config` |
 | `internal/secret` | Secret files, substitution, redaction | `config` |
-| `internal/dns` | DNS server | `audit`, `config`, `policy` |
+| `internal/dns` | DNS server | `audit`, `config`, `connlimit`, `policy` |
 | `internal/admin` | Admin API and client | `audit`, `config`, `metrics` |
-| `internal/proxy` | HTTP, TLS and WebSocket handling | `audit`, `ca`, `config`, `netguard`, `policy`, `secret` |
+| `internal/proxy` | HTTP, TLS and WebSocket handling | `audit`, `ca`, `config`, `connlimit`, `netguard`, `policy`, `secret` |
 | `cmd/gateway` | Daemon and CLI | wires the packages together |
 | `cmd/gateway-probe` | Guest-side containment checks | none; standard library only |
 

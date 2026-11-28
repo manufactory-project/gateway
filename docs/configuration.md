@@ -245,7 +245,7 @@ Keep `state_file` on storage that survives reboots. If you move or delete it and
 | `max_request_body_bytes` | 33554432 (32 MiB) | One request body |
 | `ws_max_egress_bytes` | 67108864 (64 MiB) | Bytes a guest sends on one WebSocket |
 | `max_header_bytes` | 32768 | Headers |
-| `max_conns_per_link` | 512 | Concurrent HTTP and HTTPS connections per link; DNS over TCP is not counted |
+| `max_conns_per_link` | 512 | Concurrent connections per link. HTTP and HTTPS share one budget of this size, and DNS over TCP has its own. DNS over UDP is not limited |
 | `upstream_response_header_timeout` | `10m` | Wait for an upstream's response headers |
 
 The WebSocket upgrade handshake has a fixed 30 second limit.

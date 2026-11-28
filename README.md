@@ -253,7 +253,7 @@ The example configs serve Prometheus metrics at `http://127.0.0.1:9102/metrics`:
 |---|---|
 | `gateway_requests_total` | Requests, by principal, effect, status and reason |
 | `gateway_dns_queries_total` | DNS queries, by principal and effect |
-| `gateway_conns_rejected_total` | Connections dropped at the link limit |
+| `gateway_conns_rejected_total` | HTTP, HTTPS and DNS over TCP connections dropped at the link limit |
 | `gateway_active_flows`, `gateway_active_grants` | Current flows and grants |
 | `gateway_reloads_total` | Reload attempts, by result |
 | `gateway_revocations_total` | Flows closed by revocation, grant expiry or reload |
