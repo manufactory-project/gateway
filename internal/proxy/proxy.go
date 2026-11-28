@@ -107,6 +107,12 @@ type Server struct {
 	httpsSrv *http.Server
 	httpSrv  *http.Server
 	wg       sync.WaitGroup
+
+	// mu guards draining; handlers counts requests inside serveHTTP, hijacked
+	// WebSockets included, so Shutdown can wait for their completion audit.
+	mu       sync.Mutex
+	draining bool
+	handlers sync.WaitGroup
 }
 
 // NewServer constructs a per-link Server without binding sockets yet.
@@ -305,8 +311,8 @@ func (s *Server) Start() error {
 }
 
 func serveUntilClosed(srv *http.Server, ln net.Listener, onErr func(error)) {
-	// Shutdown closes the listener and causes Serve to return http.ErrServerClosed.
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	// Shutdown closes the listener, which makes Serve return a closed-listener error.
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		if onErr != nil {
 			onErr(err)
 		}
@@ -320,19 +326,40 @@ func auditBestEffort(w *audit.Writer, ev audit.Event) {
 	}
 }
 
-// Shutdown drains listeners, tears down remaining link flows, closes idle upstream connections, and waits for goroutines.
+// Shutdown stops accepting, refuses new requests, tears down the link's
+// remaining flows (WebSockets included), and returns once every handler has
+// written its completion audit, so the caller may close the audit writer next.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.flows.drainLink(s.link.Name)
+	s.mu.Lock()
+	s.draining = true
+	s.mu.Unlock()
 
 	var errs error
-	if s.httpsSrv != nil {
-		if err := s.httpsSrv.Shutdown(ctx); err != nil {
-			errs = errors.Join(errs, err)
+	for _, ln := range []net.Listener{s.httpsLn, s.httpLn} {
+		if ln != nil {
+			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = errors.Join(errs, err)
+			}
 		}
 	}
-	if s.httpSrv != nil {
-		if err := s.httpSrv.Shutdown(ctx); err != nil {
-			errs = errors.Join(errs, err)
+	s.flows.drainLink(s.link.Name)
+
+	handlersDone := make(chan struct{})
+	go func() {
+		s.handlers.Wait()
+		close(handlersDone)
+	}()
+	select {
+	case <-handlersDone:
+	case <-ctx.Done():
+		errs = errors.Join(errs, ctx.Err())
+	}
+
+	for _, srv := range []*http.Server{s.httpsSrv, s.httpSrv} {
+		if srv != nil {
+			if err := srv.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				errs = errors.Join(errs, err)
+			}
 		}
 	}
 	s.transport.CloseIdleConnections()
@@ -341,6 +368,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		d.Flush()
 	}
 	return errs
+}
+
+// enter admits a request into the handler count unless Shutdown has begun.
+func (s *Server) enter() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.draining {
+		return false
+	}
+	s.handlers.Add(1)
+	return true
 }
 
 func (s *Server) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -529,6 +567,14 @@ func (rc *reqContext) auditCompleted(status int, bytesOut, bytesIn int64, errTex
 }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint16) {
+	if !s.enter() {
+		if s.onRequest != nil {
+			s.onRequest(s.link.Principal, string(audit.EffectDeny), http.StatusServiceUnavailable, "shutting-down")
+		}
+		http.Error(w, "gateway shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.handlers.Done()
 	if !s.inflight.TryAcquire() {
 		http.Error(w, "too many requests in flight", http.StatusServiceUnavailable)
 		return
@@ -671,8 +717,9 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		RuleID:    rc.dec.RuleID,
 		GrantID:   rc.dec.GrantID,
 		Protocol:  rc.proto,
-	}, reqCancel, guestConnFromContext(parentCtx))
-	defer s.flows.unregister(af.info.ID)
+		admitted:  rc.dec,
+	}, reqCancel, guestAbort(w, rc.r))
+	defer s.flows.unregister(af)
 	rc.flowID = af.info.ID
 
 	// Re-verify admission after flow registration if config or grants changed since admit().

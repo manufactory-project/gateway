@@ -163,6 +163,8 @@ type testGatewaySpec struct {
 	ShareAuditWith *testGateway
 	// Mirror replaces the audit stdout mirror (default: the record signal).
 	Mirror io.Writer
+	// OnRequest observes every request outcome, before its completion audit is written.
+	OnRequest func(principal, effect string, status int, reason string)
 }
 
 type testGateway struct {
@@ -353,14 +355,19 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 
 	eval := policy.NewEvaluator(store)
 	srv, err := proxy.NewServer(proxy.Options{
-		Link:           store.Current().Config.Links[0],
-		Store:          store,
-		Evaluator:      eval,
-		Audit:          aw,
-		Leaves:         ca.NewLeafCache(leafCA),
-		DialContext:    dialFn,
-		Flows:          flows,
-		OnRequest:      col.ObserveRequest,
+		Link:        store.Current().Config.Links[0],
+		Store:       store,
+		Evaluator:   eval,
+		Audit:       aw,
+		Leaves:      ca.NewLeafCache(leafCA),
+		DialContext: dialFn,
+		Flows:       flows,
+		OnRequest: func(principal, effect string, status int, reason string) {
+			col.ObserveRequest(principal, effect, status, reason)
+			if spec.OnRequest != nil {
+				spec.OnRequest(principal, effect, status, reason)
+			}
+		},
 		OnConnRejected: col.IncConnRejected,
 		OnLimited:      col.IncLimited,
 		OnCompletionLost: func(link string) {
@@ -374,8 +381,8 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
 	}
-	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
-		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+	store.OnReload(func(_, _ *config.Snapshot, _ []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval)
 		srv.CloseIdleConnections()
 		return n
 	})

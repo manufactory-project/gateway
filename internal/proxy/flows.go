@@ -7,7 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net"
-	"slices"
+	"net/http"
+	"reflect"
 	"sync"
 	"time"
 
@@ -28,6 +29,11 @@ type FlowInfo struct {
 	GrantID   string    `json:"grant_id,omitempty"`
 	Protocol  string    `json:"protocol"`
 	StartedAt time.Time `json:"started_at"`
+
+	// admitted is the whole policy decision the flow runs under: its rule and
+	// grant, WebSocket permission, and the host's bindings, which fix whether its
+	// response is scrubbed and of what.
+	admitted policy.Decision
 }
 
 // Teardown reason tokens recorded in completion audit events.
@@ -39,13 +45,15 @@ const (
 )
 
 type activeFlow struct {
-	info      FlowInfo
-	cancel    context.CancelFunc
-	guestConn net.Conn
+	info   FlowInfo
+	cancel context.CancelFunc
+	// abort ends the guest side of this flow alone (see guestAbort).
+	abort func()
 
 	mu             sync.Mutex
 	upConn         net.Conn
 	tornDown       bool
+	done           bool
 	teardownReason string
 }
 
@@ -71,31 +79,37 @@ func (f *activeFlow) reason() string {
 	return r
 }
 
-// teardown immediately cancels the request context, closes the guest connection,
-// and closes any gateway-owned WebSocket upstream socket.
+// finish marks the handler as returning. A ResponseWriter must not be used after
+// that, so teardown never calls abort on a finished flow.
+func (f *activeFlow) finish() {
+	f.mu.Lock()
+	f.done = true
+	f.mu.Unlock()
+}
+
+// teardown ends the guest side, cancels the request context, and closes any
+// gateway-owned WebSocket upstream socket.
 func (f *activeFlow) teardown(reason string) {
 	f.mu.Lock()
-	if f.tornDown {
-		f.mu.Unlock()
+	defer f.mu.Unlock()
+	if f.tornDown || f.done {
 		return
 	}
 	f.tornDown = true
 	f.teardownReason = reason
-	up := f.upConn
-	f.mu.Unlock()
 
-	// Close the guest connection before canceling reqCtx so net/http cannot
-	// observe cancellation and flush a synthetic 200 OK on an open socket.
-	if f.guestConn != nil {
-		closeQuietly(f.guestConn)
+	// End the guest side before canceling reqCtx so net/http cannot observe the
+	// cancellation and flush a synthetic 200 OK on an open socket.
+	if f.abort != nil {
+		f.abort()
 	}
 	if f.cancel != nil {
 		f.cancel()
 	}
 	// Direct upstream close applies only to WebSockets, where gateway owns the raw socket.
-	// Transport-managed HTTP/H2/SSE flows rely on reqCancel() + guestConn.Close().
-	if up != nil {
-		closeQuietly(up)
+	// Transport-managed HTTP/H2/SSE flows rely on cancel() ending the upstream exchange.
+	if f.upConn != nil {
+		closeQuietly(f.upConn)
 	}
 }
 
@@ -122,28 +136,25 @@ func (r *FlowRegistry) SetOnRevoke(fn func(int)) {
 	r.mu.Unlock()
 }
 
-func (r *FlowRegistry) register(info FlowInfo, cancel context.CancelFunc, guestConn net.Conn) *activeFlow {
+func (r *FlowRegistry) register(info FlowInfo, cancel context.CancelFunc, abort func()) *activeFlow {
 	if info.ID == "" {
 		info.ID = newFlowID()
 	}
 	if info.StartedAt.IsZero() {
 		info.StartedAt = time.Now().UTC()
 	}
-	af := &activeFlow{
-		info:      info,
-		cancel:    cancel,
-		guestConn: guestConn,
-	}
+	af := &activeFlow{info: info, cancel: cancel, abort: abort}
 	r.mu.Lock()
 	r.flows[info.ID] = af
 	r.mu.Unlock()
 	return af
 }
 
-func (r *FlowRegistry) unregister(id string) {
+func (r *FlowRegistry) unregister(af *activeFlow) {
 	r.mu.Lock()
-	delete(r.flows, id)
+	delete(r.flows, af.info.ID)
 	r.mu.Unlock()
+	af.finish()
 }
 
 // List returns a snapshot of all currently active flows.
@@ -166,9 +177,9 @@ func (r *FlowRegistry) Count() int {
 
 // RevokeByID tears down the single flow with flowID and reports how many flows were terminated.
 func (r *FlowRegistry) RevokeByID(flowID string) int {
-	return r.revokeMatching(func(info FlowInfo) bool {
+	return len(r.RevokeWhere(func(info FlowInfo) bool {
 		return info.ID == flowID
-	}, TeardownRevoked)
+	}, TeardownRevoked))
 }
 
 // RevokeByGrant tears down every active flow running under grantID with reason.
@@ -176,23 +187,17 @@ func (r *FlowRegistry) RevokeByGrant(grantID, reason string) int {
 	if grantID == "" {
 		return 0
 	}
-	return r.revokeMatching(func(info FlowInfo) bool {
+	return len(r.RevokeWhere(func(info FlowInfo) bool {
 		return info.GrantID == grantID
-	}, reason)
+	}, reason))
 }
 
 // RevokeByPrincipal tears down every active flow for principal (optionally filtered to exact host).
 func (r *FlowRegistry) RevokeByPrincipal(principal, host string) int {
 	normHost := config.NormalizeHost(host)
-	return r.revokeMatching(func(info FlowInfo) bool {
-		if info.Principal != principal {
-			return false
-		}
-		if normHost != "" && info.Host != normHost {
-			return false
-		}
-		return true
-	}, TeardownRevoked)
+	return len(r.RevokeWhere(func(info FlowInfo) bool {
+		return info.Principal == principal && (normHost == "" || info.Host == normHost)
+	}, TeardownRevoked))
 }
 
 // RevokeWhere tears down every active flow matching pred with reason, fires onRevoke, and returns the terminated FlowInfos.
@@ -216,6 +221,8 @@ func (r *FlowRegistry) drainLink(linkName string) {
 	}, TeardownRevoked)
 }
 
+// teardownWhere unregisters and tears down every flow matching pred. pred runs
+// outside the registry lock so it may call back into the registry.
 func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool, reason string) []FlowInfo {
 	r.mu.RLock()
 	snapshot := make([]*activeFlow, 0, len(r.flows))
@@ -224,56 +231,46 @@ func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool, reason string) []
 	}
 	r.mu.RUnlock()
 
-	var matched []*activeFlow
+	var revoked []FlowInfo
 	for _, af := range snapshot {
-		if pred(af.info) {
-			matched = append(matched, af)
+		if !pred(af.info) {
+			continue
 		}
-	}
-	if len(matched) == 0 {
-		return nil
-	}
-
-	r.mu.Lock()
-	targets := make([]*activeFlow, 0, len(matched))
-	for _, af := range matched {
-		if cur, ok := r.flows[af.info.ID]; ok && cur == af {
+		r.mu.Lock()
+		cur, ok := r.flows[af.info.ID]
+		if ok && cur == af {
 			delete(r.flows, af.info.ID)
-			targets = append(targets, af)
 		}
-	}
-	r.mu.Unlock()
-
-	revoked := make([]FlowInfo, 0, len(targets))
-	for _, af := range targets {
-		af.teardown(reason)
-		revoked = append(revoked, af.info)
+		r.mu.Unlock()
+		if ok && cur == af {
+			af.teardown(reason)
+			revoked = append(revoked, af.info)
+		}
 	}
 	return revoked
 }
 
-func (r *FlowRegistry) revokeMatching(pred func(FlowInfo) bool, reason string) int {
-	return len(r.RevokeWhere(pred, reason))
+// RevokeReloadedFlows tears down every active flow, across all links, whose
+// admission no longer holds. A flow is admitted by one policy decision (its rule,
+// grant, and the host's bindings, which fix whether its response is scrubbed and
+// of what). The same request decided under the reloaded state must come out
+// identical or the flow ends. That covers a wiped grant, a removed or changed
+// rule, and a binding added to the host.
+func RevokeReloadedFlows(flows *FlowRegistry, eval *policy.Evaluator) int {
+	return len(flows.RevokeWhere(func(info FlowInfo) bool {
+		now := eval.DecideRequest(info.Principal, info.Host, info.Port, info.Method, info.Path)
+		return !reflect.DeepEqual(admissionFacts(info.admitted, info.Protocol), admissionFacts(now, info.Protocol))
+	}, TeardownReload))
 }
 
-// RevokeReloadedFlows tears down every active flow across all links that was admitted
-// by a wiped grant, is no longer permitted by the reloaded policy, or is no longer
-// admitted by the rule it is running under.
-func RevokeReloadedFlows(flows *FlowRegistry, eval *policy.Evaluator, wipedGrantIDs []string) int {
-	revoked := flows.RevokeWhere(func(info FlowInfo) bool {
-		if info.GrantID != "" && slices.Contains(wipedGrantIDs, info.GrantID) {
-			return true
-		}
-		dec := eval.DecideRequest(info.Principal, info.Host, info.Port, info.Method, info.Path)
-		if !dec.Allow || dec.RuleID != info.RuleID {
-			return true
-		}
-		if info.Protocol == "websocket" && !dec.AllowWebSocket {
-			return true
-		}
-		return false
-	}, TeardownReload)
-	return len(revoked)
+// admissionFacts is the part of dec that a flow of this protocol depends on:
+// WebSocket terms matter to WebSockets only.
+func admissionFacts(dec policy.Decision, protocol string) policy.Decision {
+	if protocol != "websocket" {
+		dec.AllowWebSocket = false
+		dec.WSMaxEgressBytes = 0
+	}
+	return dec
 }
 
 func newFlowID() string {
@@ -286,10 +283,23 @@ func newFlowID() string {
 
 type guestConnCtxKey struct{}
 
-func guestConnFromContext(ctx context.Context) net.Conn {
-	c, ok := ctx.Value(guestConnCtxKey{}).(net.Conn)
+// guestAbort returns how to end r's guest side alone. HTTP/1 and WebSocket own
+// their connection, so it is closed. An HTTP/2 connection carries sibling
+// streams, so only this stream is reset: a write deadline already past resets it
+// at once, even while the handler is blocked in a write. Where that is
+// unsupported the connection is closed rather than left open.
+func guestAbort(w http.ResponseWriter, r *http.Request) func() {
+	conn, ok := r.Context().Value(guestConnCtxKey{}).(net.Conn)
 	if !ok {
 		return nil
 	}
-	return c
+	if r.ProtoMajor != 2 {
+		return func() { closeQuietly(conn) }
+	}
+	rc := http.NewResponseController(w)
+	return func() {
+		if err := rc.SetWriteDeadline(time.Now()); err != nil {
+			closeQuietly(conn)
+		}
+	}
 }

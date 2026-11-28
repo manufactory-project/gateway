@@ -423,8 +423,8 @@ func registerDaemonCallbacks(store *config.Store, eval *policy.Evaluator, flows 
 }
 
 func registerFlowLifecycleCallbacks(store *config.Store, eval *policy.Evaluator, flows *proxy.FlowRegistry, servers []*proxy.Server) {
-	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
-		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+	store.OnReload(func(_, _ *config.Snapshot, _ []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval)
 		for _, ps := range servers {
 			ps.CloseIdleConnections()
 		}

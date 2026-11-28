@@ -471,8 +471,8 @@ rules:
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
 	}
-	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
-		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+	store.OnReload(func(_, _ *config.Snapshot, _ []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval)
 		pSrv.CloseIdleConnections()
 		return n
 	})
@@ -940,8 +940,8 @@ func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.C
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
 	}
-	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
-		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
+	store.OnReload(func(_, _ *config.Snapshot, _ []string) int {
+		n := proxy.RevokeReloadedFlows(flows, eval)
 		pSrv.CloseIdleConnections()
 		return n
 	})
