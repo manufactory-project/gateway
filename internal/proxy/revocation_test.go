@@ -304,7 +304,7 @@ func TestTeardownDuringDialRaceHTTPAndWebSocket(t *testing.T) {
 					gw.Flows.RevokeByPrincipal("worker-test", "race-http.example.com")
 					return conn, nil
 				case "race-ws.example.com":
-					tc := &closeTrackingConn{Conn: conn}
+					tc := &closeTrackingConn{Conn: conn, done: make(chan struct{})}
 					raceWSConn.Store(tc)
 					gw.Flows.RevokeByPrincipal("worker-test", "race-ws.example.com")
 					return tc, nil
@@ -357,9 +357,9 @@ func TestTeardownDuringDialRaceHTTPAndWebSocket(t *testing.T) {
 	if tcWS == nil {
 		t.Fatal("race-ws dial never ran")
 	}
-	deadline := time.Now().Add(time.Second)
-	for !tcWS.closed.Load() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-tcWS.done:
+	case <-time.After(time.Second):
 	}
 	if !tcWS.closed.Load() {
 		t.Fatal("WebSocket upstream socket leaked open when teardown raced before setUpstreamConn")
@@ -606,11 +606,8 @@ func TestWebSocketRevokedDuringHandshake(t *testing.T) {
 			t.Fatal("guest connection remained open (timed out instead of closing)")
 		}
 
-		// 3. Flow must leave the registry within bound.
-		deadline := time.Now().Add(bound)
-		for gw.Flows.Count() != 0 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
+		// 3. Teardown removes the flow before closing the guest connection, so it is
+		// already gone.
 		if cnt := gw.Flows.Count(); cnt != 0 {
 			t.Fatalf("flow remained in registry after revocation: count=%d", cnt)
 		}
@@ -663,8 +660,8 @@ func TestReloadWithUnprunedExpiredGrantDoesNotDeadlock(t *testing.T) {
 		t.Fatal("timed out waiting for SSE stream to open")
 	}
 
-	// Wait past grant expiry without running the pruner.
-	time.Sleep(70 * time.Millisecond)
+	// Expiry is a point in time and no pruner runs, so wait for exactly that instant.
+	<-time.After(time.Until(g.ExpiresAt))
 
 	// ActiveGrants must be a pure read: filters out expired grant without firing expiry callbacks.
 	if active := gw.Store.ActiveGrants(); len(active) != 0 {
@@ -724,10 +721,7 @@ func TestReloadWithUnprunedExpiredGrantDoesNotDeadlock(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("open flow was not torn down after Reload")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for gw.Flows.Count() != 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	// Reload tears flows down before it returns.
 	if cnt := gw.Flows.Count(); cnt != 0 {
 		t.Fatalf("flow remained in registry after reload teardown: count=%d", cnt)
 	}
@@ -968,19 +962,20 @@ func TestAdmissionRecheckRuleToGrantAndInPlaceBindingEdit(t *testing.T) {
 
 func waitAuditCompletedError(t *testing.T, gw *testGateway, path, wantErr string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	completed := gw.Records.until(2*time.Second, func() bool {
 		for _, ev := range gw.AuditEvents(t) {
 			if (ev.Kind == "request" || ev.Kind == "websocket") && ev.Path == path {
 				if ev.Error != wantErr {
 					t.Fatalf("path %s completion audit error = %q, want %q", path, ev.Error, wantErr)
 				}
-				return
+				return true
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		return false
+	})
+	if !completed {
+		t.Fatalf("timed out waiting for completion audit on %s with error=%q", path, wantErr)
 	}
-	t.Fatalf("timed out waiting for completion audit on %s with error=%q", path, wantErr)
 }
 
 func openTestWSUpgrade(t *testing.T, gw *testGateway, host, path string) (net.Conn, *bufio.Reader) {

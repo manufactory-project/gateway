@@ -3,6 +3,7 @@
 package proxy_test
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -435,8 +436,7 @@ func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
 		}
 
 		var gotEvent *audit.Event
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
+		gw.Records.until(2*time.Second, func() bool {
 			for _, ev := range gw.AuditEvents(t) {
 				if ev.Kind == audit.KindRequest && ev.Path == "/slow-cancel" {
 					e := ev
@@ -444,11 +444,8 @@ func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
 					break
 				}
 			}
-			if gotEvent != nil {
-				break
-			}
-			time.Sleep(15 * time.Millisecond)
-		}
+			return gotEvent != nil
+		})
 		if gotEvent == nil {
 			t.Fatal("missing completed audit event for /slow-cancel")
 		}
@@ -527,8 +524,7 @@ func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
 		<-revDone
 
 		var dropEv, revEv *audit.Event
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
+		gw.Records.until(2*time.Second, func() bool {
 			for _, ev := range gw.AuditEvents(t) {
 				if ev.Kind == audit.KindRequest && ev.Path == "/drop-upstream" {
 					e := ev
@@ -539,11 +535,8 @@ func TestClientCanceled499AndUpstreamFailure502(t *testing.T) {
 					revEv = &e
 				}
 			}
-			if dropEv != nil && revEv != nil {
-				break
-			}
-			time.Sleep(15 * time.Millisecond)
-		}
+			return dropEv != nil && revEv != nil
+		})
 		if dropEv == nil || dropEv.Status != http.StatusBadGateway || dropEv.Error == "client-canceled" {
 			t.Fatalf("unexpected /drop-upstream audit event: %+v", dropEv)
 		}
@@ -609,19 +602,15 @@ func TestTruncatedUpstreamResponseAbortsGuestH1AndH2(t *testing.T) {
 			}
 
 			var found *audit.Event
-			deadline := time.Now().Add(2 * time.Second)
-			for time.Now().Before(deadline) {
+			gw.Records.until(2*time.Second, func() bool {
 				for _, ev := range gw.AuditEvents(t) {
 					if ev.Kind == audit.KindRequest && ev.Path == tc.path {
 						e := ev
 						found = &e
 					}
 				}
-				if found != nil {
-					break
-				}
-				time.Sleep(15 * time.Millisecond)
-			}
+				return found != nil
+			})
 			if found == nil || found.Error == "" {
 				t.Fatalf("%s missing completion audit with error: %+v", tc.name, found)
 			}
@@ -657,8 +646,24 @@ func TestMaxConnsPerLinkCapAndMetric(t *testing.T) {
 		}
 		t.Fatalf("dial c2: %v", err)
 	}
-	// Give listener goroutines a moment to accept both slots.
-	time.Sleep(40 * time.Millisecond)
+	// An answer on c2 proves its listener has accepted it. c3 shares c1's listener,
+	// which accepts in order, so both slots are taken before c3 is considered.
+	if err := c2.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set c2 deadline: %v", err)
+	}
+	if _, err := io.WriteString(c2, "GET / HTTP/1.1\r\nHost: cap.example.com\r\n\r\n"); err != nil {
+		t.Fatalf("write c2: %v", err)
+	}
+	held, err := http.ReadResponse(bufio.NewReader(c2), nil)
+	if err != nil {
+		t.Fatalf("read c2 response: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, held.Body); err != nil {
+		t.Fatalf("drain c2 response: %v", err)
+	}
+	if err := held.Body.Close(); err != nil {
+		t.Fatalf("close c2 response: %v", err)
+	}
 
 	// Connection N+1 (3rd) must be closed immediately and counted in gateway_conns_rejected_total.
 	c3, err := net.DialTimeout("tcp4", gw.HTTPSAddr, time.Second)
@@ -677,21 +682,10 @@ func TestMaxConnsPerLinkCapAndMetric(t *testing.T) {
 		}
 	}
 
-	// Verify metric incremented for link sbx0.
-	deadline := time.Now().Add(time.Second)
-	sawMetric := false
-	for time.Now().Before(deadline) {
-		rec := httptest.NewRecorder()
-		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-		if strings.Contains(rec.Body.String(), `gateway_conns_rejected_total{link="sbx0"} 1`) {
-			sawMetric = true
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !sawMetric {
-		rec := httptest.NewRecorder()
-		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	// The refusal is counted before the close, which c3's read has already seen.
+	rec := httptest.NewRecorder()
+	gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if !strings.Contains(rec.Body.String(), `gateway_conns_rejected_total{link="sbx0"} 1`) {
 		t.Fatalf("missing gateway_conns_rejected_total{link=\"sbx0\"} 1 in metrics:\n%s", rec.Body.String())
 	}
 
@@ -702,8 +696,12 @@ func TestMaxConnsPerLinkCapAndMetric(t *testing.T) {
 	if err := c2.Close(); err != nil {
 		t.Fatalf("close c2: %v", err)
 	}
-	time.Sleep(40 * time.Millisecond)
-	resp, err := gw.H1Client(t, "cap.example.com").Get("https://cap.example.com/ok")
+	// The server frees a slot only after reading the close, so retry until admitted.
+	client := gw.H1Client(t, "cap.example.com")
+	resp, err := client.Get("https://cap.example.com/ok")
+	for deadline := time.Now().Add(2 * time.Second); err != nil && time.Now().Before(deadline); {
+		resp, err = client.Get("https://cap.example.com/ok")
+	}
 	if err != nil {
 		t.Fatalf("GET under cap failed: %v", err)
 	}

@@ -115,9 +115,11 @@ rules:
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	records := newRecordSignal()
 	aw, err := audit.NewWriter(audit.Options{
 		Dir:          auditDir,
 		MaxFileBytes: 200,
+		Stdout:       records,
 	})
 	if err != nil {
 		t.Fatalf("audit.NewWriter: %v", err)
@@ -296,8 +298,7 @@ rules:
 	// Audit completeness check: every packet above (incl. malformed/opcode/class/QR=1) produced an audit record.
 	var events []audit.Event
 	var sawQRIgnored bool
-	deadline := time.Now().Add(time.Second)
-	for {
+	records.until(time.Second, func() bool {
 		events = readAuditEvents(t, auditDir)
 		for _, ev := range events {
 			if ev.Reason == "response-packet-ignored" && ev.Effect == audit.EffectDeny {
@@ -305,14 +306,8 @@ rules:
 				break
 			}
 		}
-		if sawQRIgnored && len(events) == 27 {
-			break
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return sawQRIgnored && len(events) == 27
+	})
 	// 2 (A udp+tcp) + 3 (AAAA/HTTPS/SVCB) + 15 (5 qtypes * 3 hosts) + 2 (blocked A/AAAA) + 5 (0q, 2q, update, chaos, QR=1) = 27.
 	if len(events) != 27 || !sawQRIgnored {
 		t.Fatalf("expected 27 audited DNS events including response-packet-ignored, got len=%d sawQRIgnored=%v", len(events), sawQRIgnored)
@@ -372,7 +367,8 @@ links:
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	records := newRecordSignal()
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir, Stdout: records})
 	if err != nil {
 		t.Fatalf("audit.NewWriter: %v", err)
 	}
@@ -432,8 +428,7 @@ links:
 	}
 
 	var sawUDP, sawTCP bool
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	if records.until(2*time.Second, func() bool {
 		for _, ev := range readAuditEvents(t, auditDir) {
 			if ev.Kind == audit.KindDNS && ev.Effect == audit.EffectDeny && ev.Reason == "malformed" {
 				if ev.Protocol == "udp" {
@@ -444,10 +439,9 @@ links:
 				}
 			}
 		}
-		if sawUDP && sawTCP {
-			return
-		}
-		time.Sleep(15 * time.Millisecond)
+		return sawUDP && sawTCP
+	}) {
+		return
 	}
 	t.Fatalf("expected malformed DNS audit events for both udp and tcp, got udp=%v tcp=%v", sawUDP, sawTCP)
 }

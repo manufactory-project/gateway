@@ -338,8 +338,14 @@ func TestStressReloadRevokeH1H2SSEAndSlowlorisBounds(t *testing.T) {
 
 	stopUpstream := make(chan struct{})
 	t.Cleanup(func() { close(stopUpstream) })
+	// flowArrived signals that a request is in flight through the proxy.
+	flowArrived := make(chan struct{}, 1)
 
 	upSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case flowArrived <- struct{}{}:
+		default:
+		}
 		switch r.URL.Path {
 		case "/fast":
 			w.WriteHeader(http.StatusOK)
@@ -699,9 +705,16 @@ rules:
 			}
 
 			// Wait until at least one flow is active (or short poll timeout) before revoking.
-			waitFlow := time.Now().Add(200 * time.Millisecond)
-			for flows.Count() == 0 && time.Now().Before(waitFlow) && stressCtx.Err() == nil {
-				time.Sleep(5 * time.Millisecond)
+			select {
+			case <-flowArrived: // discard a signal left from an earlier round
+			default:
+			}
+			if flows.Count() == 0 {
+				select {
+				case <-flowArrived:
+				case <-time.After(200 * time.Millisecond):
+				case <-stressCtx.Done():
+				}
 			}
 			if res, err := cAdmin.Revoke(context.Background(), admin.RevokeRequest{Principal: "worker-stress"}); err != nil {
 				t.Errorf("Admin Revoke: %v", err)

@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -100,11 +101,14 @@ func (c *countingSigner) Sign(r io.Reader, digest []byte, opts crypto.SignerOpts
 
 type closeTrackingConn struct {
 	net.Conn
-	closed atomic.Bool
+	closed    atomic.Bool
+	done      chan struct{} // closed on the first Close
+	closeOnce sync.Once
 }
 
 func (c *closeTrackingConn) Close() error {
 	c.closed.Store(true)
+	c.closeOnce.Do(func() { close(c.done) })
 	return c.Conn.Close()
 }
 
@@ -141,6 +145,7 @@ type testGateway struct {
 	UpTLS     *httptest.Server
 	UpPlain   *httptest.Server
 	CASigns   *countingSigner
+	Records   *recordSignal
 }
 
 func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
@@ -246,8 +251,10 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	})
 	flows.SetOnRevoke(col.AddRevocations)
 
+	records := newRecordSignal()
 	aw, err := audit.NewWriter(audit.Options{
 		Dir:          auditDir,
+		Stdout:       records,
 		MaxFileBytes: spec.AuditMaxFileBytes,
 		OnWriteError: func() {
 			col.IncAuditWriteError()
@@ -366,6 +373,7 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		UpTLS:     upTLS,
 		UpPlain:   upPlain,
 		CASigns:   cs,
+		Records:   records,
 	}
 }
 

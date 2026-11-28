@@ -137,6 +137,7 @@ func TestDialerConnectTimeSSRFRebindingAndRecordsPin(t *testing.T) {
 	}
 	var accepted atomic.Int32
 	done := make(chan struct{})
+	counted := make(chan struct{}, 8)
 	go func() {
 		defer close(done)
 		for {
@@ -145,6 +146,10 @@ func TestDialerConnectTimeSSRFRebindingAndRecordsPin(t *testing.T) {
 				return
 			}
 			accepted.Add(1)
+			select {
+			case counted <- struct{}{}:
+			default:
+			}
 			if err := c.Close(); err != nil {
 				return
 			}
@@ -261,10 +266,10 @@ rules:
 	if err := conn.Close(); err != nil {
 		t.Fatalf("close conn: %v", err)
 	}
-	// Wait briefly for Accept goroutine to increment counter.
-	deadline := time.Now().Add(time.Second)
-	for accepted.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	// Wait for the Accept goroutine to count the connection.
+	select {
+	case <-counted:
+	case <-time.After(time.Second):
 	}
 	if got := accepted.Load(); got != 1 {
 		t.Fatalf("pinned record accepted=%d, want 1", got)

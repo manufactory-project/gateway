@@ -126,6 +126,25 @@ func assertDNSRefusalCounted(t *testing.T, dnsAddr string, metricsPort uint16) {
 	t.Fatalf("metrics missing %s:\n%s", want, body)
 }
 
+// auditContains reports whether any audit segment under dir contains want.
+func auditContains(t *testing.T, dir, want string) bool {
+	t.Helper()
+	entries, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil {
+		t.Fatalf("glob audit segments: %v", err)
+	}
+	for _, p := range entries {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read audit %s: %v", p, err)
+		}
+		if strings.Contains(string(raw), want) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestGatewayNetsetupDryRunAndStartupGuards(t *testing.T) {
 	dir := t.TempDir()
 
@@ -185,6 +204,7 @@ ca:
   key_path: %s
 audit:
   dir: %s
+  stdout_json: true
 admin:
   socket: %s
 metrics:
@@ -239,23 +259,19 @@ rules:
 		t.Fatalf("expected daemon to refuse startup without required sysctls, got %v", err)
 	}
 
+	records := newRecordSignal()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(ctx, cfgPath, procSysRoot, &bytes.Buffer{}, &bytes.Buffer{})
+		done <- serveDaemon(ctx, cfgPath, procSysRoot, records, &bytes.Buffer{})
 	}()
 
 	client := admin.NewClient(sockPath)
 	t.Cleanup(client.Close)
-	deadline := time.Now().Add(2 * time.Second)
-	var statusOK bool
-	for time.Now().Before(deadline) {
-		if st, err := client.Status(context.Background()); err == nil && st.AuditHealthy {
-			statusOK = true
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
+	statusOK := records.until(2*time.Second, func() bool {
+		st, err := client.Status(context.Background())
+		return err == nil && st.AuditHealthy
+	})
 	if statusOK {
 		assertDNSRefusalCounted(t, net.JoinHostPort("127.0.26.1", strconv.Itoa(int(dnsPort))), metricsPort)
 	}
@@ -425,6 +441,7 @@ ca:
   key_path: %s
 audit:
   dir: %s
+  stdout_json: true
 admin:
   socket: %s
 dataplane:
@@ -454,23 +471,19 @@ rules:
 	}
 
 	procSysRoot := fakeSysctls(t, cfgPath)
+	records := newRecordSignal()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(ctx, cfgPath, procSysRoot, &bytes.Buffer{}, &bytes.Buffer{})
+		done <- serveDaemon(ctx, cfgPath, procSysRoot, records, &bytes.Buffer{})
 	}()
 
 	client := admin.NewClient(sockPath)
 	t.Cleanup(client.Close)
-	deadline := time.Now().Add(2 * time.Second)
-	ready := false
-	for time.Now().Before(deadline) {
-		if st, err := client.Status(context.Background()); err == nil && st.AuditHealthy {
-			ready = true
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
+	ready := records.until(2*time.Second, func() bool {
+		st, err := client.Status(context.Background())
+		return err == nil && st.AuditHealthy
+	})
 	if !ready {
 		cancel()
 		<-done
@@ -489,8 +502,17 @@ rules:
 		t.Fatalf("CreateGrant: %v", err)
 	}
 
-	// Wait past expiry and several pruner ticks (50ms) so any duplicate emission would be caught.
-	time.Sleep(320 * time.Millisecond)
+	expired := records.until(2*time.Second, func() bool {
+		return auditContains(t, auditDir, `"reason":"grant-expired"`)
+	})
+	if !expired {
+		cancel()
+		<-done
+		t.Fatal("grant never expired")
+	}
+	// A duplicate emission is something that must not happen, so there is nothing to
+	// wait on: give it several pruner ticks (50ms) to show up.
+	time.Sleep(150 * time.Millisecond)
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("serveDaemon shutdown: %v", err)
@@ -1000,7 +1022,8 @@ links:
 
 	registerDaemonCallbacks(store, eval, flows, []*proxy.Server{pSrv}, aw, &bytes.Buffer{})
 
-	if _, err := store.AddGrant("worker-claude", "order.example.com", 80, nil, nil, 80*time.Millisecond, false); err != nil {
+	orderGrant, err := store.AddGrant("worker-claude", "order.example.com", 80, nil, nil, 80*time.Millisecond, false)
+	if err != nil {
 		t.Fatalf("AddGrant: %v", err)
 	}
 	httpAddr := fmt.Sprintf("127.0.30.1:%d", linkPorts[1])
@@ -1021,7 +1044,8 @@ links:
 	}
 	<-streamOpen
 
-	time.Sleep(110 * time.Millisecond)
+	// Expiry is a point in time and no pruner runs, so wait for exactly that instant.
+	<-time.After(time.Until(orderGrant.ExpiresAt))
 	store.PruneExpiredGrants()
 	if _, rErr := io.ReadAll(resp.Body); rErr == nil {
 		t.Log("stream closed with EOF")

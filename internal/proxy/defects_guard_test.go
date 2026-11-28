@@ -394,19 +394,15 @@ func TestHTTP2ExplicitHostHeaderRejected(t *testing.T) {
 
 	// Wait for gateway to write the audited 403 h2-host-header event.
 	var sawH2HostDeny bool
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	gw.Records.until(2*time.Second, func() bool {
 		for _, ev := range gw.AuditEvents(t) {
 			if ev.Kind == audit.KindRequest && ev.Host == "h2host.example.com" && ev.Status == http.StatusForbidden && ev.Reason == "h2-host-header" {
 				sawH2HostDeny = true
 				break
 			}
 		}
-		if sawH2HostDeny {
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
+		return sawH2HostDeny
+	})
 	if !sawH2HostDeny {
 		t.Fatal("missing audited 403 h2-host-header for HTTP/2 request with explicit Host header")
 	}
@@ -521,19 +517,15 @@ func TestWebSocketDefaultEgressCapAppliesWhenRuleOmitsCap(t *testing.T) {
 	}
 
 	var sawCapAudit bool
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	gw.Records.until(2*time.Second, func() bool {
 		for _, ev := range gw.AuditEvents(t) {
 			if ev.Kind == audit.KindWebSocket && ev.Host == "wsdefcap.example.com" && strings.Contains(ev.Error, "ws-egress-cap-exceeded") {
 				sawCapAudit = true
 				break
 			}
 		}
-		if sawCapAudit {
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
+		return sawCapAudit
+	})
 	if !sawCapAudit {
 		rec := httptest.NewRecorder()
 		gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
