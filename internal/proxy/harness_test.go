@@ -289,6 +289,7 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		Flows:          flows,
 		OnRequest:      col.ObserveRequest,
 		OnConnRejected: col.IncConnRejected,
+		OnServeError:   func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)

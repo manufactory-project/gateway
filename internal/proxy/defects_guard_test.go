@@ -570,11 +570,12 @@ func TestHostWideDenyWithPathScopedAllowEndToEnd(t *testing.T) {
 		t.Fatalf("NewAllocator: %v", err)
 	}
 	dnsSrv, err := gwdns.NewServer(gwdns.ServerOptions{
-		Link:      link,
-		Store:     gw.Store,
-		Evaluator: policy.NewEvaluator(gw.Store),
-		Audit:     gw.Audit,
-		Allocator: alloc,
+		Link:         link,
+		Store:        gw.Store,
+		Evaluator:    policy.NewEvaluator(gw.Store),
+		Audit:        gw.Audit,
+		Allocator:    alloc,
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("dns.NewServer: %v", err)
@@ -670,11 +671,12 @@ func TestSharedFakeIPDoesNotBreakProxying(t *testing.T) {
 
 	link := gw.Store.Current().Config.Links[0]
 	dnsSrv, err := gwdns.NewServer(gwdns.ServerOptions{
-		Link:      link,
-		Store:     gw.Store,
-		Evaluator: policy.NewEvaluator(gw.Store),
-		Audit:     gw.Audit,
-		Allocator: alloc,
+		Link:         link,
+		Store:        gw.Store,
+		Evaluator:    policy.NewEvaluator(gw.Store),
+		Audit:        gw.Audit,
+		Allocator:    alloc,
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("dns.NewServer: %v", err)

@@ -115,6 +115,21 @@ type daemonRuntime struct {
 	adminSrv     *admin.Server
 	metricsSrv   *metrics.Server
 	auditWriter  *audit.Writer
+	serveErrCh   chan error
+}
+
+func newDaemonRuntime(auditWriter *audit.Writer) *daemonRuntime {
+	return &daemonRuntime{
+		auditWriter: auditWriter,
+		serveErrCh:  make(chan error, 1),
+	}
+}
+
+func (rt *daemonRuntime) reportServeErr(err error) {
+	select {
+	case rt.serveErrCh <- err:
+	default:
+	}
 }
 
 func (rt *daemonRuntime) shutdownAll() error {
@@ -226,11 +241,10 @@ func (rt *daemonRuntime) startControl(cfg *config.Config, store *config.Store, f
 		rt.adminSrv = srv
 	}
 	if cfg.Metrics.Listen != "" {
-		srv, err := metrics.NewServer(cfg.Metrics.Listen, collector)
+		srv, err := metrics.NewServer(cfg.Metrics.Listen, collector, onServeErr)
 		if err != nil {
 			return err
 		}
-		srv.SetOnServeError(onServeErr)
 		if err := srv.Start(); err != nil {
 			return err
 		}
@@ -315,14 +329,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		return err
 	}
 
-	rt := &daemonRuntime{auditWriter: auditWriter}
-	serveErrCh := make(chan error, 1)
-	reportServeErr := func(err error) {
-		select {
-		case serveErrCh <- err:
-		default:
-		}
-	}
+	rt := newDaemonRuntime(auditWriter)
 	alloc, err := gwdns.NewAllocator(cfg.FakePrefix)
 	if err != nil {
 		return errors.Join(err, rt.shutdownAll())
@@ -331,11 +338,11 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	leaves := ca.NewLeafCache(mitmCA)
 	dialer := netguard.NewDialer(netguard.Options{Store: store})
 
-	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, reportServeErr); err != nil {
+	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, rt.reportServeErr); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
 	registerDaemonCallbacks(store, eval, flows, rt.proxyServers, auditWriter, stderr)
-	if err := rt.startControl(cfg, store, flows, collector, reportServeErr); err != nil {
+	if err := rt.startControl(cfg, store, flows, collector, rt.reportServeErr); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
 	if err := auditWriter.WriteSync(audit.Event{
@@ -360,20 +367,19 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		})
 	}()
 
-	return rt.waitAndShutdown(ctx, runCancel, &bgWG, serveErrCh, stderr)
+	return rt.waitAndShutdown(ctx, runCancel, &bgWG, stderr)
 }
 
 func (rt *daemonRuntime) waitAndShutdown(
 	ctx context.Context,
 	runCancel context.CancelFunc,
 	bgWG *sync.WaitGroup,
-	serveErrCh <-chan error,
 	stderr io.Writer,
 ) error {
 	var listenerErr error
 	select {
 	case <-ctx.Done():
-	case listenerErr = <-serveErrCh:
+	case listenerErr = <-rt.serveErrCh:
 		logf(stderr, "gateway: fatal listener error: %v\n", listenerErr)
 		auditBestEffort(rt.auditWriter, audit.Event{
 			Kind:   audit.KindLifecycle,

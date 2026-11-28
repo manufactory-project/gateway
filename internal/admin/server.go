@@ -118,8 +118,8 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.SocketPath == "" {
 		return nil, errors.New("admin: socket path is required")
 	}
-	if opts.Store == nil || opts.Flows == nil || opts.Audit == nil {
-		return nil, errors.New("admin: store, flows, and audit are required")
+	if opts.Store == nil || opts.Flows == nil || opts.Audit == nil || opts.OnServeError == nil {
+		return nil, errors.New("admin: store, flows, audit, and onServeError are required")
 	}
 	return &Server{
 		socketPath:   opts.SocketPath,

@@ -44,14 +44,17 @@ func TestMetricsExplicitBindAndExposition(t *testing.T) {
 
 	// Containment: wildcard listen addresses (including v4-mapped ::ffff:0.0.0.0) are forbidden.
 	for _, bad := range []string{"0.0.0.0:9102", ":9102", "[::]:9102", "[::ffff:0.0.0.0]:9102", "localhost:9102"} {
-		if _, err := metrics.NewServer(bad, col); err == nil {
+		if _, err := metrics.NewServer(bad, col, func(error) {}); err == nil {
 			t.Fatalf("expected NewServer(%q) to fail", bad)
 		}
 	}
 
 	// Positive control: explicit loopback IP binds and serves Prometheus metrics.
 	listenAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(freePort(t, "127.0.0.1"))))
-	srv, err := metrics.NewServer(listenAddr, col)
+	if _, err := metrics.NewServer(listenAddr, col, nil); err == nil {
+		t.Fatal("expected metrics.NewServer with nil onServeError to fail")
+	}
+	srv, err := metrics.NewServer(listenAddr, col, func(error) {})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

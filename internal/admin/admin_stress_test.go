@@ -219,11 +219,12 @@ rules:
 	})
 	flows.SetOnRevoke(col.AddRevocations)
 	srv, err := admin.NewServer(admin.Options{
-		SocketPath: sockPath,
-		Store:      store,
-		Flows:      testFlowAdapter{flows: flows},
-		Audit:      aw,
-		Metrics:    col,
+		SocketPath:   sockPath,
+		Store:        store,
+		Flows:        testFlowAdapter{flows: flows},
+		Audit:        aw,
+		Metrics:      col,
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("admin.NewServer: %v", err)
@@ -432,14 +433,15 @@ rules:
 
 	eval := policy.NewEvaluator(store)
 	pSrv, err := proxy.NewServer(proxy.Options{
-		Link:        store.Current().Config.Links[0],
-		Store:       store,
-		Evaluator:   eval,
-		Audit:       aw,
-		Leaves:      ca.NewLeafCache(mitmCA),
-		DialContext: dialUp,
-		Flows:       flows,
-		OnRequest:   col.ObserveRequest,
+		Link:         store.Current().Config.Links[0],
+		Store:        store,
+		Evaluator:    eval,
+		Audit:        aw,
+		Leaves:       ca.NewLeafCache(mitmCA),
+		DialContext:  dialUp,
+		Flows:        flows,
+		OnRequest:    col.ObserveRequest,
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
@@ -464,11 +466,12 @@ rules:
 	})
 
 	aSrv, err := admin.NewServer(admin.Options{
-		SocketPath: sockPath,
-		Store:      store,
-		Flows:      testFlowAdapter{flows: flows},
-		Audit:      aw,
-		Metrics:    col,
+		SocketPath:   sockPath,
+		Store:        store,
+		Flows:        testFlowAdapter{flows: flows},
+		Audit:        aw,
+		Metrics:      col,
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("admin.NewServer: %v", err)
@@ -484,7 +487,7 @@ rules:
 		}
 	})
 
-	mSrv, err := metrics.NewServer(store.Current().Config.Metrics.Listen, col)
+	mSrv, err := metrics.NewServer(store.Current().Config.Metrics.Listen, col, func(error) {})
 	if err != nil {
 		t.Fatalf("metrics.NewServer: %v", err)
 	}
@@ -788,10 +791,11 @@ links:
 	})
 	sockPath := filepath.Join(dir, "admin.sock")
 	srv, err := admin.NewServer(admin.Options{
-		SocketPath: sockPath,
-		Store:      store,
-		Flows:      testFlowAdapter{flows: proxy.NewFlowRegistry()},
-		Audit:      aw,
+		SocketPath:   sockPath,
+		Store:        store,
+		Flows:        testFlowAdapter{flows: proxy.NewFlowRegistry()},
+		Audit:        aw,
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("admin.NewServer: %v", err)
@@ -889,7 +893,7 @@ func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.C
 	eval := policy.NewEvaluator(store)
 	pSrv, err := proxy.NewServer(proxy.Options{
 		Link: store.Current().Config.Links[0], Store: store, Evaluator: eval,
-		Leaves: ca.NewLeafCache(rootCA), Audit: aw, Flows: flows,
+		Leaves: ca.NewLeafCache(rootCA), Audit: aw, Flows: flows, OnServeError: func(error) {},
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, upAddr)
@@ -918,7 +922,7 @@ func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.C
 	})
 	sockPath := filepath.Join(dir, "admin.sock")
 	aSrv, err := admin.NewServer(admin.Options{
-		SocketPath: sockPath, Store: store, Flows: testFlowAdapter{flows: flows}, Audit: aw,
+		SocketPath: sockPath, Store: store, Flows: testFlowAdapter{flows: flows}, Audit: aw, OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("admin.NewServer: %v", err)

@@ -76,11 +76,12 @@ rules:
 		b.Fatalf("NewAllocator: %v", err)
 	}
 	srv, err := gwdns.NewServer(gwdns.ServerOptions{
-		Link:      store.Current().Config.Links[0],
-		Store:     store,
-		Evaluator: policy.NewEvaluator(store),
-		Audit:     aw,
-		Allocator: alloc,
+		Link:         store.Current().Config.Links[0],
+		Store:        store,
+		Evaluator:    policy.NewEvaluator(store),
+		Audit:        aw,
+		Allocator:    alloc,
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		b.Fatalf("NewServer: %v", err)

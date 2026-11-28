@@ -71,8 +71,8 @@ type Server struct {
 
 // NewServer constructs a per-link Server without binding sockets yet.
 func NewServer(opts Options) (*Server, error) {
-	if opts.Store == nil || opts.Evaluator == nil || opts.Audit == nil || opts.Leaves == nil || opts.Flows == nil {
-		return nil, errors.New("proxy: store, evaluator, audit, leaves, and flows are required")
+	if opts.Store == nil || opts.Evaluator == nil || opts.Audit == nil || opts.Leaves == nil || opts.Flows == nil || opts.OnServeError == nil {
+		return nil, errors.New("proxy: store, evaluator, audit, leaves, flows, and onServeError are required")
 	}
 	if !opts.Link.ParsedGatewayIP.IsValid() || opts.Link.ParsedGatewayIP.IsUnspecified() {
 		return nil, errors.New("proxy: explicit non-wildcard gateway_ip is required")

@@ -1146,10 +1146,27 @@ func TestNewServerRequiresFlows(t *testing.T) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, addr)
 		},
-		Flows: nil,
+		Flows:        nil,
+		OnServeError: func(error) {},
 	})
 	if err == nil {
 		t.Fatal("expected proxy.NewServer with Flows=nil to return an error")
+	}
+	_, err = proxy.NewServer(proxy.Options{
+		Link:      gw.Store.Current().Config.Links[0],
+		Store:     gw.Store,
+		Evaluator: policy.NewEvaluator(gw.Store),
+		Audit:     gw.Audit,
+		Leaves:    ca.NewLeafCache(testUpstreamCA),
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		Flows:        proxy.NewFlowRegistry(),
+		OnServeError: nil,
+	})
+	if err == nil {
+		t.Fatal("expected proxy.NewServer with OnServeError=nil to return an error")
 	}
 }
 

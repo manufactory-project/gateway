@@ -49,12 +49,13 @@ func TestAdmissionRecheckBlocksRevokedGrantBetweenAdmitAndRegister(t *testing.T)
 
 	var dialHits atomic.Int32
 	srv, err := NewServer(Options{
-		Link:      store.Current().Config.Links[0],
-		Store:     store,
-		Evaluator: policy.NewEvaluator(store),
-		Audit:     aw,
-		Leaves:    ca.NewLeafCache(rootCA),
-		Flows:     NewFlowRegistry(),
+		Link:         store.Current().Config.Links[0],
+		Store:        store,
+		Evaluator:    policy.NewEvaluator(store),
+		Audit:        aw,
+		Leaves:       ca.NewLeafCache(rootCA),
+		Flows:        NewFlowRegistry(),
+		OnServeError: func(error) {},
 		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 			dialHits.Add(1)
 			return nil, net.ErrClosed
@@ -129,12 +130,13 @@ func TestAdmissionRecheckBlocksWhenOnlyAllowWebSocketChanges(t *testing.T) {
 
 	var dialHits atomic.Int32
 	srv, err := NewServer(Options{
-		Link:      store.Current().Config.Links[0],
-		Store:     store,
-		Evaluator: policy.NewEvaluator(store),
-		Audit:     aw,
-		Leaves:    ca.NewLeafCache(rootCA),
-		Flows:     NewFlowRegistry(),
+		Link:         store.Current().Config.Links[0],
+		Store:        store,
+		Evaluator:    policy.NewEvaluator(store),
+		Audit:        aw,
+		Leaves:       ca.NewLeafCache(rootCA),
+		Flows:        NewFlowRegistry(),
+		OnServeError: func(error) {},
 		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 			dialHits.Add(1)
 			return nil, net.ErrClosed

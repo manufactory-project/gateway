@@ -236,11 +236,12 @@ rules:
 	})
 	flows := proxy.NewFlowRegistry()
 	aSrv, err := admin.NewServer(admin.Options{
-		SocketPath: sockPath,
-		Store:      store,
-		Flows:      adminFlowAdapter{flows: flows},
-		Audit:      aw,
-		Metrics:    metrics.NewCollector(metrics.Options{}),
+		SocketPath:   sockPath,
+		Store:        store,
+		Flows:        adminFlowAdapter{flows: flows},
+		Audit:        aw,
+		Metrics:      metrics.NewCollector(metrics.Options{}),
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("admin.NewServer: %v", err)
@@ -574,11 +575,12 @@ rules:
 		}
 	})
 	aSrv, err := admin.NewServer(admin.Options{
-		SocketPath: sockPath,
-		Store:      store,
-		Flows:      adminFlowAdapter{flows: proxy.NewFlowRegistry()},
-		Audit:      aw,
-		Metrics:    metrics.NewCollector(metrics.Options{}),
+		SocketPath:   sockPath,
+		Store:        store,
+		Flows:        adminFlowAdapter{flows: proxy.NewFlowRegistry()},
+		Audit:        aw,
+		Metrics:      metrics.NewCollector(metrics.Options{}),
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("admin.NewServer: %v", err)
@@ -711,14 +713,7 @@ rules:
 	}
 	flows := proxy.NewFlowRegistry()
 	collector := metrics.NewCollector(metrics.Options{})
-	rt := &daemonRuntime{auditWriter: aw}
-	serveErrCh := make(chan error, 1)
-	reportServeErr := func(e error) {
-		select {
-		case serveErrCh <- e:
-		default:
-		}
-	}
+	rt := newDaemonRuntime(aw)
 	alloc, err := gwdns.NewAllocator(cfg.FakePrefix)
 	if err != nil {
 		t.Fatalf("NewAllocator: %v", err)
@@ -726,14 +721,14 @@ rules:
 	eval := policy.NewEvaluator(store)
 	leaves := ca.NewLeafCache(mitmCA)
 	dialer := netguard.NewDialer(netguard.Options{Store: store})
-	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, reportServeErr); err != nil {
+	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, rt.reportServeErr); err != nil {
 		t.Fatalf("startLinks: %v", err)
 	}
-	if err := rt.startControl(cfg, store, flows, collector, reportServeErr); err != nil {
+	if err := rt.startControl(cfg, store, flows, collector, rt.reportServeErr); err != nil {
 		t.Fatalf("startControl: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	runCtx, runCancel := context.WithCancel(ctx)
 	var bgWG sync.WaitGroup
@@ -746,12 +741,12 @@ rules:
 	permErr := errors.New("accept EMFILE permanent failure")
 	go func() {
 		if sErr := (&http.Server{}).Serve(failingTestListener{err: permErr}); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
-			reportServeErr(fmt.Errorf("proxy(sbx0/https): %w", sErr))
+			rt.reportServeErr(fmt.Errorf("proxy(sbx0/https): %w", sErr))
 		}
 	}()
 
 	var stderr bytes.Buffer
-	gotErr := rt.waitAndShutdown(ctx, runCancel, &bgWG, serveErrCh, &stderr)
+	gotErr := rt.waitAndShutdown(ctx, runCancel, &bgWG, &stderr)
 	if !errors.Is(gotErr, permErr) {
 		t.Fatalf("waitAndShutdown err = %v, want wrapped %v (non-zero exit)", gotErr, permErr)
 	}
@@ -871,12 +866,13 @@ links:
 
 	eval := policy.NewEvaluator(store)
 	pSrv, err := proxy.NewServer(proxy.Options{
-		Link:      store.Current().Config.Links[0],
-		Store:     store,
-		Evaluator: eval,
-		Audit:     aw,
-		Leaves:    ca.NewLeafCache(mitmCA),
-		Flows:     flows,
+		Link:         store.Current().Config.Links[0],
+		Store:        store,
+		Evaluator:    eval,
+		Audit:        aw,
+		Leaves:       ca.NewLeafCache(mitmCA),
+		Flows:        flows,
+		OnServeError: func(error) {},
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, upSrv.Listener.Addr().String())

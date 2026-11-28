@@ -842,7 +842,8 @@ rules:
 			Resolver: resolver,
 			Timeout:  time.Second,
 		}),
-		Flows: proxy.NewFlowRegistry(),
+		Flows:        proxy.NewFlowRegistry(),
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)

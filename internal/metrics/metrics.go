@@ -210,15 +210,10 @@ type Server struct {
 	wg  sync.WaitGroup
 }
 
-// SetOnServeError registers a callback invoked if the metrics listener exits with an unexpected error.
-func (s *Server) SetOnServeError(fn func(error)) {
-	s.onServeError = fn
-}
-
 // NewServer validates listenAddr is an explicit IP:port (never wildcard) and constructs Server.
-func NewServer(listenAddr string, collector *Collector) (*Server, error) {
-	if collector == nil {
-		return nil, errors.New("metrics: collector is required")
+func NewServer(listenAddr string, collector *Collector, onServeError func(error)) (*Server, error) {
+	if collector == nil || onServeError == nil {
+		return nil, errors.New("metrics: collector and onServeError are required")
 	}
 	host, _, err := net.SplitHostPort(listenAddr)
 	if err != nil {
@@ -233,8 +228,9 @@ func NewServer(listenAddr string, collector *Collector) (*Server, error) {
 		return nil, fmt.Errorf("metrics: wildcard or non-IP listen address %q is forbidden", listenAddr)
 	}
 	return &Server{
-		listenAddr: listenAddr,
-		collector:  collector,
+		listenAddr:   listenAddr,
+		collector:    collector,
+		onServeError: onServeError,
 	}, nil
 }
 

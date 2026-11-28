@@ -98,8 +98,8 @@ type ServerOptions struct {
 
 // NewServer creates a per-link fake-IP DNS Server bound to link.ParsedGatewayIP:link.DNSPort.
 func NewServer(opts ServerOptions) (*Server, error) {
-	if opts.Store == nil || opts.Evaluator == nil || opts.Audit == nil || opts.Allocator == nil {
-		return nil, errors.New("dns: store, evaluator, audit, and allocator are required")
+	if opts.Store == nil || opts.Evaluator == nil || opts.Audit == nil || opts.Allocator == nil || opts.OnServeError == nil {
+		return nil, errors.New("dns: store, evaluator, audit, allocator, and onServeError are required")
 	}
 	if !opts.Link.ParsedGatewayIP.IsValid() || opts.Link.ParsedGatewayIP.IsUnspecified() {
 		return nil, errors.New("dns: explicit non-wildcard gateway_ip is required")
