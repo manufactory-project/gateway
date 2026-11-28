@@ -2,7 +2,8 @@
 
 // Command gateway runs the headless, egress-only network gateway daemon and
 // provides its operator CLI subcommands (`run`, `netsetup`, `status`, `reload`,
-// `flows`, `revoke`, `grant`, `grants`, `ca init`, and `dataplane check`).
+// `flows`, `revoke`, `grant`, `grants`, `ca init`, `dataplane check`, and
+// `version`).
 package main
 
 import (
@@ -38,13 +39,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	socketPath := fs.String("socket", defaultSocket, "path to gateway admin Unix socket")
 	asJSON := fs.Bool("json", false, "output JSON")
+	version := fs.Bool("version", false, "print the build version")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	jsonOut := *asJSON || trailingJSON
 	rest := fs.Args()
+	if *version {
+		return runVersion(rest, jsonOut, stdout, stderr)
+	}
 	if len(rest) == 0 {
-		return errors.New("usage: gateway [--socket PATH] [--json] <run|netsetup|status|reload|flows|revoke|grants|grant|ca|dataplane>")
+		return errors.New("usage: gateway [--socket PATH] [--json] <run|netsetup|status|reload|flows|revoke|grants|grant|ca|dataplane|version>")
 	}
 
 	cmd := rest[0]
@@ -59,6 +64,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runCA(cmdArgs, jsonOut, stdout, stderr)
 	case "dataplane":
 		return runDataplane(ctx, cmdArgs, jsonOut, stdout, stderr)
+	case "version":
+		return runVersion(cmdArgs, jsonOut, stdout, stderr)
 	default:
 		return runAdminCmd(ctx, *socketPath, cmd, cmdArgs, jsonOut, stdout, stderr)
 	}
