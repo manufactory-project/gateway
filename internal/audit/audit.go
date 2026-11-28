@@ -431,7 +431,10 @@ func (w *Writer) pruneSizeLocked(now time.Time) error {
 		}
 		return segs[i].seq < segs[j].seq
 	})
-	var removed int64
+	var (
+		toRemove     []segmentMeta
+		plannedBytes int64
+	)
 	for _, seg := range segs {
 		if total <= w.maxTotalBytes {
 			break
@@ -439,32 +442,37 @@ func (w *Writer) pruneSizeLocked(now time.Time) error {
 		if seg.active {
 			continue
 		}
-		if rmErr := os.Remove(filepath.Join(w.dir, seg.name)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-			w.diagf("audit: size-prune remove %s: %v\n", seg.name, rmErr)
-			continue
-		}
+		toRemove = append(toRemove, seg)
 		total -= seg.size
-		removed += seg.size
+		plannedBytes += seg.size
 	}
-	if removed <= 0 {
+	if len(toRemove) == 0 {
 		return nil
-	}
-	if w.onSizePrune != nil {
-		w.onSizePrune(removed)
 	}
 	ev := sanitizeEvent(Event{
 		Kind:         KindLifecycle,
 		Reason:       "audit-size-pruned",
-		BytesRemoved: removed,
+		BytesRemoved: plannedBytes,
 	}, now.UTC())
 	line, mErr := json.Marshal(ev)
 	if mErr != nil {
-		return nil
+		return fmt.Errorf("audit: marshal audit-size-pruned event: %w", mErr)
 	}
 	line = append(line, '\n')
 	if wErr := w.writeLineLocked(line); wErr != nil {
 		w.diagf("audit: write audit-size-pruned event: %v\n", wErr)
 		return wErr
+	}
+	var removed int64
+	for _, seg := range toRemove {
+		if rmErr := os.Remove(filepath.Join(w.dir, seg.name)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			w.diagf("audit: size-prune remove %s: %v\n", seg.name, rmErr)
+			continue
+		}
+		removed += seg.size
+	}
+	if removed > 0 && w.onSizePrune != nil {
+		w.onSizePrune(removed)
 	}
 	return nil
 }
