@@ -478,3 +478,47 @@ func TestReloadRevokingOneHTTP2StreamLeavesSiblingRunning(t *testing.T) {
 	waitAuditCompletedError(t, gw, "/a", "reload")
 	waitAuditCompletedError(t, gw, "/b", "")
 }
+
+// TestReloadThatMovesAPinTearsDownTheOpenFlow pins that a flow decided under one
+// pin ends when a reload changes only the rule's pin, since its upstream connection
+// was made to the old address.
+func TestReloadThatMovesAPinTearsDownTheOpenFlow(t *testing.T) {
+	open := make(chan string, 1)
+	release := make(chan struct{})
+	var once sync.Once
+	gw := newTestGateway(t, testGatewaySpec{
+		OnCleanupFirst: func() { once.Do(func() { close(release) }) },
+		Hosts:          []string{"forge.lan.example"},
+		Handler:        sseHold(open, release),
+		RulesYAML:      "  - id: pinned\n    principal: worker-test\n    effect: allow\n    hosts: [forge.lan.example]\n    pins: {forge.lan.example: 10.10.20.5}\n",
+	})
+	resp, err := gw.H1Client(t, "forge.lan.example").Get("https://forge.lan.example/stream")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /stream: resp=%+v err=%v", resp, err)
+	}
+	<-open
+	reload := func(yaml string) int {
+		t.Helper()
+		if err := os.WriteFile(gw.CfgPath, []byte(yaml), 0o600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		_, _, revoked, err := gw.Store.Reload()
+		if err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		return revoked
+	}
+	if n := reload(gw.BaseYAML); n != 0 {
+		t.Fatalf("reload with the same pin revoked %d flow(s), want 0", n)
+	}
+	if n := reload(strings.Replace(gw.BaseYAML, "10.10.20.5", "10.10.20.6", 1)); n != 1 {
+		t.Fatalf("reload moving the pin revoked %d flow(s), want 1", n)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Logf("stream closed on reload: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Logf("close resp: %v", err)
+	}
+	waitAuditCompletedError(t, gw, "/stream", "reload")
+}
