@@ -156,6 +156,11 @@ type testGatewaySpec struct {
 	OnCleanupFirst    func()
 	UpstreamH1        bool
 	OnAuditWriteError func()
+	// OnCompletionLost is called after a lost completion record is counted.
+	OnCompletionLost func()
+	// ShareAuditWith makes this gateway write to the other's audit log through
+	// the same Writer, as the links of one daemon do.
+	ShareAuditWith *testGateway
 }
 
 type testGateway struct {
@@ -183,6 +188,9 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 
 	dir := t.TempDir()
 	auditDir := filepath.Join(dir, "audit")
+	if spec.ShareAuditWith != nil {
+		auditDir = spec.ShareAuditWith.AuditDir
+	}
 
 	mitmCert := filepath.Join(dir, "mitm-ca.crt")
 	mitmKey := filepath.Join(dir, "mitm-ca.key")
@@ -276,19 +284,25 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	flows.SetOnRevoke(col.AddRevocations)
 
 	records := newRecordSignal()
-	aw, err := audit.NewWriter(audit.Options{
-		Dir:          auditDir,
-		Stdout:       records,
-		MaxFileBytes: spec.AuditMaxFileBytes,
-		OnWriteError: func() {
-			col.IncAuditWriteError()
-			if spec.OnAuditWriteError != nil {
-				spec.OnAuditWriteError()
-			}
-		},
-	})
-	if err != nil {
-		t.Fatalf("audit.NewWriter: %v", err)
+	var aw *audit.Writer
+	if spec.ShareAuditWith != nil {
+		aw = spec.ShareAuditWith.Audit
+		records = spec.ShareAuditWith.Records
+	} else {
+		aw, err = audit.NewWriter(audit.Options{
+			Dir:          auditDir,
+			Stdout:       records,
+			MaxFileBytes: spec.AuditMaxFileBytes,
+			OnWriteError: func() {
+				col.IncAuditWriteError()
+				if spec.OnAuditWriteError != nil {
+					spec.OnAuditWriteError()
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("audit.NewWriter: %v", err)
+		}
 	}
 
 	var cs *countingSigner
@@ -342,7 +356,14 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		Flows:          flows,
 		OnRequest:      col.ObserveRequest,
 		OnConnRejected: col.IncConnRejected,
-		OnServeError:   func(error) {},
+		OnLimited:      col.IncLimited,
+		OnCompletionLost: func(link string) {
+			col.IncCompletionLost(link)
+			if spec.OnCompletionLost != nil {
+				spec.OnCompletionLost()
+			}
+		},
+		OnServeError: func(error) {},
 	})
 	if err != nil {
 		t.Fatalf("proxy.NewServer: %v", err)
@@ -361,11 +382,13 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 
 	// Register cleanups in LIFO order so blocked upstream handlers release first,
 	// then grant pruner stops, then proxy shuts down, then upstream closes, then audit closes.
-	t.Cleanup(func() {
-		if err := aw.Close(); err != nil {
-			t.Errorf("audit close: %v", err)
-		}
-	})
+	if spec.ShareAuditWith == nil {
+		t.Cleanup(func() {
+			if err := aw.Close(); err != nil {
+				t.Errorf("audit close: %v", err)
+			}
+		})
+	}
 	if upPlain != nil {
 		t.Cleanup(upPlain.Close)
 	}
@@ -605,4 +628,10 @@ func makeSignedServerCert(t testing.TB, root ca.CA, dnsNames []string) tls.Certi
 		t.Fatalf("sign upstream leaf: %v", err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+func scrapeMetrics(gw *testGateway) string {
+	rec := httptest.NewRecorder()
+	gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return rec.Body.String()
 }

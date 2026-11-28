@@ -240,6 +240,8 @@ A value of 0 selects the default. `max_file_bytes` must not exceed `max_total_by
 
 Anyone who can open the admin socket can create grants and reload the config.
 
+`metrics.listen` has no authentication, by design: Prometheus scrapes it over the management network. Anyone who can reach that address can read every metric, including per-principal request counts and refusal reasons. Bind it to a management-network address that guests cannot route to, and do not put it on a link's gateway IP.
+
 ### `dataplane`
 
 | Key | Required | Default | Value |
@@ -261,6 +263,7 @@ Keep `state_file` on storage that survives reboots. If you move or delete it and
 |---|---|---|
 | `fake_cidr` | `198.18.0.0/15` | IPv4 range for the placeholder addresses guests receive, `/30` or larger. Must not overlap any link's `subnet` |
 | `ttl_seconds` | 60 | TTL of those answers |
+| `max_queries_per_second` | 100 | DNS queries served per link, UDP and TCP together, with a burst of the same size. Queries over it are dropped unanswered before any work is done, counted in `gateway_limited_total{reason="dns-rate-limited"}`, and recorded as one `dns-rate-limited` audit record with a `count`, at most once every 10 seconds |
 
 Guests connect to these addresses, and `gateway` redirects the connection, so the range never carries real traffic and `gateway` never dials an address inside it.
 
@@ -280,8 +283,17 @@ No special-purpose range passes a strict filter, so no default can be accepted e
 | `max_request_body_bytes` | 33554432 (32 MiB) | One request body |
 | `ws_max_egress_bytes` | 67108864 (64 MiB) | Bytes a guest sends on one WebSocket |
 | `max_header_bytes` | 32768 | Headers |
-| `max_conns_per_link` | 512 | Concurrent connections per link. HTTP and HTTPS share one budget of this size, and DNS over TCP has its own. DNS over UDP is not limited |
-| `upstream_response_header_timeout` | `10m` | Wait for an upstream's response headers |
+| `max_conns_per_link` | 512 | Concurrent connections per link. HTTP and HTTPS share one budget of this size, and DNS over TCP has its own |
+| `max_inflight_per_link` | 256 | Requests being served at once per link, across HTTP, HTTPS, every HTTP/2 stream, SSE and WebSocket. The next request gets `503` |
+| `max_denied_handshakes_per_second` | 20 | TLS handshakes per link refused for a missing, IP-literal or denied SNI that are audited and counted individually; the rest are still refused but recorded only in the summary |
+| `max_new_leaves_per_second` | 50 | New leaf certificates minted per link. Over it, the handshake for an uncached name fails; cached names are unaffected |
+| `read_header_timeout` | `10s` | Time a guest has to finish the TLS handshake and each request's headers |
+| `stream_idle_timeout` | `60s` | A request body read, or a response write, that moves no byte for this long is cut. Streams that keep moving, such as SSE or LLM output, are never cut however long they run |
+| `upstream_response_header_timeout` | `10m` | Wait for an upstream's response headers. A long non-streaming model call needs it; the wait holds one `max_inflight_per_link` slot |
+
+Each connection from a guest may have 100 concurrent HTTP/2 streams. Each link keeps at most 32 connections, and 32 idle connections, to any one upstream host.
+
+Refusals by `max_inflight_per_link`, `max_denied_handshakes_per_second` and `max_new_leaves_per_second` are counted in `gateway_limited_total` by link and reason, and each is summarized by one audit record with a `count` at most every 10 seconds, so the audit log stays complete without a flood being able to fill it. A request completion record that cannot be written is counted in `gateway_audit_completion_lost_total`.
 
 The WebSocket upgrade handshake has a fixed 30 second limit.
 
@@ -297,7 +309,7 @@ If the new file is invalid or changes a setting that needs a restart, the comman
 
 | Applied on reload | Needs a restart |
 |---|---|
-| `rules` (including `pins`), `dns.ttl_seconds`, `http.max_request_body_bytes`, `http.ws_max_egress_bytes` | `links`, `ca`, `audit`, `admin`, `metrics`, `dataplane`, `dns.fake_cidr`, `http.max_header_bytes`, `http.max_conns_per_link`, `http.upstream_response_header_timeout` |
+| `rules` (including `pins`), `dns.ttl_seconds`, `http.max_request_body_bytes`, `http.ws_max_egress_bytes` | `links`, `ca`, `audit`, `admin`, `metrics`, `dataplane`, `dns.fake_cidr`, `dns.max_queries_per_second`, `http.max_header_bytes`, `http.max_conns_per_link`, `http.max_inflight_per_link`, `http.max_denied_handshakes_per_second`, `http.max_new_leaves_per_second`, `http.read_header_timeout`, `http.stream_idle_timeout`, `http.upstream_response_header_timeout` |
 
 A successful reload:
 

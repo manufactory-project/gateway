@@ -207,8 +207,13 @@ func NewLeafCacheWithOptions(c CA, capacity int, now func() time.Time) *LeafCach
 	}
 }
 
+// ErrMintLimited is returned by Leaf when the caller's admit function refuses a mint.
+var ErrMintLimited = errors.New("ca: leaf mint rate limit exceeded")
+
 // Leaf returns a valid cached leaf for name or mints one without holding c.mu.
-func (c *LeafCache) Leaf(name string) (*tls.Certificate, error) {
+// A cache hit never calls admit; a mint calls it once first, and Leaf returns
+// ErrMintLimited when it refuses, so each caller can budget its own minting.
+func (c *LeafCache) Leaf(name string, admit func() bool) (*tls.Certificate, error) {
 	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
 	if name == "" {
 		return nil, errors.New("ca: empty leaf name")
@@ -233,6 +238,9 @@ func (c *LeafCache) Leaf(name string) (*tls.Certificate, error) {
 		}
 		c.mu.RUnlock()
 
+		if !admit() {
+			return nil, ErrMintLimited
+		}
 		// Mint ECDSA key and X.509 certificate with NO cache lock held.
 		cert, notAfter, err := c.mint(name, nowInner)
 		if err != nil {

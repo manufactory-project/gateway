@@ -29,6 +29,8 @@ type Collector struct {
 	reloadsTotal              *prometheus.CounterVec
 	revocationsTotal          prometheus.Counter
 	connsRejectedTotal        *prometheus.CounterVec
+	rateLimitedTotal          *prometheus.CounterVec
+	completionLostTotal       *prometheus.CounterVec
 }
 
 // Options wires dynamic gauges into a Collector.
@@ -71,6 +73,14 @@ func NewCollector(opts Options) *Collector {
 			Name: "gateway_conns_rejected_total",
 			Help: "Total guest connections closed because a link reached http.max_conns_per_link (HTTP/HTTPS and DNS over TCP are limited separately).",
 		}, []string{"link"}),
+		rateLimitedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_limited_total",
+			Help: "Total guest work refused by a per-link limit (dns-rate-limited, denied-handshake-rate-limited, leaf-mint-rate-limited, inflight-limit).",
+		}, []string{"link", "reason"}),
+		completionLostTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_audit_completion_lost_total",
+			Help: "Total request completion records that failed to write after the request had already run.",
+		}, []string{"link"}),
 	}
 
 	reg.MustRegister(
@@ -81,6 +91,8 @@ func NewCollector(opts Options) *Collector {
 		c.reloadsTotal,
 		c.revocationsTotal,
 		c.connsRejectedTotal,
+		c.rateLimitedTotal,
+		c.completionLostTotal,
 	)
 
 	if opts.ActiveFlows != nil {
@@ -113,6 +125,16 @@ func (c *Collector) ObserveAuditSizePruned(bytesRemoved int64) {
 // IncConnRejected increments gateway_conns_rejected_total for link.
 func (c *Collector) IncConnRejected(link string) {
 	c.connsRejectedTotal.WithLabelValues(link).Inc()
+}
+
+// IncLimited increments gateway_limited_total for link and reason.
+func (c *Collector) IncLimited(link, reason string) {
+	c.rateLimitedTotal.WithLabelValues(link, reason).Inc()
+}
+
+// IncCompletionLost increments gateway_audit_completion_lost_total for link.
+func (c *Collector) IncCompletionLost(link string) {
+	c.completionLostTotal.WithLabelValues(link).Inc()
 }
 
 // knownRequestReasons bounds the Prometheus reason label to a fixed set of
@@ -155,6 +177,7 @@ var knownRequestReasons = map[string]struct{}{
 	"grant-expired":                     {},
 	"reload":                            {},
 	"client-canceled":                   {},
+	"guest-idle-timeout":                {},
 	"ws-egress-cap-exceeded":            {},
 	"compressed-response-on-bound-host": {},
 	"partial-response-on-bound-host":    {},

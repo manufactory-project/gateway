@@ -48,8 +48,9 @@ This goal is limited by design: **data can leave through any destination you all
 Provided:
 
 - Default deny per principal, checked for each DNS lookup and each HTTP request.
-- A JSONL record of each DNS and request decision, naming the principal. Paths are recorded; query strings, headers and bodies are not. If the record cannot be written before a lookup is answered or a request is sent, it is refused. Connections dropped at the connection limit are only counted in metrics.
-- Limits on concurrent connections per link (HTTP and HTTPS together, and DNS over TCP separately; DNS over UDP is not limited), request body size, header size, bytes a guest sends on a WebSocket, and total audit log size.
+- A JSONL record of each DNS and request decision, naming the principal. Paths are recorded; query strings, headers and bodies are not. If the record cannot be written before a lookup is answered or a request is sent, it is refused. Connections dropped at the connection limit are only counted in metrics. Work refused by a per-link rate or in-flight limit is counted in metrics too and is recorded as a summary record carrying a `count`, at most once per link and reason every 10 seconds, instead of one record per refusal.
+- Limits per link, so one guest cannot slow another: concurrent connections (HTTP and HTTPS together, and DNS over TCP separately), requests in flight, DNS queries per second (UDP and TCP), denied TLS handshakes per second, new leaf certificates per second, HTTP/2 streams per connection, upstream connections per host, and idle time on a stalled request body, response or handshake. Also request body size, header size, bytes a guest sends on a WebSocket, and total audit log size.
+- Every TLS handshake is a full one: the gateway issues no session tickets, so the SNI check, its audit record and the denied-handshake limit cannot be skipped by resuming a session.
 
 Not prevented:
 

@@ -32,6 +32,12 @@ const (
 	DefaultMaxHeaderBytes                = 32 << 10 // 32 KiB
 	DefaultMaxConnsPerLink               = 512
 	DefaultUpstreamResponseHeaderTimeout = "10m"
+	DefaultReadHeaderTimeout             = "10s"
+	DefaultStreamIdleTimeout             = "60s"
+	DefaultMaxQueriesPerSecond           = 100
+	DefaultMaxDeniedHandshakesPerSecond  = 20
+	DefaultMaxNewLeavesPerSecond         = 50
+	DefaultMaxInflightPerLink            = 256
 	DefaultAuditRetainDays               = 30
 	MaxAuditRetainDays                   = int(math.MaxInt64 / int64(24*time.Hour))
 	DefaultAuditMaxFileBytes             = 100 << 20       // 100 MiB
@@ -107,6 +113,8 @@ type DHCPConfig struct {
 type DNSConfig struct {
 	FakeCIDR   string `yaml:"fake_cidr"`
 	TTLSeconds uint32 `yaml:"ttl_seconds"`
+	// MaxQueriesPerSecond caps the DNS queries (UDP and TCP together) served per link.
+	MaxQueriesPerSecond int `yaml:"max_queries_per_second"`
 }
 
 // HTTPConfig configures MITM HTTP/2/WS size, connection, timeout, and header limits.
@@ -116,8 +124,20 @@ type HTTPConfig struct {
 	MaxHeaderBytes                int    `yaml:"max_header_bytes"`
 	MaxConnsPerLink               int    `yaml:"max_conns_per_link"`
 	UpstreamResponseHeaderTimeout string `yaml:"upstream_response_header_timeout"`
+	// ReadHeaderTimeout bounds a guest's TLS handshake and request headers.
+	ReadHeaderTimeout string `yaml:"read_header_timeout"`
+	// StreamIdleTimeout cuts a stream on which no byte moves for this long while
+	// the gateway waits on the guest (a stalled request body or an unread response).
+	StreamIdleTimeout string `yaml:"stream_idle_timeout"`
+	// Per-link limits: denied TLS handshakes and new leaf certificates per second,
+	// and requests in flight.
+	MaxDeniedHandshakesPerSecond int `yaml:"max_denied_handshakes_per_second"`
+	MaxNewLeavesPerSecond        int `yaml:"max_new_leaves_per_second"`
+	MaxInflightPerLink           int `yaml:"max_inflight_per_link"`
 
 	ParsedUpstreamResponseHeaderTimeout time.Duration `yaml:"-"`
+	ParsedReadHeaderTimeout             time.Duration `yaml:"-"`
+	ParsedStreamIdleTimeout             time.Duration `yaml:"-"`
 }
 
 // LinkConfig maps one sandbox link interface and subnet to one principal.
@@ -240,6 +260,24 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.HTTP.UpstreamResponseHeaderTimeout == "" {
 		cfg.HTTP.UpstreamResponseHeaderTimeout = DefaultUpstreamResponseHeaderTimeout
+	}
+	if cfg.HTTP.ReadHeaderTimeout == "" {
+		cfg.HTTP.ReadHeaderTimeout = DefaultReadHeaderTimeout
+	}
+	if cfg.HTTP.StreamIdleTimeout == "" {
+		cfg.HTTP.StreamIdleTimeout = DefaultStreamIdleTimeout
+	}
+	if cfg.DNS.MaxQueriesPerSecond == 0 {
+		cfg.DNS.MaxQueriesPerSecond = DefaultMaxQueriesPerSecond
+	}
+	if cfg.HTTP.MaxDeniedHandshakesPerSecond == 0 {
+		cfg.HTTP.MaxDeniedHandshakesPerSecond = DefaultMaxDeniedHandshakesPerSecond
+	}
+	if cfg.HTTP.MaxNewLeavesPerSecond == 0 {
+		cfg.HTTP.MaxNewLeavesPerSecond = DefaultMaxNewLeavesPerSecond
+	}
+	if cfg.HTTP.MaxInflightPerLink == 0 {
+		cfg.HTTP.MaxInflightPerLink = DefaultMaxInflightPerLink
 	}
 	if cfg.Dataplane.DHCP.LeaseTime == "" {
 		cfg.Dataplane.DHCP.LeaseTime = DefaultDHCPLeaseTime
@@ -394,6 +432,9 @@ func validateDNS(cfg *Config) error {
 	if p.Bits() > 30 {
 		return fmt.Errorf("dns.fake_cidr %q must have prefix <= /30 (at least 2 usable addresses)", cfg.DNS.FakeCIDR)
 	}
+	if cfg.DNS.MaxQueriesPerSecond <= 0 {
+		return fmt.Errorf("dns.max_queries_per_second must be > 0, got %d", cfg.DNS.MaxQueriesPerSecond)
+	}
 	cfg.FakePrefix = p.Masked()
 	return nil
 }
@@ -416,7 +457,28 @@ func validateHTTP(h *HTTPConfig) error {
 		return fmt.Errorf("http.upstream_response_header_timeout %q must be a positive duration", h.UpstreamResponseHeaderTimeout)
 	}
 	h.ParsedUpstreamResponseHeaderTimeout = dur
-	return nil
+	for name, limit := range map[string]int{
+		"max_denied_handshakes_per_second": h.MaxDeniedHandshakesPerSecond,
+		"max_new_leaves_per_second":        h.MaxNewLeavesPerSecond,
+		"max_inflight_per_link":            h.MaxInflightPerLink,
+	} {
+		if limit <= 0 {
+			return fmt.Errorf("http.%s must be > 0, got %d", name, limit)
+		}
+	}
+	if h.ParsedReadHeaderTimeout, err = parsePositiveDuration("http.read_header_timeout", h.ReadHeaderTimeout); err != nil {
+		return err
+	}
+	h.ParsedStreamIdleTimeout, err = parsePositiveDuration("http.stream_idle_timeout", h.StreamIdleTimeout)
+	return err
+}
+
+func parsePositiveDuration(name, raw string) (time.Duration, error) {
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s %q must be a positive duration", name, raw)
+	}
+	return d, nil
 }
 
 // validateFakeCIDR refuses a fake range that a link's subnet or gateway address

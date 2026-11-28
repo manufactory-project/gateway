@@ -925,8 +925,10 @@ func TestMetricsReasonLabelAndCompletionAuditFailureCounts(t *testing.T) {
 	inUpstream := make(chan struct{})
 	releaseUpstream := make(chan struct{})
 	auditFailed := make(chan struct{}, 1)
+	completionLost := make(chan struct{}, 1)
 	gw := newTestGateway(t, testGatewaySpec{
 		AuditMaxFileBytes: 180,
+		OnCompletionLost:  func() { completionLost <- struct{}{} },
 		OnCleanupFirst:    func() { close(releaseUpstream) },
 		OnAuditWriteError: func() {
 			select {
@@ -998,6 +1000,12 @@ func TestMetricsReasonLabelAndCompletionAuditFailureCounts(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("completion audit write never failed")
 	}
+	// The loss is counted on its own, not only in the generic write-error total.
+	select {
+	case <-completionLost:
+	case <-time.After(5 * time.Second):
+		t.Fatal("lost completion record was never counted")
+	}
 
 	rec := httptest.NewRecorder()
 	gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
@@ -1006,6 +1014,7 @@ func TestMetricsReasonLabelAndCompletionAuditFailureCounts(t *testing.T) {
 		`gateway_requests_total{effect="deny",principal="worker-test",reason="default-deny",status="403"} 1`,
 		`gateway_requests_total{effect="allow",principal="worker-test",reason="rule-allow",status="200"} 1`,
 		"gateway_audit_write_errors_total 1",
+		`gateway_audit_completion_lost_total{link="sbx0"} 1`,
 	} {
 		if !strings.Contains(mText, want) {
 			t.Fatalf("/metrics missing %q:\n%s", want, mText)

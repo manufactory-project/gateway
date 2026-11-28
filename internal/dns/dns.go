@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	mdns "github.com/miekg/dns"
 
@@ -80,7 +81,10 @@ type Server struct {
 	onQuery        func(principal, effect string)
 	onConnRejected func(link string)
 	onServeError   func(error)
+	onLimited      func(link, reason string)
 
+	budget       *connlimit.Budget
+	drops        *connlimit.Drops
 	shuttingDown atomic.Bool
 	udpConn      net.PacketConn
 	tcpLn        net.Listener
@@ -99,7 +103,9 @@ type ServerOptions struct {
 	OnQuery   func(principal, effect string)
 	// OnConnRejected is called for each TCP connection over http.max_conns_per_link.
 	OnConnRejected func(link string)
-	OnServeError   func(error)
+	// OnLimited is called for each query dropped by dns.max_queries_per_second.
+	OnLimited    func(link, reason string)
+	OnServeError func(error)
 }
 
 // NewServer creates a per-link fake-IP DNS Server bound to link.ParsedGatewayIP:link.DNSPort.
@@ -110,7 +116,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if !opts.Link.ParsedGatewayIP.IsValid() || opts.Link.ParsedGatewayIP.IsUnspecified() {
 		return nil, errors.New("dns: explicit non-wildcard gateway_ip is required")
 	}
-	return &Server{
+	s := &Server{
 		link:           opts.Link,
 		onConnRejected: opts.OnConnRejected,
 		store:          opts.Store,
@@ -119,7 +125,15 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		allocator:      opts.Allocator,
 		onQuery:        opts.OnQuery,
 		onServeError:   opts.OnServeError,
-	}, nil
+		onLimited:      opts.OnLimited,
+	}
+	s.drops = connlimit.NewDrops(func() {
+		if s.onLimited != nil {
+			s.onLimited(s.link.Name, ReasonRateLimited)
+		}
+	}, s.auditRateLimited)
+	s.budget = connlimit.NewBudget(opts.Store.Current().Config.DNS.MaxQueriesPerSecond, s.drops)
+	return s, nil
 }
 
 // Start binds explicit UDP and TCP listeners and starts serving DNS queries.
@@ -154,6 +168,7 @@ func (s *Server) Start() error {
 	s.udpSrv = &mdns.Server{
 		PacketConn:        pc,
 		Handler:           handler,
+		DecorateReader:    s.limitReader,
 		MsgAcceptFunc:     acceptAll,
 		MsgInvalidFunc:    func(_ []byte, _ error) { s.auditMalformed("udp") },
 		NotifyStartedFunc: func() { close(udpReady) },
@@ -161,6 +176,7 @@ func (s *Server) Start() error {
 	s.tcpSrv = &mdns.Server{
 		Listener:          limit.Listener(ln),
 		Handler:           handler,
+		DecorateReader:    s.limitReader,
 		MsgAcceptFunc:     acceptAll,
 		MsgInvalidFunc:    func(_ []byte, _ error) { s.auditMalformed("tcp") },
 		NotifyStartedFunc: func() { close(tcpReady) },
@@ -204,6 +220,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 	s.wg.Wait()
+	s.drops.Flush()
 	return errs
 }
 
@@ -363,6 +380,49 @@ func (s *Server) auditMalformed(proto string) {
 	}
 	if s.onQuery != nil {
 		s.onQuery(s.link.Principal, string(audit.EffectDeny))
+	}
+}
+
+// ReasonRateLimited labels queries dropped over dns.max_queries_per_second, in
+// the limit metric and in the one summary audit record written per interval.
+const ReasonRateLimited = "dns-rate-limited"
+
+// limitReader drops queries over the link's budget as they are read, before the
+// DNS server spawns a goroutine for, parses, or audits them one by one.
+func (s *Server) limitReader(r mdns.Reader) mdns.Reader {
+	return limitedReader{Reader: r, budget: s.budget}
+}
+
+type limitedReader struct {
+	mdns.Reader
+	budget *connlimit.Budget
+}
+
+func (r limitedReader) ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
+	for {
+		m, err := r.Reader.ReadTCP(conn, timeout)
+		if err != nil || r.budget.Allow() {
+			return m, err
+		}
+	}
+}
+
+func (r limitedReader) ReadUDP(conn *net.UDPConn, timeout time.Duration) ([]byte, *mdns.SessionUDP, error) {
+	for {
+		m, sess, err := r.Reader.ReadUDP(conn, timeout)
+		if err != nil || r.budget.Allow() {
+			return m, sess, err
+		}
+	}
+}
+
+func (s *Server) auditRateLimited(n uint64) {
+	ev := s.newEvent("", "", "", "")
+	ev.Effect = audit.EffectDeny
+	ev.Reason = ReasonRateLimited
+	ev.Count = n
+	if err := s.audit.WriteSync(ev); err != nil && s.onQuery != nil {
+		s.onQuery(s.link.Principal, "audit_error")
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/textproto"
+	"os"
 	"path"
 	"reflect"
 	"strconv"
@@ -50,8 +51,30 @@ type Options struct {
 	Flows          *FlowRegistry
 	OnRequest      func(principal, effect string, status int, reason string)
 	OnConnRejected func(link string)
-	OnServeError   func(error)
+	// OnLimited is called for each refusal by a per-link limit (see the Reason*
+	// constants); OnCompletionLost for each completion record that failed to write.
+	OnLimited        func(link, reason string)
+	OnCompletionLost func(link string)
+	OnServeError     func(error)
 }
+
+// Reasons for refusals by a per-link limit: the limit metric label and the
+// reason of the one summary audit record written per interval.
+const (
+	ReasonDeniedHandshakeLimited = "denied-handshake-rate-limited"
+	ReasonLeafMintLimited        = "leaf-mint-rate-limited"
+	ReasonInflightLimited        = "inflight-limit"
+)
+
+const (
+	// maxConnsPerUpstreamHost bounds the upstream connections one link holds to
+	// one host. HTTP/2 upstreams multiplex many requests over each.
+	maxConnsPerUpstreamHost = 32
+	// maxIdleUpstreamConns bounds the idle upstream connections one link keeps.
+	maxIdleUpstreamConns = 32
+	// maxGuestStreams is the HTTP/2 concurrent streams a guest may open per connection.
+	maxGuestStreams = 100
+)
 
 // Server owns the explicit-bind HTTPS (:443 semantics) and HTTP (:80 semantics)
 // listeners for a single sandbox link.
@@ -66,6 +89,16 @@ type Server struct {
 	onRequest      func(principal, effect string, status int, reason string)
 	onConnRejected func(link string)
 	onServeError   func(error)
+
+	onLimited        func(link, reason string)
+	onCompletionLost func(link string)
+
+	// Per-link limits. Refusals are counted at once and summarized in the audit
+	// log once per interval, so a flood cannot stall the audit writer.
+	deniedBudget *connlimit.Budget
+	mintBudget   *connlimit.Budget
+	inflight     *connlimit.Limit
+	drops        []*connlimit.Drops
 
 	transport *http.Transport // unpinned requests only; see upstreamTransport
 
@@ -103,8 +136,15 @@ func NewServer(opts Options) (*Server, error) {
 		onRequest:      opts.OnRequest,
 		onConnRejected: opts.OnConnRejected,
 		onServeError:   opts.OnServeError,
+
+		onLimited:        opts.OnLimited,
+		onCompletionLost: opts.OnCompletionLost,
 	}
 	s.transport = s.newTransport(netip.Addr{})
+	hCfg := s.store.Current().Config.HTTP
+	s.deniedBudget = connlimit.NewBudget(hCfg.MaxDeniedHandshakesPerSecond, s.newDrops(ReasonDeniedHandshakeLimited))
+	s.mintBudget = connlimit.NewBudget(hCfg.MaxNewLeavesPerSecond, s.newDrops(ReasonLeafMintLimited))
+	s.inflight = connlimit.New(hCfg.MaxInflightPerLink, s.newDrops(ReasonInflightLimited).Add)
 	return s, nil
 }
 
@@ -120,7 +160,9 @@ func (s *Server) newTransport(pin netip.Addr) *http.Transport {
 		},
 		ForceAttemptHTTP2:      true,
 		DisableCompression:     true,
-		MaxIdleConns:           100,
+		MaxConnsPerHost:        maxConnsPerUpstreamHost,
+		MaxIdleConns:           maxIdleUpstreamConns,
+		MaxIdleConnsPerHost:    maxIdleUpstreamConns,
 		IdleConnTimeout:        60 * time.Second,
 		TLSHandshakeTimeout:    15 * time.Second,
 		ResponseHeaderTimeout:  hCfg.ParsedUpstreamResponseHeaderTimeout,
@@ -140,6 +182,26 @@ func (s *Server) upstreamTransport(pin netip.Addr) (*http.Transport, func()) {
 	}
 	tr := s.newTransport(pin)
 	return tr, tr.CloseIdleConnections
+}
+
+// newDrops returns the counter and summary audit record for one kind of refusal.
+func (s *Server) newDrops(reason string) *connlimit.Drops {
+	d := connlimit.NewDrops(func() {
+		if s.onLimited != nil {
+			s.onLimited(s.link.Name, reason)
+		}
+	}, func(n uint64) {
+		auditBestEffort(s.audit, audit.Event{
+			Kind:      audit.KindRequest,
+			Principal: s.link.Principal,
+			Link:      s.link.Name,
+			Effect:    audit.EffectDeny,
+			Reason:    reason,
+			Count:     n,
+		})
+	})
+	s.drops = append(s.drops, d)
+	return d
 }
 
 // CloseIdleConnections closes any idle pooled upstream connections held by this server.
@@ -174,6 +236,10 @@ func (s *Server) Start() error {
 		MinVersion:     tls.VersionTLS12,
 		NextProtos:     []string{"h2", "http/1.1"},
 		GetCertificate: s.getCertificate,
+		// A resumed handshake never calls GetCertificate, which is where the SNI
+		// policy check, its audit record and the denied-handshake limit run.
+		// Without tickets every handshake is a full one and passes that gate.
+		SessionTicketsDisabled: true,
 	}
 	httpsLn := tls.NewListener(limit.Listener(rawHTTPSLn), tlsCfg)
 	cappedHTTPLn := limit.Listener(httpLn)
@@ -193,19 +259,23 @@ func (s *Server) Start() error {
 	}
 
 	s.httpsSrv = &http.Server{
-		Handler:                      http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.serveHTTP(w, r, 443) }),
-		ConnContext:                  connCtx,
-		MaxHeaderBytes:               hCfg.MaxHeaderBytes,
-		ReadHeaderTimeout:            10 * time.Second,
-		IdleTimeout:                  90 * time.Second,
-		Protocols:                    &httpsProtos,
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.serveHTTP(w, r, 443) }),
+		ConnContext:       connCtx,
+		MaxHeaderBytes:    hCfg.MaxHeaderBytes,
+		ReadHeaderTimeout: hCfg.ParsedReadHeaderTimeout,
+		IdleTimeout:       90 * time.Second,
+		Protocols:         &httpsProtos,
+		HTTP2: &http.HTTP2Config{
+			MaxConcurrentStreams: maxGuestStreams,
+			WriteByteTimeout:     hCfg.ParsedStreamIdleTimeout,
+		},
 		DisableGeneralOptionsHandler: true,
 	}
 	s.httpSrv = &http.Server{
 		Handler:                      http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { s.serveHTTP(w, r, 80) }),
 		ConnContext:                  connCtx,
 		MaxHeaderBytes:               hCfg.MaxHeaderBytes,
-		ReadHeaderTimeout:            10 * time.Second,
+		ReadHeaderTimeout:            hCfg.ParsedReadHeaderTimeout,
 		IdleTimeout:                  90 * time.Second,
 		Protocols:                    &httpProtos,
 		DisableGeneralOptionsHandler: true,
@@ -267,6 +337,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.transport.CloseIdleConnections()
 	s.wg.Wait()
+	for _, d := range s.drops {
+		d.Flush()
+	}
 	return errs
 }
 
@@ -295,10 +368,15 @@ func (s *Server) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, e
 	}
 
 	// Only allowed SNIs ever reach LeafCache (never cache leaves for denied SNIs).
-	return s.leaves.Leaf(sni)
+	return s.leaves.Leaf(sni, s.mintBudget.Allow)
 }
 
 func (s *Server) auditDeniedSNI(srcIP, sni, reason, ruleID string) {
+	// Over budget the handshake is still refused; only its record is dropped
+	// (counted, and summarized once per interval).
+	if !s.deniedBudget.Allow() {
+		return
+	}
 	if s.onRequest != nil {
 		s.onRequest(s.link.Principal, string(audit.EffectDeny), 0, reason)
 	}
@@ -422,7 +500,7 @@ func completionMetricReason(admitReason, errText string) string {
 	}
 	switch errText {
 	case TeardownRevoked, TeardownGrantExpired, TeardownReload, TeardownClientCanceled,
-		"compressed-response-on-bound-host", "partial-response-on-bound-host",
+		guestIdleTimeout, "compressed-response-on-bound-host", "partial-response-on-bound-host",
 		"unexpected-101", "unexpected-101-non-websocket":
 		return errText
 	default:
@@ -444,10 +522,18 @@ func (rc *reqContext) auditCompleted(status int, bytesOut, bytesIn int64, errTex
 	ev.BytesOut = bytesOut
 	ev.BytesIn = bytesIn
 	ev.Error = errText
-	auditBestEffort(rc.srv.audit, ev)
+	// The request already ran; a lost completion record is counted, not retried.
+	if err := rc.srv.audit.WriteSync(ev); err != nil && rc.srv.onCompletionLost != nil {
+		rc.srv.onCompletionLost(rc.srv.link.Name)
+	}
 }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request, dstPort uint16) {
+	if !s.inflight.TryAcquire() {
+		http.Error(w, "too many requests in flight", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.inflight.Release()
 	rc, ok := s.admit(w, r, dstPort)
 	if !ok {
 		return
@@ -600,7 +686,10 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		return
 	}
 
-	countingBody := &countingReadCloser{rc: http.MaxBytesReader(w, rc.r.Body, rc.maxBody)}
+	rctl := http.NewResponseController(w)
+	idle := s.store.Current().Config.HTTP.ParsedStreamIdleTimeout
+	guestBody := &idleBody{ReadCloser: rc.r.Body, rc: rctl, idle: idle}
+	countingBody := &countingReadCloser{rc: http.MaxBytesReader(w, guestBody, rc.maxBody)}
 	// A nil body keeps a bodiless request bodiless; a non-nil reader with length 0
 	// would be sent upstream as a body of unknown length.
 	var body io.Reader
@@ -628,6 +717,10 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 			rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, reason)
 			panic(http.ErrAbortHandler)
 		}
+		if guestBody.expired.Load() {
+			rc.auditCompleted(http.StatusRequestTimeout, countingBody.n.Load(), 0, guestIdleTimeout)
+			panic(http.ErrAbortHandler)
+		}
 		if parentCtx.Err() != nil {
 			rc.auditCompleted(statusClientClosedRequest, countingBody.n.Load(), 0, TeardownClientCanceled)
 			panic(http.ErrAbortHandler)
@@ -637,6 +730,7 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		return
 	}
 	defer closeQuietly(resp.Body)
+	w = idleWriter{ResponseWriter: w, rc: rctl, idle: idle}
 
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, "unexpected-101")
@@ -655,7 +749,9 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 	if reason := af.reason(); reason != "" {
 		errText = reason
 	} else if copyErr != nil {
-		if parentCtx.Err() != nil {
+		if errors.Is(copyErr, os.ErrDeadlineExceeded) {
+			errText = guestIdleTimeout
+		} else if parentCtx.Err() != nil {
 			errText = TeardownClientCanceled
 		} else {
 			errText = upstreamErrorText(copyErr)

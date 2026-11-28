@@ -82,7 +82,7 @@ func TestLeafCacheSingleflightConcurrencyAndEviction(t *testing.T) {
 	for i := 0; i < workers; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			tlsCert, err := cache.Leaf("API.Anthropic.com.")
+			tlsCert, err := cache.Leaf("API.Anthropic.com.", allowMint)
 			if err != nil {
 				t.Errorf("Leaf: %v", err)
 				return
@@ -115,11 +115,11 @@ func TestLeafCacheSingleflightConcurrencyAndEviction(t *testing.T) {
 	// Capacity bound evicts oldest name cleanly: re-requesting api.anthropic.com
 	// after 3 other names must mint a fresh leaf with a new serial number.
 	for _, h := range []string{"h2.example.com", "h3.example.com", "h4.example.com"} {
-		if _, err := cache.Leaf(h); err != nil {
+		if _, err := cache.Leaf(h, allowMint); err != nil {
 			t.Fatalf("Leaf %s: %v", h, err)
 		}
 	}
-	reminted, err := cache.Leaf("api.anthropic.com")
+	reminted, err := cache.Leaf("api.anthropic.com", allowMint)
 	if err != nil {
 		t.Fatalf("remint evicted api.anthropic.com: %v", err)
 	}
@@ -140,3 +140,5 @@ func TestLeafCacheSingleflightConcurrencyAndEviction(t *testing.T) {
 		t.Fatalf("ca.key perm = %o, want 0600", fi.Mode().Perm())
 	}
 }
+
+func allowMint() bool { return true }

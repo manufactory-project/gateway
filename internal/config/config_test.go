@@ -289,6 +289,36 @@ func TestConfigValidationInvariants(t *testing.T) {
 			wantError: "max_conns_per_link",
 		},
 		{
+			name:      "reject invalid dns.max_queries_per_second",
+			yaml:      validYAML + "\ndns:\n  max_queries_per_second: -1\n",
+			wantError: "max_queries_per_second",
+		},
+		{
+			name:      "reject invalid http.max_inflight_per_link",
+			yaml:      validYAML + "\nhttp:\n  max_inflight_per_link: -1\n",
+			wantError: "max_inflight_per_link",
+		},
+		{
+			name:      "reject invalid http.max_denied_handshakes_per_second",
+			yaml:      validYAML + "\nhttp:\n  max_denied_handshakes_per_second: -1\n",
+			wantError: "max_denied_handshakes_per_second",
+		},
+		{
+			name:      "reject invalid http.max_new_leaves_per_second",
+			yaml:      validYAML + "\nhttp:\n  max_new_leaves_per_second: -1\n",
+			wantError: "max_new_leaves_per_second",
+		},
+		{
+			name:      "reject invalid http.read_header_timeout",
+			yaml:      validYAML + "\nhttp:\n  read_header_timeout: soon\n",
+			wantError: "read_header_timeout",
+		},
+		{
+			name:      "reject invalid http.stream_idle_timeout",
+			yaml:      validYAML + "\nhttp:\n  stream_idle_timeout: -5s\n",
+			wantError: "stream_idle_timeout",
+		},
+		{
 			name:      "reject invalid http.upstream_response_header_timeout",
 			yaml:      validYAML + "\nhttp:\n  upstream_response_header_timeout: notaduration\n",
 			wantError: "upstream_response_header_timeout",
@@ -504,6 +534,12 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		{"http_max_header_bytes", validYAML + "\nhttp:\n  max_header_bytes: 65536\n"},
 		{"http_max_conns_per_link", validYAML + "\nhttp:\n  max_conns_per_link: 64\n"},
 		{"http_upstream_response_header_timeout", validYAML + "\nhttp:\n  upstream_response_header_timeout: 30s\n"},
+		{"dns_max_queries_per_second", validYAML + "\ndns:\n  max_queries_per_second: 7\n"},
+		{"http_max_inflight_per_link", validYAML + "\nhttp:\n  max_inflight_per_link: 7\n"},
+		{"http_max_denied_handshakes_per_second", validYAML + "\nhttp:\n  max_denied_handshakes_per_second: 7\n"},
+		{"http_max_new_leaves_per_second", validYAML + "\nhttp:\n  max_new_leaves_per_second: 7\n"},
+		{"http_read_header_timeout", validYAML + "\nhttp:\n  read_header_timeout: 3s\n"},
+		{"http_stream_idle_timeout", validYAML + "\nhttp:\n  stream_idle_timeout: 3s\n"},
 		{"audit_max_total_bytes", strings.Replace(validYAML, "  dir: /var/log/gateway/audit", "  dir: /var/log/gateway/audit\n  max_total_bytes: 1048576", 1)},
 	}
 	for _, tc := range immutableChanges {

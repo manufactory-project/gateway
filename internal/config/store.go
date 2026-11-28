@@ -193,6 +193,14 @@ func checkReloadImmutable(prev, next *Config) error {
 	if prev.HTTP.ParsedUpstreamResponseHeaderTimeout != next.HTTP.ParsedUpstreamResponseHeaderTimeout {
 		return errors.New("reload refused: http.upstream_response_header_timeout changed (restart required)")
 	}
+	if prev.DNS.MaxQueriesPerSecond != next.DNS.MaxQueriesPerSecond ||
+		prev.HTTP.MaxDeniedHandshakesPerSecond != next.HTTP.MaxDeniedHandshakesPerSecond ||
+		prev.HTTP.MaxNewLeavesPerSecond != next.HTTP.MaxNewLeavesPerSecond ||
+		prev.HTTP.MaxInflightPerLink != next.HTTP.MaxInflightPerLink ||
+		prev.HTTP.ParsedReadHeaderTimeout != next.HTTP.ParsedReadHeaderTimeout ||
+		prev.HTTP.ParsedStreamIdleTimeout != next.HTTP.ParsedStreamIdleTimeout {
+		return errors.New("reload refused: per-link rate, in-flight or timeout limits changed (restart required)")
+	}
 	if !slices.Equal(prev.Links, next.Links) {
 		return errors.New("reload refused: links or principals changed (restart required)")
 	}

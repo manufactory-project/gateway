@@ -198,6 +198,7 @@ func (rt *daemonRuntime) startLinks(
 			Allocator:      alloc,
 			OnQuery:        collector.ObserveDNSQuery,
 			OnConnRejected: collector.IncConnRejected,
+			OnLimited:      collector.IncLimited,
 			OnServeError:   onServeErr,
 		})
 		if err != nil {
@@ -209,16 +210,18 @@ func (rt *daemonRuntime) startLinks(
 		rt.dnsServers = append(rt.dnsServers, ds)
 
 		ps, err := proxy.NewServer(proxy.Options{
-			Link:           link,
-			Store:          store,
-			Evaluator:      eval,
-			Audit:          rt.auditWriter,
-			Leaves:         leaves,
-			Dialer:         dialer,
-			Flows:          flows,
-			OnRequest:      collector.ObserveRequest,
-			OnConnRejected: collector.IncConnRejected,
-			OnServeError:   onServeErr,
+			Link:             link,
+			Store:            store,
+			Evaluator:        eval,
+			Audit:            rt.auditWriter,
+			Leaves:           leaves,
+			Dialer:           dialer,
+			Flows:            flows,
+			OnRequest:        collector.ObserveRequest,
+			OnConnRejected:   collector.IncConnRejected,
+			OnLimited:        collector.IncLimited,
+			OnCompletionLost: collector.IncCompletionLost,
+			OnServeError:     onServeErr,
 		})
 		if err != nil {
 			return err
