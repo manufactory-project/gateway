@@ -178,6 +178,7 @@ func checkReloadImmutable(prev, next *Config) error {
 		return errors.New("reload refused: dns.fake_cidr changed (restart required)")
 	}
 	if prev.Dataplane.ReadyFile != next.Dataplane.ReadyFile ||
+		prev.Dataplane.StateFile != next.Dataplane.StateFile ||
 		prev.Dataplane.DHCP != next.Dataplane.DHCP {
 		return errors.New("reload refused: dataplane configuration changed (restart required)")
 	}

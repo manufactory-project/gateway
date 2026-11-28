@@ -97,6 +97,14 @@ the locked plain-Go wire suite is the living verification inventory.
   startup rather than querying the live `nftables` ruleset (which requires root via
   `gateway dataplane check`). Isolation relies on systemd always running `ExecStartPre=+ gateway netsetup`
   first, root-owned `/run/gateway-dataplane/`, and `net.ipv4.ip_forward=0`.
+- **Removed links are blocked by interface name, from the record:** `netsetup` keeps dropping all
+  traffic on interfaces removed from `links`, but only once it has run. After a reboot nothing is
+  loaded until `gateway.service` runs `netsetup`, and nothing is loaded if `netsetup` fails before
+  loading the ruleset (for example on an invalid config or a corrupt `dataplane.state_file`). Another
+  tool flushing the ruleset (`nft flush ruleset`, reloading `nftables.service`) removes the drops. An
+  interface that is renamed, or enslaved to a bridge or bond, no longer matches. An interface is not
+  recorded if the state file is lost (or `state_file` is moved) across a reboot, or if its link was removed by a version without
+  the record and the host rebooted before upgrading.
 - **Global `records` private-IP exceptions:** Private-address connect-time exceptions come only from
   global `records` entries (`host -> exact IP`), which are not scoped per principal or rule; any
   principal with an allow rule for that host can reach the mapped IP.

@@ -36,6 +36,7 @@ const (
 	DefaultHTTPPort                      = 10080
 	DefaultDNSPort                       = 10053
 	DefaultDHCPLeaseTime                 = "12h"
+	DefaultDataplaneStateFile            = "/var/lib/gateway-dataplane/links.json"
 	PlaceholderPrefix                    = "mf_ph_"
 )
 
@@ -85,7 +86,10 @@ type MetricsConfig struct {
 
 // DataplaneConfig configures Linux netsetup and startup verification.
 type DataplaneConfig struct {
-	ReadyFile string     `yaml:"ready_file"`
+	ReadyFile string `yaml:"ready_file"`
+	// StateFile records every sandbox interface netsetup has managed, so that
+	// interfaces removed from links stay blocked. It must survive reboots.
+	StateFile string     `yaml:"state_file"`
 	DHCP      DHCPConfig `yaml:"dhcp"`
 }
 
@@ -244,6 +248,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Dataplane.DHCP.LeaseTime == "" {
 		cfg.Dataplane.DHCP.LeaseTime = DefaultDHCPLeaseTime
 	}
+	if cfg.Dataplane.StateFile == "" {
+		cfg.Dataplane.StateFile = DefaultDataplaneStateFile
+	}
 	for i := range cfg.Links {
 		if cfg.Links[i].HTTPSPort == 0 {
 			cfg.Links[i].HTTPSPort = DefaultHTTPSPort
@@ -310,6 +317,9 @@ func validate(cfg *Config) error {
 			return err
 		}
 	}
+	if !filepath.IsAbs(cfg.Dataplane.StateFile) {
+		return fmt.Errorf("dataplane.state_file %q must be an absolute path", cfg.Dataplane.StateFile)
+	}
 	if err := validateDataplaneAdminSeparation(cfg); err != nil {
 		return err
 	}
@@ -326,6 +336,9 @@ func validateDataplaneAdminSeparation(cfg *Config) error {
 	adminDir := filepath.Clean(filepath.Dir(cfg.Admin.Socket))
 	if isPathInsideDir(cfg.Dataplane.ReadyFile, adminDir) {
 		return fmt.Errorf("dataplane.ready_file %q must not be inside admin.socket directory %q", cfg.Dataplane.ReadyFile, adminDir)
+	}
+	if isPathInsideDir(cfg.Dataplane.StateFile, adminDir) {
+		return fmt.Errorf("dataplane.state_file %q must not be inside admin.socket directory %q", cfg.Dataplane.StateFile, adminDir)
 	}
 	if isPathInsideDir(cfg.Dataplane.DHCP.ConfigPath, adminDir) {
 		return fmt.Errorf("dataplane.dhcp.config_path %q must not be inside admin.socket directory %q", cfg.Dataplane.DHCP.ConfigPath, adminDir)
@@ -934,6 +947,9 @@ func isSafeIdentifier(s string) bool {
 	}
 	return true
 }
+
+// IsValidInterfaceName reports whether s is accepted as a links[].interface value.
+func IsValidInterfaceName(s string) bool { return isValidIfName(s) }
 
 func isValidIfName(s string) bool {
 	// Linux IFNAMSIZ is 16 including NUL terminator; '.' is rejected in v0.1 because

@@ -6,7 +6,8 @@ Linux-first, headless, egress-only network gateway for isolating sandboxed guest
 
 - **`cmd/gateway`** — single binary providing the daemon, root dataplane setup, and operator CLI:
   - `gateway run --config <path>`: unprivileged daemon (zero `CAP_NET_ADMIN`) serving per-link DNS, HTTPS, and HTTP listeners, Unix-socket Admin API (`/run/gateway/admin.sock`), and optional `/metrics`.
-  - `gateway netsetup --config <path> [--dry-run]`: privileged one-shot setup applying kernel sysctls, per-link `ip` addresses/rules/routes, atomic `nftables` (`table inet gw`), DHCP-only `dnsmasq.conf`, and `dataplane.ready`.
+  - `gateway netsetup --config <path> [--dry-run]`: privileged one-shot setup applying kernel sysctls, per-link `ip` addresses/rules/routes, atomic `nftables` (`table inet gw`), DHCP-only `dnsmasq.conf`, and `dataplane.ready`. Interfaces removed from `links` stay blocked.
+  - `gateway netsetup --config <path> --release <interface>`: stop blocking a removed interface (see [Removing a link](#removing-a-link)).
   - Operator subcommands (`--socket PATH` before the subcommand; `--json` before or after any subcommand):
     - `gateway status`
     - `gateway reload`
@@ -51,6 +52,18 @@ systemctl enable --now gateway.service gateway-dhcp.service
 ```
 
 Install `/etc/gateway/ca/ca.crt` into each guest's system trust store (`update-ca-certificates`), verify the dataplane with `gateway dataplane check --config /etc/gateway/gateway.yaml`, and check daemon status with `gateway status`.
+
+## Removing a link
+
+Remove the link and its rules from the config, then run `systemctl restart gateway.service gateway-dhcp.service`. `netsetup` removes the address, route, and `ip rule` it added to the interface, and drops all traffic to, from, and through it, also after a reboot. It does not take the interface down.
+
+The interface stays blocked until a link configures it again or you release it. Release it only after detaching its guests, because a released interface is filtered by whatever else the host has, not by `gateway`:
+
+```bash
+gateway netsetup --config /etc/gateway/gateway.yaml --release sbx1
+```
+
+`netsetup` records the interfaces it has managed in `dataplane.state_file` (default `/var/lib/gateway-dataplane/links.json`). Keep it on storage that survives reboots. If it is unreadable or corrupt, `netsetup` fails without changing anything; restore it, or delete it and detach every removed interface.
 
 ## Reading the Audit Log
 

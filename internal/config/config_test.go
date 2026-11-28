@@ -172,6 +172,16 @@ func TestConfigValidationInvariants(t *testing.T) {
 			wantError: "must not be inside admin.socket directory",
 		},
 		{
+			name:      "reject relative state_file",
+			yaml:      strings.Replace(validYAML, "  ready_file:", "  state_file: links.json\n  ready_file:", 1),
+			wantError: "dataplane.state_file",
+		},
+		{
+			name:      "reject state_file inside admin.socket directory",
+			yaml:      strings.Replace(validYAML, "  ready_file:", "  state_file: /run/gateway/links.json\n  ready_file:", 1) + "\nadmin:\n  socket: /run/gateway/admin.sock\n",
+			wantError: "must not be inside admin.socket directory",
+		},
+		{
 			name:      "reject dhcp.config_path inside admin.socket directory",
 			yaml:      strings.Replace(validYAML, "    config_path: /run/gateway-dataplane/dnsmasq.conf", "    config_path: /run/gateway/dnsmasq.conf", 1) + "\nadmin:\n  socket: /run/gateway/admin.sock\n",
 			wantError: "must not be inside admin.socket directory",
@@ -389,6 +399,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		{"links_gateway_ip", strings.Replace(validYAML, "gateway_ip: 10.200.0.1", "gateway_ip: 10.200.0.2", 1)},
 		{"principals", strings.ReplaceAll(validYAML, "worker-codex", "worker-renamed")},
 		{"dataplane_ready_file", strings.Replace(validYAML, "/run/gateway-dataplane/dataplane.ready", "/run/gateway-dataplane/other.ready", 1)},
+		{"dataplane_state_file", strings.Replace(validYAML, "  ready_file:", "  state_file: /var/lib/elsewhere/links.json\n  ready_file:", 1)},
 		{"dataplane_dhcp", strings.Replace(validYAML, "user: dnsmasq", "user: nobody", 1)},
 		{"dataplane_verify_sysctls", strings.Replace(validYAML, "dataplane:\n", "dataplane:\n  verify_sysctls: false\n", 1)},
 		{"http_max_header_bytes", validYAML + "\nhttp:\n  max_header_bytes: 65536\n"},

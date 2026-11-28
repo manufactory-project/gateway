@@ -677,6 +677,7 @@ gw_exec bash -ceu '
   done
 '
 
+# run_probe_guest0 [peer-link-ip]; an empty argument skips the peer link check.
 run_probe_guest0() {
   g0_exec /usr/local/bin/gateway-probe \
     --allow-host "$UPSTREAM_HOST" \
@@ -686,7 +687,7 @@ run_probe_guest0() {
     --mgmt-ip "$GW_MGMT_IP" \
     --tcp22-target "${GW_UPSTREAM_GW}:22" \
     --dot-target "${GW_UPSTREAM_GW}:853" \
-    --peer-link-ip 10.200.0.17 \
+    --peer-link-ip "${1-10.200.0.17}" \
     --peer-guest-addr "${G1_IP}:8080"
 }
 
@@ -966,6 +967,45 @@ restore_dataplane() {
   gw_exec /usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml
 }
 
+# assert_guest1_tcp <address> <want: reachable|blocked> <label>
+# Connects from guest1 to the gateway's removed-link test listener on :8081.
+assert_guest1_tcp() {
+  local addr="$1" want="$2" label="$3" got=blocked
+  if g1_exec timeout 5s python3 -c 'import socket,sys; socket.create_connection((sys.argv[1], 8081), 3)' "$addr" 2>/dev/null; then
+    got=reachable
+  fi
+  if [[ "$got" != "$want" ]]; then
+    echo "FAIL: ${label}: guest1 -> [${addr}]:8081 is ${got}, want ${want}" >&2
+    exit 1
+  fi
+  echo "    PASS: ${label}: guest1 -> [${addr}]:8081 ${got}"
+}
+
+start_removed_link_listeners() {
+  gw_exec bash -ceu '
+    # http.server bound to :: is dual-stack, so one listener serves IPv4 and IPv6.
+    systemd-run --unit=gwd-removed-link --quiet /usr/bin/python3 -m http.server 8081 --bind ::
+    for url in "http://127.0.0.1:8081/" "http://[::1]:8081/"; do
+      ok=0
+      for _ in $(seq 1 20); do
+        if curl -gsf -o /dev/null --max-time 2 "$url"; then
+          ok=1
+          break
+        fi
+        sleep 0.25
+      done
+      [[ "$ok" -eq 1 ]] || { echo "FAIL: no listener at ${url}" >&2; exit 1; }
+    done
+  '
+}
+
+restart_gateway_units() {
+  gw_exec systemctl restart gateway.service gateway-dhcp.service
+  sleep 1
+  gw_exec systemctl is-active --quiet gateway.service
+  gw_exec systemctl is-active --quiet gateway-dhcp.service
+}
+
 if [[ "$DEFECT_DROP_FIB_LOCAL" -eq 1 ]]; then
   echo "==> Step 2.6 (defect): remove fib daddr type local guard"
   echo "    running green baseline (guest0 probe)..."
@@ -1068,5 +1108,70 @@ if [[ "$DEFECT_DROP_DNS_DNAT" -eq 1 ]]; then
   run_probe_guest0 >/dev/null
   echo "    PASS: DNS DNAT defect detected and dataplane restored"
 fi
+
+echo "==> Step 2.7: A removed link stays blocked across restart and reboot"
+start_removed_link_listeners
+assert_guest1_tcp 10.200.0.17 blocked "link configured"
+
+python3 - "$TMPDIR_WORK/gateway.yaml" "$TMPDIR_WORK/one-link.yaml" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+# Drop the sbx1 link and the guest1 rule, each up to the next blank line.
+for head in (r"  - name: sbx1\n", r"  - id: guest1-test-upstream\n"):
+    text, n = re.subn(head + r"(?:.+\n?)*\n?", "", text)
+    if n != 1:
+        sys.exit(f"expected to remove exactly one block starting {head!r}, removed {n}")
+open(sys.argv[2], "w", encoding="utf-8").write(text)
+PY
+incus file push "$TMPDIR_WORK/one-link.yaml" "${GW_INST}/etc/gateway/gateway.yaml" --project "$PROJECT" --mode 0640
+gw_exec chown root:gateway /etc/gateway/gateway.yaml
+restart_gateway_units
+
+assert_guest1_tcp 10.200.0.17 blocked "after restart, old address"
+if gw_exec ip -4 -o addr show dev sbx1 | grep -q '10\.200\.0\.17/'; then
+  echo "FAIL: removed link still holds 10.200.0.17 on sbx1" >&2
+  exit 1
+fi
+echo "    PASS: old address removed from sbx1"
+gw_exec nft list set inet gw retired_ifs | grep -q '"sbx1"'
+# With sbx1 removed, 10.200.0.17 is no longer a gateway address: guest0's :443
+# to it is redirected to guest0's own proxy like any other destination.
+if ! run_probe_guest0 "" >"$TMPDIR_WORK/removed-guest0.jsonl" 2>&1; then
+  grep '"pass":false' "$TMPDIR_WORK/removed-guest0.jsonl" >&2 || cat "$TMPDIR_WORK/removed-guest0.jsonl" >&2
+  echo "FAIL: guest0 probe failed after removing sbx1" >&2
+  exit 1
+fi
+echo "    PASS: remaining link still passes the probe"
+
+echo "    rebooting the gateway container..."
+incus restart "$GW_INST" --project "$PROJECT"
+booted=0
+for _ in $(seq 1 60); do
+  # Fails to connect until systemd's bus is up; "degraded" still counts as booted.
+  state="$(gw_exec systemctl is-system-running 2>/dev/null || true)"
+  if [[ "$state" == "running" || "$state" == "degraded" ]]; then
+    booted=1
+    break
+  fi
+  sleep 1
+done
+[[ "$booted" -eq 1 ]] || { echo "FAIL: gateway container did not finish booting" >&2; exit 1; }
+restart_gateway_units
+gw_exec nft list set inet gw retired_ifs | grep -q '"sbx1"'
+
+# The reboot cleared the address and the per-interface sysctls. Raise sbx1 as
+# other host tooling might; the guest can then try IPv6 link-local.
+start_removed_link_listeners
+gw_exec bash -ceu 'sysctl -qw net.ipv6.conf.sbx1.disable_ipv6=0; ip link set sbx1 up'
+g1_exec bash -ceu 'sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0; ip link set eth0 down; ip link set eth0 addrgenmode eui64; ip link set eth0 up'
+sleep 3
+SBX1_LL="$(gw_exec ip -6 -o addr show dev sbx1 scope link | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+[[ -n "$SBX1_LL" ]] || { echo "FAIL: sbx1 has no link-local address to test" >&2; exit 1; }
+assert_guest1_tcp "${SBX1_LL}%eth0" blocked "after reboot, IPv6 link-local"
+
+# Control: releasing the interface makes the same connection succeed, so the
+# blocked results above are not caused by a broken path.
+gw_exec /usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml --release sbx1
+assert_guest1_tcp "${SBX1_LL}%eth0" reachable "after --release (control)"
 
 echo "==> E2E completed successfully"

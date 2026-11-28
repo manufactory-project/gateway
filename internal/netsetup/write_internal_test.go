@@ -129,6 +129,7 @@ func TestApplyOrderSysctlsAndNftBeforeIP(t *testing.T) {
 	dpDir := filepath.Join(dir, "dataplane")
 	readyFile := filepath.Join(dpDir, "dataplane.ready")
 	dnsmasqFile := filepath.Join(dpDir, "dnsmasq.conf")
+	stateFile := filepath.Join(dir, "state", "links.json")
 
 	cfgYAML := fmt.Sprintf(`
 ca:
@@ -138,6 +139,7 @@ audit:
   dir: /var/log/gateway/audit
 dataplane:
   ready_file: %s
+  state_file: %s
   dhcp:
     user: dnsmasq
     lease_file: /var/lib/gateway/dnsmasq.leases
@@ -150,7 +152,7 @@ links:
     gateway_ip: 10.200.0.1
     ct_zone: 101
     route_table: 101
-`, readyFile, dnsmasqFile)
+`, readyFile, stateFile, dnsmasqFile)
 	cfg, err := config.Parse([]byte(cfgYAML))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -182,6 +184,9 @@ links:
 	nftScript := fmt.Sprintf(`#!/bin/sh
 val="$(cat %q)"
 printf 'nft %%s (ip_forward=%%s)\n' "$*" "$val" >> %q
+if [ "$1" = "-j" ]; then
+  echo '{"nftables": []}'
+fi
 if [ "$1" = "list" ]; then
   cat %q
 fi
@@ -375,6 +380,7 @@ audit:
   dir: /var/log/gateway/audit
 dataplane:
   ready_file: %s
+  state_file: %s
   dhcp:
     user: dnsmasq
     lease_file: /var/lib/gateway/dnsmasq.leases
@@ -386,7 +392,7 @@ links:
     gateway_ip: 10.200.0.1
     ct_zone: 101
     route_table: 101
-`, staleReady)
+`, staleReady, filepath.Join(base, "state", "links.json"))
 	cfg, err := config.Parse([]byte(cfgYAML))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)

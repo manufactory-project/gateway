@@ -5,11 +5,16 @@
 `gateway` separates host network privilege from the guest-facing data plane across three runtime roles (plus operator subcommands in the same binary):
 
 1. **`gateway netsetup --config <path>` (root, one-shot via systemd `ExecStartPre=+`):**
-   Removes any stale `dataplane.ready_file` first, generates and applies kernel sysctls and the
+   Removes any stale `dataplane.ready_file` first, records every sandbox interface it has managed in
+   `dataplane.state_file`, generates and applies kernel sysctls and the
    atomic `nft -f` ruleset (`table inet gw`, verified with `nft list table`) **before** bringing up
    any sandbox link or assigning per-link `ip addr` / `ip rule` / `ip route` state, then atomically
    writes the DHCP-only `dnsmasq` config and `dataplane.ready_file` into root-owned `0755`
    `/run/gateway-dataplane/` (refusing symlinks or non-root/group-/other-writable directories).
+   Recorded interfaces that no link configures any more are "retired": the ruleset drops all their
+   traffic (`@retired_ifs`) and the address, route, and `ip rule` recorded for them are deleted. A
+   retired interface is let go only by configuring it again or by `netsetup --release <interface>`.
+   Interfaces named by the sets of an already loaded `table inet gw` are adopted into the record.
 2. **`dnsmasq` (unprivileged DHCPv4 only, started after `netsetup`):**
    Runs with `--port=0 --dhcp-broadcast --no-ping --bind-interfaces --user=<dhcp.user>` and one
    `--interface` per sandbox link so it drops root and all network capabilities (`CAP_NET_ADMIN`,
@@ -202,7 +207,9 @@ Two minimal systemd units under `deploy/` run the data plane and DHCPv4 helper:
   `LogsDirectory=gateway/audit` (creating and granting write access to `/var/log/gateway/audit`
   only). Root-written dataplane files (`dnsmasq.conf` and `dataplane.ready`) live in root-owned
   `0755` `/run/gateway-dataplane/` (mode `0644`), so unprivileged `gateway` has read-only access
-  and cannot tamper with `dnsmasq.conf` or `dataplane.ready`.
+  and cannot tamper with `dnsmasq.conf` or `dataplane.ready`. The interface record lives in
+  root-owned `/var/lib/gateway-dataplane/` (`dataplane.state_file`), which `netsetup` creates; unlike
+  `/run`, it must survive reboots. The `+` prefix exempts `ExecStartPre` from `ProtectSystem=strict`.
 - **`deploy/gateway-dhcp.service`:** Ordered `After=gateway.service` and
   `Requires=gateway.service`. Runs
   `/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gateway-dataplane/dnsmasq.conf` with no flags

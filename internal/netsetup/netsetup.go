@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,17 +41,28 @@ type Sysctl struct {
 }
 
 // IPCommand represents one `ip` invocation; Optional means non-zero exit is ignored
-// (used only for idempotent `ip rule del` before `ip rule add`).
+// (for deletions of things that may not exist).
 type IPCommand struct {
 	Args     []string
 	Optional bool
 }
 
 // RenderNftables generates the atomic nftables ruleset for table inet gw from cfg.
-func RenderNftables(cfg *config.Config) (string, error) {
+// All traffic to, from and through the retired interfaces is dropped.
+func RenderNftables(cfg *config.Config, retired ...string) (string, error) {
 	links := linuxLinks(cfg)
-	if len(links) == 0 {
+	if len(links) == 0 && len(retired) == 0 {
 		return "", errors.New("netsetup: no links declare a Linux interface")
+	}
+	return renderRuleset(links, retired), nil
+}
+
+func renderRuleset(links []config.LinkConfig, retired []string) string {
+	// retiredDrop writes a drop rule for retired interfaces, if there are any.
+	retiredDrop := func(b *strings.Builder, direction string) {
+		if len(retired) > 0 {
+			writeLine(b, "        ", direction, " @", retiredSet, " drop")
+		}
 	}
 
 	var b strings.Builder
@@ -58,17 +70,14 @@ func RenderNftables(cfg *config.Config) (string, error) {
 	b.WriteString("delete table inet gw\n\n")
 	b.WriteString("table inet gw {\n")
 
-	b.WriteString("    set sandbox_ifs {\n")
-	b.WriteString("        type ifname\n")
-	b.WriteString("        elements = { ")
-	for i, l := range links {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(strconv.Quote(l.Interface))
+	var configured []string
+	for _, l := range links {
+		configured = append(configured, l.Interface)
 	}
-	b.WriteString(" }\n")
-	b.WriteString("    }\n\n")
+	writeIfnameSet(&b, sandboxSet, configured)
+	if len(retired) > 0 {
+		writeIfnameSet(&b, retiredSet, retired)
+	}
 
 	b.WriteString("    chain raw_prerouting {\n")
 	b.WriteString("        type filter hook prerouting priority raw; policy accept;\n")
@@ -86,6 +95,7 @@ func RenderNftables(cfg *config.Config) (string, error) {
 
 	b.WriteString("    chain prerouting_guard {\n")
 	b.WriteString("        type filter hook prerouting priority dstnat - 10; policy accept;\n")
+	retiredDrop(&b, "iifname")
 	b.WriteString("        iifname @sandbox_ifs meta nfproto ipv6 drop\n")
 	for _, l := range links {
 		qIf := strconv.Quote(l.Interface)
@@ -113,6 +123,7 @@ func RenderNftables(cfg *config.Config) (string, error) {
 	// no udp/tcp dport 53 rules belong here. Keep UDP 67 for DHCPv4.
 	b.WriteString("    chain input {\n")
 	b.WriteString("        type filter hook input priority filter; policy accept;\n")
+	retiredDrop(&b, "iifname")
 	b.WriteString("        iifname @sandbox_ifs meta nfproto ipv6 drop\n")
 	b.WriteString("        iifname @sandbox_ifs ct state invalid drop\n")
 	b.WriteString("        iifname @sandbox_ifs ct status dnat accept\n")
@@ -122,17 +133,33 @@ func RenderNftables(cfg *config.Config) (string, error) {
 
 	b.WriteString("    chain forward {\n")
 	b.WriteString("        type filter hook forward priority filter; policy accept;\n")
+	retiredDrop(&b, "iifname")
+	retiredDrop(&b, "oifname")
 	b.WriteString("        iifname @sandbox_ifs drop\n")
 	b.WriteString("        oifname @sandbox_ifs drop\n")
 	b.WriteString("    }\n\n")
 
 	b.WriteString("    chain output {\n")
 	b.WriteString("        type filter hook output priority filter; policy accept;\n")
+	retiredDrop(&b, "oifname")
 	b.WriteString("        oifname @sandbox_ifs meta nfproto ipv6 drop\n")
 	b.WriteString("    }\n")
 	b.WriteString("}\n")
 
-	return b.String(), nil
+	return b.String()
+}
+
+func writeIfnameSet(b *strings.Builder, name string, interfaces []string) {
+	writeLine(b, "    set ", name, " {")
+	b.WriteString("        type ifname\n")
+	if len(interfaces) > 0 {
+		quoted := make([]string, len(interfaces))
+		for i, ifname := range interfaces {
+			quoted[i] = strconv.Quote(ifname)
+		}
+		writeLine(b, "        elements = { ", strings.Join(quoted, ", "), " }")
+	}
+	b.WriteString("    }\n\n")
 }
 
 // DesiredSysctls returns the exact kernel sysctls required by gateway.
@@ -257,55 +284,92 @@ func VerifySysctls(procSysRoot string, cfg *config.Config) error {
 }
 
 // Apply executes netsetup as root (invoked from systemd ExecStartPre=+):
-// removes any stale ready_file first, writes sysctls, loads and verifies the
-// nftables ruleset atomically via `nft -f -`, then configures interfaces/routes/rules,
-// writes the dnsmasq config, and writes ready_file last only after everything has succeeded.
+// removes any stale ready_file first, records the managed interfaces in
+// state_file, writes sysctls, loads and verifies the nftables ruleset atomically
+// via `nft -f -` (blocking retired interfaces), removes what it earlier added to
+// those, then configures interfaces/routes/rules, writes the dnsmasq config, and
+// writes ready_file last only after everything has succeeded.
 func Apply(ctx context.Context, cfg *config.Config) error {
 	return applyWithPaths(ctx, cfg, "/proc/sys", 0)
 }
 
-func applyWithPaths(ctx context.Context, cfg *config.Config, procSysRoot string, expectedUID uint32) error {
+// Release is Apply, but also stops blocking the retired interface name and
+// removes it from state_file. A configured interface cannot be released.
+func Release(ctx context.Context, cfg *config.Config, name string) error {
+	return applyWithPaths(ctx, cfg, "/proc/sys", 0, name)
+}
+
+func applyWithPaths(ctx context.Context, cfg *config.Config, procSysRoot string, expectedUID uint32, release ...string) error {
+	for _, name := range release {
+		if isConfigured(cfg, name) {
+			return fmt.Errorf("netsetup: cannot release %q: a link still configures it", name)
+		}
+	}
 	if cfg.Dataplane.ReadyFile != "" {
 		if err := removeOwnedFile(cfg.Dataplane.ReadyFile, expectedUID); err != nil {
 			return fmt.Errorf("netsetup: remove stale ready_file %s: %w", cfg.Dataplane.ReadyFile, err)
 		}
 	}
 
-	ruleset, err := RenderNftables(cfg)
+	prev, err := loadRecord(cfg.Dataplane.StateFile, expectedUID)
 	if err != nil {
 		return err
 	}
-	dnsmasqConf, err := RenderDnsmasq(cfg)
+	live, err := liveInterfaces(ctx)
 	if err != nil {
+		return err
+	}
+	rec := mergeRecord(prev, live, cfg)
+	retired := retiredInterfaces(rec, cfg)
+	for _, name := range release {
+		if !slices.Contains(interfaceNames(retired), name) {
+			return fmt.Errorf("netsetup: cannot release %q: it is not a retired interface", name)
+		}
+	}
+	ruleset, err := RenderNftables(cfg, interfaceNames(retired)...)
+	if err != nil {
+		return err
+	}
+	// Record before changing the kernel, so an interrupted run forgets nothing.
+	if err := saveRecord(cfg.Dataplane.StateFile, rec, expectedUID); err != nil {
 		return err
 	}
 
 	// Apply sysctls and nftables BEFORE bringing links up or assigning addresses
-	// so there is no unguarded forwarding or link-local IPv6 window.
-	for _, sc := range DesiredSysctls(cfg) {
-		rel := strings.ReplaceAll(sc.Key, ".", string(filepath.Separator))
-		p := filepath.Join(procSysRoot, rel)
-		if err := os.WriteFile(p, []byte(sc.Value+"\n"), 0o644); err != nil {
-			return fmt.Errorf("netsetup: write sysctl %s=%s: %w", sc.Key, sc.Value, err)
+	// so there is no unguarded forwarding or link-local IPv6 window. A sysctl
+	// failure (such as a missing interface) is reported only after the ruleset is
+	// loaded, so that it cannot leave retired interfaces unblocked.
+	sysctlErr := writeSysctls(procSysRoot, cfg)
+	if err := loadRuleset(ctx, ruleset); err != nil {
+		return errors.Join(sysctlErr, err)
+	}
+	if err := runIPCommands(ctx, cleanupCommands(retired)); err != nil {
+		return errors.Join(sysctlErr, err)
+	}
+	if sysctlErr != nil {
+		return sysctlErr
+	}
+
+	// Released interfaces were blocked and cleaned up above; now let them go.
+	if len(release) > 0 {
+		released := func(m managedInterface) bool { return slices.Contains(release, m.Name) }
+		rec.Interfaces = slices.DeleteFunc(rec.Interfaces, released)
+		retired = slices.DeleteFunc(retired, released)
+		if err := loadRuleset(ctx, renderRuleset(linuxLinks(cfg), interfaceNames(retired))); err != nil {
+			return err
+		}
+		if err := saveRecord(cfg.Dataplane.StateFile, rec, expectedUID); err != nil {
+			return err
 		}
 	}
 
-	nftLoad := exec.CommandContext(ctx, "nft", "-f", "-")
-	nftLoad.Stdin = strings.NewReader(ruleset)
-	if out, err := nftLoad.CombinedOutput(); err != nil {
-		return fmt.Errorf("netsetup: nft -f failed: %w: %s", err, strings.TrimSpace(string(out)))
-	}
-
-	if err := CheckNftTable(ctx); err != nil {
+	// Fails when no link declares an interface; retired ones are blocked by now.
+	dnsmasqConf, err := RenderDnsmasq(cfg)
+	if err != nil {
 		return err
 	}
-
-	for _, cmdSpec := range IPCommands(cfg) {
-		cmd := exec.CommandContext(ctx, cmdSpec.Args[0], cmdSpec.Args[1:]...)
-		out, err := cmd.CombinedOutput()
-		if err != nil && !cmdSpec.Optional {
-			return fmt.Errorf("netsetup: %s failed: %w: %s", strings.Join(cmdSpec.Args, " "), err, strings.TrimSpace(string(out)))
-		}
+	if err := runIPCommands(ctx, IPCommands(cfg)); err != nil {
+		return err
 	}
 
 	if cfg.Dataplane.DHCP.ConfigPath != "" {
@@ -317,6 +381,37 @@ func applyWithPaths(ctx context.Context, cfg *config.Config, procSysRoot string,
 	if cfg.Dataplane.ReadyFile != "" {
 		if err := writeOwnedFile(cfg.Dataplane.ReadyFile, []byte("ok\n"), expectedUID); err != nil {
 			return fmt.Errorf("netsetup: write ready_file %s: %w", cfg.Dataplane.ReadyFile, err)
+		}
+	}
+	return nil
+}
+
+func writeSysctls(procSysRoot string, cfg *config.Config) error {
+	for _, sc := range DesiredSysctls(cfg) {
+		rel := strings.ReplaceAll(sc.Key, ".", string(filepath.Separator))
+		p := filepath.Join(procSysRoot, rel)
+		if err := os.WriteFile(p, []byte(sc.Value+"\n"), 0o644); err != nil {
+			return fmt.Errorf("netsetup: write sysctl %s=%s: %w", sc.Key, sc.Value, err)
+		}
+	}
+	return nil
+}
+
+func loadRuleset(ctx context.Context, ruleset string) error {
+	nftLoad := exec.CommandContext(ctx, "nft", "-f", "-")
+	nftLoad.Stdin = strings.NewReader(ruleset)
+	if out, err := nftLoad.CombinedOutput(); err != nil {
+		return fmt.Errorf("netsetup: nft -f failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return CheckNftTable(ctx)
+}
+
+func runIPCommands(ctx context.Context, cmds []IPCommand) error {
+	for _, cmdSpec := range cmds {
+		cmd := exec.CommandContext(ctx, cmdSpec.Args[0], cmdSpec.Args[1:]...)
+		out, err := cmd.CombinedOutput()
+		if err != nil && !cmdSpec.Optional {
+			return fmt.Errorf("netsetup: %s failed: %w: %s", strings.Join(cmdSpec.Args, " "), err, strings.TrimSpace(string(out)))
 		}
 	}
 	return nil
@@ -387,6 +482,9 @@ func writeOwnedFile(path string, data []byte, expectedUID uint32) error {
 		if chErr := os.Chmod(dir, 0o755); chErr != nil {
 			return fmt.Errorf("chmod %s: %w", dir, chErr)
 		}
+		if syncErr := syncDir(filepath.Dir(dir)); syncErr != nil {
+			return syncErr
+		}
 	}
 	if err := verifyOwnedDir(dir, expectedUID); err != nil {
 		return err
@@ -417,11 +515,25 @@ func writeOwnedFile(path string, data []byte, expectedUID uint32) error {
 	if err := tmp.Chmod(0o644); err != nil {
 		return cleanupTmp(errors.Join(fmt.Errorf("chmod temp %s: %w", tmpName, err), tmp.Close()))
 	}
+	if err := tmp.Sync(); err != nil {
+		return cleanupTmp(errors.Join(fmt.Errorf("sync temp %s: %w", tmpName, err), tmp.Close()))
+	}
 	if err := tmp.Close(); err != nil {
 		return cleanupTmp(fmt.Errorf("close temp %s: %w", tmpName, err))
 	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return cleanupTmp(fmt.Errorf("rename %s -> %s: %w", tmpName, path, err))
+	}
+	return syncDir(dir)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %s: %w", dir, err)
+	}
+	if err := errors.Join(d.Sync(), d.Close()); err != nil {
+		return fmt.Errorf("sync dir %s: %w", dir, err)
 	}
 	return nil
 }

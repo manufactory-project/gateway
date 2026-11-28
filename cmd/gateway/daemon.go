@@ -30,14 +30,18 @@ func runNetsetup(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to gateway YAML config")
 	dryRun := fs.Bool("dry-run", false, "print generated nftables, sysctls, ip commands, and dnsmasq config without applying")
+	release := fs.String("release", "", "stop blocking an interface that was removed from links")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: gateway netsetup --config <path> [--dry-run] (unexpected arguments: %s)", strings.Join(fs.Args(), " "))
+		return fmt.Errorf("usage: gateway netsetup --config <path> [--dry-run | --release <interface>] (unexpected arguments: %s)", strings.Join(fs.Args(), " "))
 	}
 	if *cfgPath == "" {
 		return errors.New("netsetup: --config is required")
+	}
+	if *dryRun && *release != "" {
+		return errors.New("netsetup: --dry-run and --release cannot be combined")
 	}
 
 	cfg, _, err := config.LoadFile(*cfgPath)
@@ -46,7 +50,11 @@ func runNetsetup(args []string, stdout, stderr io.Writer) error {
 	}
 
 	if *dryRun {
-		nft, err := netsetup.RenderNftables(cfg)
+		retired, cleanup, err := netsetup.RetiredPlan(cfg)
+		if err != nil {
+			return err
+		}
+		nft, err := netsetup.RenderNftables(cfg, retired...)
 		if err != nil {
 			return err
 		}
@@ -71,7 +79,7 @@ func runNetsetup(args []string, stdout, stderr io.Writer) error {
 		if _, err := fmt.Fprintln(stdout, "# --- ip commands ---"); err != nil {
 			return err
 		}
-		for _, cmd := range netsetup.IPCommands(cfg) {
+		for _, cmd := range append(cleanup, netsetup.IPCommands(cfg)...) {
 			if _, err := fmt.Fprintln(stdout, strings.Join(cmd.Args, " ")); err != nil {
 				return err
 			}
@@ -87,6 +95,9 @@ func runNetsetup(args []string, stdout, stderr io.Writer) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if *release != "" {
+		return netsetup.Release(ctx, cfg, *release)
+	}
 	return netsetup.Apply(ctx, cfg)
 }
 

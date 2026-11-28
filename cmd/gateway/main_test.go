@@ -93,6 +93,11 @@ func TestGatewayNetsetupDryRunAndStartupGuards(t *testing.T) {
 		}
 	}
 
+	releaseArgs := []string{"netsetup", "--config", exPath, "--dry-run", "--release", "sbx9"}
+	if err := run(context.Background(), releaseArgs, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("--dry-run with --release: err = %v", err)
+	}
+
 	// 2. `gateway run` requires --config.
 	var noCfgOut, noCfgErr bytes.Buffer
 	if err := run(context.Background(), []string{"run"}, &noCfgOut, &noCfgErr); err == nil {
