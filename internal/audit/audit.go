@@ -3,6 +3,7 @@
 package audit
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -90,6 +91,7 @@ type Event struct {
 	BytesOut       int64     `json:"bytes_out,omitempty"`
 	BytesIn        int64     `json:"bytes_in,omitempty"`
 	BytesRemoved   int64     `json:"bytes_removed,omitempty"`
+	Count          uint64    `json:"count,omitempty"`
 	Error          string    `json:"error,omitempty"`
 	ConfigHash     string    `json:"config_hash,omitempty"`
 }
@@ -298,9 +300,13 @@ func (w *Writer) openSegmentLocked(ts time.Time, incrementSeq bool) error {
 
 	for {
 		path := filepath.Join(w.dir, segmentFileName(day, seq))
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o640)
 		if err != nil {
 			return fmt.Errorf("audit: open segment %s: %w", path, err)
+		}
+		if err := truncatePartialLine(f); err != nil {
+			closeErr := f.Close()
+			return errors.Join(fmt.Errorf("audit: repair segment %s: %w", path, err), closeErr)
 		}
 		fi, err := f.Stat()
 		if err != nil {
@@ -323,6 +329,36 @@ func (w *Writer) openSegmentLocked(ts time.Time, incrementSeq bool) error {
 
 	w.pruneLocked(ts.UTC())
 	return w.pruneSizeLocked(ts.UTC())
+}
+
+// truncatePartialLine cuts f back to its last newline. A short write or a crash
+// can leave half a record at the end; the next append would otherwise glue a
+// whole record onto it and corrupt both.
+func truncatePartialLine(f *os.File) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := fi.Size()
+	var buf [4096]byte
+	for end := size; end > 0; {
+		start := max(end-int64(len(buf)), 0)
+		chunk := buf[:end-start]
+		if _, err := f.ReadAt(chunk, start); err != nil {
+			return err
+		}
+		if i := bytes.LastIndexByte(chunk, '\n'); i >= 0 {
+			if keep := start + int64(i) + 1; keep < size {
+				return f.Truncate(keep)
+			}
+			return nil
+		}
+		end = start
+	}
+	if size > 0 {
+		return f.Truncate(0)
+	}
+	return nil
 }
 
 func (w *Writer) latestSeqForDay(day string) (int, error) {
