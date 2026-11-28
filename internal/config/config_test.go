@@ -249,6 +249,30 @@ func TestConfigValidationInvariants(t *testing.T) {
 	}
 }
 
+func TestReloadRefusesLinkWithoutInterface(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(validYAML), 0o600); err != nil {
+		t.Fatalf("write initial yaml: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	before := store.Current()
+
+	unguarded := strings.Replace(validYAML, "    interface: sbx0\n", "", 1)
+	if err := os.WriteFile(cfgPath, []byte(unguarded), 0o600); err != nil {
+		t.Fatalf("write unguarded yaml: %v", err)
+	}
+	// The restart-only link check would also refuse this, so require the validation error.
+	if _, _, _, err := store.Reload(); err == nil || !strings.Contains(err.Error(), "links[sbx0].interface") {
+		t.Fatalf("Reload error = %v, want the missing interface refusal", err)
+	}
+	if store.Current() != before {
+		t.Fatal("refused Reload replaced the active snapshot")
+	}
+}
+
 func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "gateway.yaml")
