@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	mdns "github.com/miekg/dns"
 
@@ -68,28 +69,31 @@ func uint32ToIPv4(v uint32) netip.Addr {
 
 // Server serves fake-IP DNS over explicit-bind UDP and TCP sockets for a single link.
 type Server struct {
-	link      config.LinkConfig
-	store     *config.Store
-	eval      *policy.Evaluator
-	audit     *audit.Writer
-	allocator *Allocator
-	onQuery   func(principal, effect string)
+	link         config.LinkConfig
+	store        *config.Store
+	eval         *policy.Evaluator
+	audit        *audit.Writer
+	allocator    *Allocator
+	onQuery      func(principal, effect string)
+	onServeError func(error)
 
-	udpConn net.PacketConn
-	tcpLn   net.Listener
-	udpSrv  *mdns.Server
-	tcpSrv  *mdns.Server
-	wg      sync.WaitGroup
+	shuttingDown atomic.Bool
+	udpConn      net.PacketConn
+	tcpLn        net.Listener
+	udpSrv       *mdns.Server
+	tcpSrv       *mdns.Server
+	wg           sync.WaitGroup
 }
 
 // ServerOptions configures a per-link DNS Server.
 type ServerOptions struct {
-	Link      config.LinkConfig
-	Store     *config.Store
-	Evaluator *policy.Evaluator
-	Audit     *audit.Writer
-	Allocator *Allocator
-	OnQuery   func(principal, effect string)
+	Link         config.LinkConfig
+	Store        *config.Store
+	Evaluator    *policy.Evaluator
+	Audit        *audit.Writer
+	Allocator    *Allocator
+	OnQuery      func(principal, effect string)
+	OnServeError func(error)
 }
 
 // NewServer creates a per-link fake-IP DNS Server bound to link.ParsedGatewayIP:link.DNSPort.
@@ -101,12 +105,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		return nil, errors.New("dns: explicit non-wildcard gateway_ip is required")
 	}
 	return &Server{
-		link:      opts.Link,
-		store:     opts.Store,
-		eval:      opts.Evaluator,
-		audit:     opts.Audit,
-		allocator: opts.Allocator,
-		onQuery:   opts.OnQuery,
+		link:         opts.Link,
+		store:        opts.Store,
+		eval:         opts.Evaluator,
+		audit:        opts.Audit,
+		allocator:    opts.Allocator,
+		onQuery:      opts.OnQuery,
+		onServeError: opts.OnServeError,
 	}, nil
 }
 
@@ -150,11 +155,19 @@ func (s *Server) Start() error {
 	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
-		serveDNSUntilClosed(s.udpSrv)
+		serveDNSUntilClosed(s.udpSrv, &s.shuttingDown, func(err error) {
+			if s.onServeError != nil {
+				s.onServeError(fmt.Errorf("dns(%s/udp): %w", s.link.Name, err))
+			}
+		})
 	}()
 	go func() {
 		defer s.wg.Done()
-		serveDNSUntilClosed(s.tcpSrv)
+		serveDNSUntilClosed(s.tcpSrv, &s.shuttingDown, func(err error) {
+			if s.onServeError != nil {
+				s.onServeError(fmt.Errorf("dns(%s/tcp): %w", s.link.Name, err))
+			}
+		})
 	}()
 
 	<-udpReady
@@ -164,6 +177,7 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops both UDP and TCP DNS servers and waits for goroutines to exit.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.shuttingDown.Store(true)
 	var errs error
 	if s.udpSrv != nil {
 		if err := s.udpSrv.ShutdownContext(ctx); err != nil {
@@ -338,10 +352,12 @@ func (s *Server) auditMalformed(proto string) {
 	}
 }
 
-func serveDNSUntilClosed(srv *mdns.Server) {
+func serveDNSUntilClosed(srv *mdns.Server, shuttingDown *atomic.Bool, onErr func(error)) {
 	// Shutdown closes the underlying socket, causing ActivateAndServe to exit.
-	if err := srv.ActivateAndServe(); err != nil {
-		return
+	if err := srv.ActivateAndServe(); err != nil && !shuttingDown.Load() {
+		if onErr != nil {
+			onErr(err)
+		}
 	}
 }
 

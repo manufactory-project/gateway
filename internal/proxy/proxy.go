@@ -43,6 +43,7 @@ type Options struct {
 	Flows          *FlowRegistry
 	OnRequest      func(principal, effect string, status int, reason string)
 	OnConnRejected func(link string)
+	OnServeError   func(error)
 }
 
 // Server owns the explicit-bind HTTPS (:443 semantics) and HTTP (:80 semantics)
@@ -57,6 +58,7 @@ type Server struct {
 	flows          *FlowRegistry
 	onRequest      func(principal, effect string, status int, reason string)
 	onConnRejected func(link string)
+	onServeError   func(error)
 
 	transport *http.Transport
 
@@ -109,6 +111,7 @@ func NewServer(opts Options) (*Server, error) {
 		flows:          opts.Flows,
 		onRequest:      opts.OnRequest,
 		onConnRejected: opts.OnConnRejected,
+		onServeError:   opts.OnServeError,
 		transport:      tr,
 	}
 	return s, nil
@@ -195,19 +198,29 @@ func (s *Server) Start() error {
 	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
-		serveUntilClosed(s.httpsSrv, httpsLn)
+		serveUntilClosed(s.httpsSrv, httpsLn, func(err error) {
+			if s.onServeError != nil {
+				s.onServeError(fmt.Errorf("proxy(%s/https): %w", s.link.Name, err))
+			}
+		})
 	}()
 	go func() {
 		defer s.wg.Done()
-		serveUntilClosed(s.httpSrv, cappedHTTPLn)
+		serveUntilClosed(s.httpSrv, cappedHTTPLn, func(err error) {
+			if s.onServeError != nil {
+				s.onServeError(fmt.Errorf("proxy(%s/http): %w", s.link.Name, err))
+			}
+		})
 	}()
 	return nil
 }
 
-func serveUntilClosed(srv *http.Server, ln net.Listener) {
+func serveUntilClosed(srv *http.Server, ln net.Listener, onErr func(error)) {
 	// Shutdown closes the listener and causes Serve to return http.ErrServerClosed.
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return
+		if onErr != nil {
+			onErr(err)
+		}
 	}
 }
 

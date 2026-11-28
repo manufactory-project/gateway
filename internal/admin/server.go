@@ -89,22 +89,24 @@ type GrantRequest struct {
 
 // Options configures the Unix-socket Admin Server.
 type Options struct {
-	SocketPath  string
-	SocketGroup string
-	Store       *config.Store
-	Flows       FlowManager
-	Audit       *audit.Writer
-	Metrics     *metrics.Collector
+	SocketPath   string
+	SocketGroup  string
+	Store        *config.Store
+	Flows        FlowManager
+	Audit        *audit.Writer
+	Metrics      *metrics.Collector
+	OnServeError func(error)
 }
 
 // Server serves the Admin API strictly over a local Unix domain socket (mode 0660).
 type Server struct {
-	socketPath  string
-	socketGroup string
-	store       *config.Store
-	flows       FlowManager
-	audit       *audit.Writer
-	metrics     *metrics.Collector
+	socketPath   string
+	socketGroup  string
+	store        *config.Store
+	flows        FlowManager
+	audit        *audit.Writer
+	metrics      *metrics.Collector
+	onServeError func(error)
 
 	ln  net.Listener
 	srv *http.Server
@@ -124,8 +126,9 @@ func NewServer(opts Options) (*Server, error) {
 		socketGroup: opts.SocketGroup,
 		store:       opts.Store,
 		flows:       opts.Flows,
-		audit:       opts.Audit,
-		metrics:     opts.Metrics,
+		audit:        opts.Audit,
+		metrics:      opts.Metrics,
+		onServeError: opts.OnServeError,
 	}, nil
 }
 
@@ -182,15 +185,21 @@ func (s *Server) Start() error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		serveUntilClosed(s.srv, ln)
+		serveUntilClosed(s.srv, ln, func(err error) {
+			if s.onServeError != nil {
+				s.onServeError(fmt.Errorf("admin: %w", err))
+			}
+		})
 	}()
 	return nil
 }
 
-func serveUntilClosed(srv *http.Server, ln net.Listener) {
+func serveUntilClosed(srv *http.Server, ln net.Listener, onErr func(error)) {
 	// Shutdown closes the listener and causes Serve to return http.ErrServerClosed.
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return
+		if onErr != nil {
+			onErr(err)
+		}
 	}
 }
 

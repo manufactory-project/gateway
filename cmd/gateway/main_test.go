@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,8 +21,11 @@ import (
 	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/ca"
 	"github.com/manufactory-project/gateway/internal/config"
+	gwdns "github.com/manufactory-project/gateway/internal/dns"
 	"github.com/manufactory-project/gateway/internal/metrics"
+	"github.com/manufactory-project/gateway/internal/netguard"
 	"github.com/manufactory-project/gateway/internal/netsetup"
+	"github.com/manufactory-project/gateway/internal/policy"
 	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
@@ -638,5 +644,142 @@ rules:
 		if !strings.Contains(err.Error(), "usage:") && !strings.Contains(err.Error(), "flag provided but not defined") {
 			t.Errorf("gateway %v returned unexpected error %q (want usage or flag error)", args, err.Error())
 		}
+	}
+}
+
+type failingTestListener struct {
+	err error
+}
+
+func (f failingTestListener) Accept() (net.Conn, error) { return nil, f.err }
+func (f failingTestListener) Close() error              { return nil }
+func (f failingTestListener) Addr() net.Addr            { return &net.TCPAddr{} }
+
+func TestDaemonExitsNonZeroOnUnexpectedListenerError(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	mitmCA, err := ca.Init(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	auditDir := filepath.Join(dir, "audit")
+	sockPath := filepath.Join(dir, "admin", "admin.sock")
+	linkPorts := freePorts(t, "127.0.29.1", 3)
+	metricsPort := freePorts(t, "127.0.0.1", 1)[0]
+
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+admin:
+  socket: %s
+metrics:
+  listen: 127.0.0.1:%d
+links:
+  - name: sbx0
+    principal: worker-claude
+    subnet: 127.0.29.0/28
+    gateway_ip: 127.0.29.1
+    https_port: %d
+    http_port: %d
+    dns_port: %d
+rules:
+  - id: r1
+    principal: worker-claude
+    effect: allow
+    hosts: [api.anthropic.com]
+    ports: [443]
+`, certPath, keyPath, auditDir, sockPath, metricsPort, linkPorts[0], linkPorts[1], linkPorts[2])
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg := store.Current().Config
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	flows := proxy.NewFlowRegistry()
+	collector := metrics.NewCollector(metrics.Options{})
+	rt := &daemonRuntime{auditWriter: aw}
+	serveErrCh := make(chan error, 1)
+	reportServeErr := func(e error) {
+		select {
+		case serveErrCh <- e:
+		default:
+		}
+	}
+	alloc, err := gwdns.NewAllocator(cfg.FakePrefix)
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+	eval := policy.NewEvaluator(store)
+	leaves := ca.NewLeafCache(mitmCA)
+	dialer := netguard.NewDialer(netguard.Options{Store: store})
+	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, reportServeErr); err != nil {
+		t.Fatalf("startLinks: %v", err)
+	}
+	if err := rt.startControl(cfg, store, flows, collector, reportServeErr); err != nil {
+		t.Fatalf("startControl: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runCtx, runCancel := context.WithCancel(ctx)
+	var bgWG sync.WaitGroup
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		store.RunGrantPruner(runCtx, 50*time.Millisecond)
+	}()
+
+	permErr := errors.New("accept EMFILE permanent failure")
+	go func() {
+		if sErr := (&http.Server{}).Serve(failingTestListener{err: permErr}); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
+			reportServeErr(fmt.Errorf("proxy(sbx0/https): %w", sErr))
+		}
+	}()
+
+	var stderr bytes.Buffer
+	gotErr := rt.waitAndShutdown(ctx, runCancel, &bgWG, serveErrCh, &stderr)
+	if !errors.Is(gotErr, permErr) {
+		t.Fatalf("waitAndShutdown err = %v, want wrapped %v (non-zero exit)", gotErr, permErr)
+	}
+	if !strings.Contains(stderr.String(), "fatal listener error") || !strings.Contains(stderr.String(), permErr.Error()) {
+		t.Fatalf("stderr = %q, want fatal listener error message", stderr.String())
+	}
+
+	entries, err := filepath.Glob(filepath.Join(auditDir, "*.jsonl"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("glob audit jsonl: %v (entries=%v)", err, entries)
+	}
+	var sawListenerErr bool
+	for _, p := range entries {
+		raw, rErr := os.ReadFile(p)
+		if rErr != nil {
+			t.Fatalf("read audit %s: %v", p, rErr)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line == "" {
+				continue
+			}
+			var ev audit.Event
+			if uErr := json.Unmarshal([]byte(line), &ev); uErr != nil {
+				t.Fatalf("unmarshal audit line: %v", uErr)
+			}
+			if ev.Kind == audit.KindLifecycle && ev.Reason == "listener-error" && strings.Contains(ev.Error, permErr.Error()) {
+				sawListenerErr = true
+			}
+		}
+	}
+	if !sawListenerErr {
+		t.Fatalf("missing audit lifecycle event with reason=listener-error and error containing %q", permErr.Error())
 	}
 }

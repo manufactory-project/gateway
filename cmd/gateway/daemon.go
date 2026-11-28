@@ -163,15 +163,17 @@ func (rt *daemonRuntime) startLinks(
 	dialer *netguard.Dialer,
 	flows *proxy.FlowRegistry,
 	collector *metrics.Collector,
+	onServeErr func(error),
 ) error {
 	for _, link := range cfg.Links {
 		ds, err := gwdns.NewServer(gwdns.ServerOptions{
-			Link:      link,
-			Store:     store,
-			Evaluator: eval,
-			Audit:     rt.auditWriter,
-			Allocator: alloc,
-			OnQuery:   collector.ObserveDNSQuery,
+			Link:         link,
+			Store:        store,
+			Evaluator:    eval,
+			Audit:        rt.auditWriter,
+			Allocator:    alloc,
+			OnQuery:      collector.ObserveDNSQuery,
+			OnServeError: onServeErr,
 		})
 		if err != nil {
 			return err
@@ -191,6 +193,7 @@ func (rt *daemonRuntime) startLinks(
 			Flows:          flows,
 			OnRequest:      collector.ObserveRequest,
 			OnConnRejected: collector.IncConnRejected,
+			OnServeError:   onServeErr,
 		})
 		if err != nil {
 			return err
@@ -203,15 +206,16 @@ func (rt *daemonRuntime) startLinks(
 	return nil
 }
 
-func (rt *daemonRuntime) startControl(cfg *config.Config, store *config.Store, flows *proxy.FlowRegistry, collector *metrics.Collector) error {
+func (rt *daemonRuntime) startControl(cfg *config.Config, store *config.Store, flows *proxy.FlowRegistry, collector *metrics.Collector, onServeErr func(error)) error {
 	if cfg.Admin.Socket != "" {
 		srv, err := admin.NewServer(admin.Options{
-			SocketPath:  cfg.Admin.Socket,
-			SocketGroup: cfg.Admin.SocketGroup,
-			Store:       store,
-			Flows:       adminFlowAdapter{flows: flows},
-			Audit:       rt.auditWriter,
-			Metrics:     collector,
+			SocketPath:   cfg.Admin.Socket,
+			SocketGroup:  cfg.Admin.SocketGroup,
+			Store:        store,
+			Flows:        adminFlowAdapter{flows: flows},
+			Audit:        rt.auditWriter,
+			Metrics:      collector,
+			OnServeError: onServeErr,
 		})
 		if err != nil {
 			return err
@@ -226,6 +230,7 @@ func (rt *daemonRuntime) startControl(cfg *config.Config, store *config.Store, f
 		if err != nil {
 			return err
 		}
+		srv.SetOnServeError(onServeErr)
 		if err := srv.Start(); err != nil {
 			return err
 		}
@@ -312,6 +317,13 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	registerGrantExpiredAudit(store, auditWriter, stderr)
 
 	rt := &daemonRuntime{auditWriter: auditWriter}
+	serveErrCh := make(chan error, 1)
+	reportServeErr := func(err error) {
+		select {
+		case serveErrCh <- err:
+		default:
+		}
+	}
 	alloc, err := gwdns.NewAllocator(cfg.FakePrefix)
 	if err != nil {
 		return errors.Join(err, rt.shutdownAll())
@@ -320,11 +332,11 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	leaves := ca.NewLeafCache(mitmCA)
 	dialer := netguard.NewDialer(netguard.Options{Store: store})
 
-	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector); err != nil {
+	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, reportServeErr); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
 	registerFlowLifecycleCallbacks(store, eval, flows, rt.proxyServers)
-	if err := rt.startControl(cfg, store, flows, collector); err != nil {
+	if err := rt.startControl(cfg, store, flows, collector, reportServeErr); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
 	if err := auditWriter.WriteSync(audit.Event{
@@ -335,23 +347,48 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		return errors.Join(err, rt.shutdownAll())
 	}
 
+	runCtx, runCancel := context.WithCancel(ctx)
 	var bgWG sync.WaitGroup
 	bgWG.Add(2)
 	go func() {
 		defer bgWG.Done()
-		store.RunGrantPruner(ctx, 50*time.Millisecond)
+		store.RunGrantPruner(runCtx, 50*time.Millisecond)
 	}()
 	go func() {
 		defer bgWG.Done()
-		store.WatchSIGHUP(ctx, func(snap *config.Snapshot, _ []string, revokedFlows int, reloadErr error) {
+		store.WatchSIGHUP(runCtx, func(snap *config.Snapshot, _ []string, revokedFlows int, reloadErr error) {
 			handleSIGHUPReload(snap, revokedFlows, reloadErr, collector, auditWriter, stderr)
 		})
 	}()
 
-	<-ctx.Done()
+	return rt.waitAndShutdown(ctx, runCancel, &bgWG, serveErrCh, stderr)
+}
+
+func (rt *daemonRuntime) waitAndShutdown(
+	ctx context.Context,
+	runCancel context.CancelFunc,
+	bgWG *sync.WaitGroup,
+	serveErrCh <-chan error,
+	stderr io.Writer,
+) error {
+	var listenerErr error
+	select {
+	case <-ctx.Done():
+	case listenerErr = <-serveErrCh:
+		logf(stderr, "gateway: fatal listener error: %v\n", listenerErr)
+		auditBestEffort(rt.auditWriter, audit.Event{
+			Kind:   audit.KindLifecycle,
+			Reason: "listener-error",
+			Error:  listenerErr.Error(),
+		})
+	}
+	runCancel()
 	bgWG.Wait()
 
-	if aErr := auditWriter.WriteSync(audit.Event{
+	if listenerErr != nil {
+		return errors.Join(listenerErr, rt.shutdownAll())
+	}
+	if aErr := rt.auditWriter.WriteSync(audit.Event{
 		Kind:   audit.KindLifecycle,
 		Reason: "stopped",
 	}); aErr != nil {

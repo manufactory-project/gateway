@@ -201,12 +201,18 @@ func (c *Collector) Handler() http.Handler {
 
 // Server serves /metrics over an explicit non-wildcard IP:port TCP listener.
 type Server struct {
-	listenAddr string
-	collector  *Collector
+	listenAddr   string
+	collector    *Collector
+	onServeError func(error)
 
 	ln  net.Listener
 	srv *http.Server
 	wg  sync.WaitGroup
+}
+
+// SetOnServeError registers a callback invoked if the metrics listener exits with an unexpected error.
+func (s *Server) SetOnServeError(fn func(error)) {
+	s.onServeError = fn
 }
 
 // NewServer validates listenAddr is an explicit IP:port (never wildcard) and constructs Server.
@@ -232,9 +238,11 @@ func NewServer(listenAddr string, collector *Collector) (*Server, error) {
 	}, nil
 }
 
-func serveUntilClosed(srv *http.Server, ln net.Listener) {
+func serveUntilClosed(srv *http.Server, ln net.Listener, onErr func(error)) {
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return
+		if onErr != nil {
+			onErr(err)
+		}
 	}
 }
 
@@ -256,7 +264,11 @@ func (s *Server) Start() error {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		serveUntilClosed(s.srv, ln)
+		serveUntilClosed(s.srv, ln, func(err error) {
+			if s.onServeError != nil {
+				s.onServeError(fmt.Errorf("metrics: %w", err))
+			}
+		})
 	}()
 	return nil
 }
