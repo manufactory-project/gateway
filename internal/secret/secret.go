@@ -9,11 +9,13 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/textproto"
 	"os"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/manufactory-project/gateway/internal/config"
 )
@@ -45,13 +47,25 @@ func (e *MisplacedError) Error() string {
 // FileResolver reads secret values from files on demand (tmpfs / systemd LoadCredential).
 type FileResolver struct{}
 
+// maxSecretBytes caps a secret file; a larger one is refused, never truncated.
+const maxSecretBytes = 64 << 10
+
 // Resolve reads path, strips at most one trailing \r?\n, and fails closed on
-// read error, empty value, or any interior \r, \n, or \x00.
+// read error, empty value, or any interior \r, \n, or \x00. The path must be a
+// regular file, not a symlink (nor a FIFO or device, which could block or stream
+// forever), not accessible to "other", and at most 64 KiB.
 func (FileResolver) Resolve(path string) (string, error) {
 	if path == "" {
 		return "", errors.New("empty secret file path")
 	}
-	raw, err := os.ReadFile(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return "", err
+	}
+	raw, err := readSecret(f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
 	if err != nil {
 		return "", err
 	}
@@ -63,6 +77,27 @@ func (FileResolver) Resolve(path string) (string, error) {
 		return "", errors.New("secret value contains forbidden control character (CR/LF/NUL)")
 	}
 	return val, nil
+}
+
+func readSecret(f *os.File) ([]byte, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, errors.New("secret file is not a regular file")
+	}
+	if fi.Mode().Perm()&0o007 != 0 {
+		return nil, errors.New("secret file is accessible to other users")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxSecretBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxSecretBytes {
+		return nil, fmt.Errorf("secret file exceeds %d bytes", maxSecretBytes)
+	}
+	return raw, nil
 }
 
 func stripSingleTrailingNewline(s string) string {

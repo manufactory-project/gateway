@@ -155,9 +155,11 @@ rules:
 
 Schemes:
 
-- `bearer` and `token`: the header value starts with `Bearer ` or `token ` and contains the placeholder.
-- `basic`: the placeholder is inside the base64-decoded Basic credentials.
-- `raw`: the placeholder is anywhere in the header value.
+The header value must be exactly one of these forms. Any other value that contains the placeholder is refused with `403` (`placeholder-misplaced`), and a value without the placeholder is passed on untouched.
+
+- `bearer` and `token`: `Bearer <placeholder>` or `Token <placeholder>`.
+- `basic`: `Basic ` plus the base64 of `user:<placeholder>` (padded).
+- `raw`: exactly the placeholder.
 
 Substitution happens only when all of these hold:
 
@@ -179,7 +181,7 @@ nano /etc/gateway/secrets/api-token
 
 The service cannot see files under `/home` or `/root`, and has its own `/tmp`. In the guest, use the placeholder where the secret would go, such as `Authorization: Bearer mf_ph_api_token`.
 
-The file is read on each request, so you can replace it without a reload. One trailing newline is removed.
+The file is read on each request, so you can replace it without a reload. One trailing newline is removed. It must be a regular file (not a symlink, FIFO or device), not accessible to other users (mode `0640` or tighter), and at most 64 KiB.
 
 A host with a binding is a bound host for every principal. On each request to it:
 

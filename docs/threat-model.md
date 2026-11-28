@@ -30,7 +30,9 @@ Protected:
 
 - The guest holds a placeholder. `gateway` puts the real value into one named header, only on HTTPS, and only when the rule that owns the binding allows the request.
 - Placeholders left in request headers are removed before the request leaves.
-- A host with any binding is a bound host for every principal. In its responses (headers, bodies and trailers), echoes of every secret bound to it are replaced with placeholders, in literal, URL-encoded and JSON-escaped form.
+- A host with any binding is a bound host for every principal. In its responses (headers, bodies and trailers), echoes of every secret bound to it are replaced with placeholders. Each character of the secret matches itself or any escape of it, in any mix: percent-encoding in either hex case (including a `+` for a space), JSON `\uXXXX` in either hex case (including `=` and surrogate pairs), and JSON one-character escapes such as `\/`. The `base64(user:secret)` that `gateway` sends for a Basic binding is matched the same way.
+- The guest cannot choose where the placeholder sits: a bound header is substituted only when it is exactly `<Scheme> <placeholder>` (`raw`: exactly the placeholder; `basic`: `user:<placeholder>`). Any other use of the placeholder in that header is refused with `403`.
+- A secret file must be a regular, private (not world-accessible) file of at most 64 KiB, and not a symlink; anything else is refused with `403`.
 - So that a response can always be checked, bound hosts get no `Range` requests or compression, partial and compressed responses are refused, WebSockets are refused, and nothing is sent unless every secret for the host can be read.
 - Once a request has been sent, a failure is recorded in the audit log as a category, not as the error text, which could quote the secret.
 
@@ -38,7 +40,7 @@ Not protected:
 
 - **Use of the credential.** The guest can do anything the credential permits on the allowed methods and paths, such as pushing to a repository the token can write. Narrow the token at its issuer and narrow the rule.
 - **Credentials the guest already holds**, such as a CLI's login token stored in the guest. `gateway` does not hide or restrict them.
-- **Other echo encodings**: base64 (including Basic credentials), base64url, hex, changed case and HTML entities.
+- **Other echo encodings**: base64 (other than the Basic header `gateway` sent), base64url, hex, changed case and HTML entities.
 - **Reflection through another host.** A secret that an upstream stores and later serves from a host without a binding for it is not replaced.
 
 ## Goal 3: limit and record what leaves

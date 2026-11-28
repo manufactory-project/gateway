@@ -322,3 +322,54 @@ func TestBasicAuthEchoIsScrubbed(t *testing.T) {
 		t.Fatalf("control: bare-secret redactor unexpectedly scrubbed the encoded form: %q", got)
 	}
 }
+
+// TestRedactorMatchesRealWorldEncodings pins that a secret is rewritten to its
+// placeholder in every encoding real servers echo it in, whole or split across
+// chunk boundaries, and that near misses are left alone.
+func TestRedactorMatchesRealWorldEncodings(t *testing.T) {
+	const ph = "mf_ph_enc"
+	cases := []struct{ secret, echo, name string }{
+		{"ab/cd+ef==", "ab/cd+ef==", "literal"},
+		{"ab/cd+ef==", "ab/cd%2Bef%3D%3D", "python quote mixes literal and escaped"},
+		{"ab/cd+ef==", "ab%2Fcd%2Bef%3D%3D", "query escape"},
+		{"ab/cd+ef==", "ab%2fcd%2bef%3d%3d", "lowercase hex"},
+		{"ab/cd+ef==", `ab\/cd+ef==`, "php json_encode"},
+		{"ab/cd+ef==", `ab/cd+ef==`, "gson html-safe"},
+		{"ab/cd+ef==", `ab/cd+ef==`, "uppercase unicode escape"},
+		{"ab/cd+ef==", `ab%2Fcd+ef==`, "arbitrary mix"},
+		{"ab/cd+ef==", "%61%62%2F%63%64%2B%65%66%3D%3D", "fully escaped"},
+		{"tok!en*(1)'x", "tok!en*(1)%27x", "encodeURIComponent"},
+		{"a b\"c\\d", `a+b\"c\\d`, "plus and json escapes"},
+		{"café-\U0001F600", "caf%C3%A9-%F0%9F%98%80", "utf8 percent"},
+		{"café-\U0001F600", `café-😀`, "utf8 json surrogates"},
+	}
+	for _, tc := range cases {
+		red := secret.NewRedactor([]secret.Pair{{Name: "n", Placeholder: ph, Value: tc.secret}})
+		in := "pre " + tc.echo + " post"
+		want := "pre " + ph + " post"
+		if got := red.ScrubString(in); got != want {
+			t.Errorf("%s: ScrubString(%q) = %q, want %q", tc.name, in, got, want)
+		}
+		// Split at every byte boundary: the window must hold a partial secret back.
+		var out bytes.Buffer
+		sw := red.StreamWriter(&out, nil)
+		for i := 0; i < len(in); i++ {
+			if _, err := sw.Write([]byte{in[i]}); err != nil {
+				t.Fatalf("%s: write: %v", tc.name, err)
+			}
+		}
+		if err := sw.Close(); err != nil {
+			t.Fatalf("%s: close: %v", tc.name, err)
+		}
+		if out.String() != want {
+			t.Errorf("%s: streamed = %q, want %q", tc.name, out.String(), want)
+		}
+	}
+	// Negative controls: a near miss and unrelated text pass through unchanged.
+	red := secret.NewRedactor([]secret.Pair{{Name: "n", Placeholder: ph, Value: "ab/cd+ef=="}})
+	for _, in := range []string{"ab/cd+ef=", "ab/cd+ef%3", "plain text", `ab\/cd+ef\u003`, `ab\/cd+ef\u003x=`} {
+		if got := red.ScrubString(in); got != in {
+			t.Errorf("ScrubString(%q) = %q, want unchanged", in, got)
+		}
+	}
+}
