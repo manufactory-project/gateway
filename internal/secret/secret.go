@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/manufactory-project/gateway/internal/config"
@@ -71,77 +72,45 @@ type Pair struct {
 	Value       string
 }
 
-// ApplyRequest performs substitution-only secret injection for matched bindings on
-// HTTPS (:443) ONLY, then unconditionally sweeps Proxy-Authorization and any
-// remaining mf_ph_* placeholders (literal or inside decoded Basic Auth) from EVERY
-// header on EVERY request — including bound hosts and cleartext port 80.
-func ApplyRequest(hdr http.Header, bindings []config.BindingConfig, dstPort uint16) ([]string, []Pair, error) {
-	resolver := FileResolver{}
-
-	var (
-		secretNames []string
-		pairs       []Pair
-		seenNames   = make(map[string]bool)
-		memo        = make(map[string]string)
-	)
-
+// ApplyRequest injects the resolved values of the matched bindings on HTTPS
+// (:443) ONLY, then unconditionally sweeps Proxy-Authorization and any remaining
+// mf_ph_* placeholders (literal or inside decoded Basic Auth) from EVERY header
+// on EVERY request, including bound hosts and cleartext port 80. pairs must come
+// from ResolveHostPairs for the same host. It returns the substituted names.
+func ApplyRequest(hdr http.Header, bindings []config.BindingConfig, pairs []Pair, dstPort uint16) []string {
+	var names []string
 	// Substitution happens ONLY on HTTPS :443, and ONLY into the exact named header and scheme.
-	if dstPort == 443 && len(bindings) > 0 {
+	if dstPort == 443 {
 		for _, b := range bindings {
-			canon := textproto.CanonicalMIMEHeaderKey(b.Header)
-			vals := hdr.Values(canon)
-			if len(vals) == 0 {
-				continue
-			}
-
-			needsSub := false
-			for _, v := range vals {
-				if matchesSchemeAndPlaceholder(v, b.Scheme, b.Placeholder) {
-					needsSub = true
-					break
-				}
-			}
-			if !needsSub {
-				continue
-			}
-
-			realVal, ok := memo[b.SecretFile]
-			if !ok {
-				var err error
-				realVal, err = resolver.Resolve(b.SecretFile)
-				if err != nil {
-					return nil, nil, &ResolveError{Name: b.Name, Cause: "resolve failed", Err: err}
-				}
-				memo[b.SecretFile] = realVal
-			}
-
-			newVals := make([]string, len(vals))
-			for i, v := range vals {
-				if matchesSchemeAndPlaceholder(v, b.Scheme, b.Placeholder) {
-					newVals[i] = substituteByScheme(v, b.Scheme, b.Placeholder, realVal)
-				} else {
-					newVals[i] = v
-				}
-			}
-			hdr[canon] = newVals
-
-			if !seenNames[b.Name] {
-				seenNames[b.Name] = true
-				secretNames = append(secretNames, b.Name)
-				pairs = append(pairs, Pair{
-					Name:        b.Name,
-					Placeholder: b.Placeholder,
-					Value:       realVal,
-				})
+			if value, ok := valueFor(pairs, b.Placeholder); ok && substitute(hdr, b, value) && !slices.Contains(names, b.Name) {
+				names = append(names, b.Name)
 			}
 		}
 	}
-
-	// Unconditional post-substitution sweep across ALL headers on EVERY request
-	// (including bound hosts and port 80).
 	SweepHeaders(hdr)
+	return names
+}
 
-	return secretNames, pairs, nil
+func valueFor(pairs []Pair, placeholder string) (string, bool) {
+	for _, p := range pairs {
+		if p.Placeholder == placeholder {
+			return p.Value, true
+		}
+	}
+	return "", false
+}
+
+// substitute replaces b's placeholder in the values of b's header that use b's scheme.
+func substitute(hdr http.Header, b config.BindingConfig, value string) bool {
+	vals := hdr[textproto.CanonicalMIMEHeaderKey(b.Header)]
+	changed := false
+	for i, v := range vals {
+		if matchesSchemeAndPlaceholder(v, b.Scheme, b.Placeholder) {
+			vals[i] = substituteByScheme(v, b.Scheme, b.Placeholder, value)
+			changed = true
+		}
+	}
+	return changed
 }
 
 // SweepHeaders unconditionally removes Proxy-Authorization and any header whose
@@ -158,31 +127,18 @@ func SweepHeaders(hdr http.Header) {
 	}
 }
 
-// ResolveHostPairs resolves every binding declared for a host so response scrubbing
-// catches echoed bound secrets even on requests that did not send an auth header.
-// It fails closed (returning an error) if any binding's secret cannot be resolved.
-func ResolveHostPairs(bindings []config.BindingConfig, existing []Pair) ([]Pair, error) {
+// ResolveHostPairs resolves every binding declared for a host, before dispatch,
+// so the same values drive substitution and response scrubbing. It fails closed
+// (returning a *ResolveError) if any binding's secret cannot be resolved.
+func ResolveHostPairs(bindings []config.BindingConfig) ([]Pair, error) {
 	resolver := FileResolver{}
-	seen := make(map[string]bool, len(existing))
-	out := make([]Pair, 0, len(bindings)+len(existing))
-	for _, p := range existing {
-		seen[p.Placeholder] = true
-		out = append(out, p)
-	}
+	out := make([]Pair, 0, len(bindings))
 	for _, b := range bindings {
-		if seen[b.Placeholder] {
-			continue
-		}
 		val, err := resolver.Resolve(b.SecretFile)
 		if err != nil {
-			return nil, &ResolveError{Name: b.Name, Cause: "resolve for response redaction failed", Err: err}
+			return nil, &ResolveError{Name: b.Name, Cause: "resolve failed", Err: err}
 		}
-		seen[b.Placeholder] = true
-		out = append(out, Pair{
-			Name:        b.Name,
-			Placeholder: b.Placeholder,
-			Value:       val,
-		})
+		out = append(out, Pair{Name: b.Name, Placeholder: b.Placeholder, Value: val})
 	}
 	return out, nil
 }

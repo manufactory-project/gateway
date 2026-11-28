@@ -102,10 +102,11 @@ func TestApplyRequestSubstitutionAndUnconditionalPostSubSweep(t *testing.T) {
 	hdr.Set("Proxy-Authorization", "Basic dXNlcjpwYXNz")
 	hdr.Set("X-Normal", "keep-me")
 
-	names, pairs, err := secret.ApplyRequest(hdr, []config.BindingConfig{bindingBasic}, 443)
+	pairs, err := secret.ResolveHostPairs([]config.BindingConfig{bindingBasic})
 	if err != nil {
-		t.Fatalf("ApplyRequest: %v", err)
+		t.Fatalf("ResolveHostPairs: %v", err)
 	}
+	names := secret.ApplyRequest(hdr, []config.BindingConfig{bindingBasic}, pairs, 443)
 	if len(names) != 1 || names[0] != "forge-basic" || len(pairs) != 1 {
 		t.Fatalf("unexpected names=%v pairs=%+v", names, pairs)
 	}
@@ -126,10 +127,7 @@ func TestApplyRequestSubstitutionAndUnconditionalPostSubSweep(t *testing.T) {
 	hdr80 := make(http.Header)
 	hdr80.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("git:mf_ph_A")))
 	hdr80.Set("Proxy-Authorization", "Bearer abc")
-	names80, _, err := secret.ApplyRequest(hdr80, []config.BindingConfig{bindingBasic}, 80)
-	if err != nil {
-		t.Fatalf("ApplyRequest port 80: %v", err)
-	}
+	names80 := secret.ApplyRequest(hdr80, []config.BindingConfig{bindingBasic}, pairs, 80)
 	if len(names80) != 0 {
 		t.Fatalf("port 80 must never substitute secrets, got %v", names80)
 	}

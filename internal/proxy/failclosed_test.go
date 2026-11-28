@@ -83,9 +83,11 @@ func TestUntrustedUpstreamCertRefused(t *testing.T) {
 
 func TestBoundHostMissingSecretFailsClosedRedaction(t *testing.T) {
 	missingSecFile := filepath.Join(t.TempDir(), "missing.sec")
+	var received atomic.Int32
 	gw := newTestGateway(t, testGatewaySpec{
 		Hosts: []string{"broken.example.com"},
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			received.Add(1)
 			w.WriteHeader(http.StatusOK)
 			if _, err := io.WriteString(w, "would-leak-if-fail-open"); err != nil {
 				return
@@ -118,8 +120,11 @@ func TestBoundHostMissingSecretFailsClosedRedaction(t *testing.T) {
 	if err := rBroken.Body.Close(); err != nil {
 		t.Fatalf("close broken body: %v", err)
 	}
-	if rBroken.StatusCode != http.StatusBadGateway {
-		t.Fatalf("broken redaction secret status=%d, want 502", rBroken.StatusCode)
+	if rBroken.StatusCode != http.StatusForbidden {
+		t.Fatalf("broken redaction secret status=%d, want 403", rBroken.StatusCode)
+	}
+	if got := received.Load(); got != 0 {
+		t.Fatalf("upstream received %d requests with an unresolvable secret, want 0", got)
 	}
 	if strings.Contains(string(brokenBody), "would-leak-if-fail-open") {
 		t.Fatalf("unscrubbed body leaked on redaction error: %q", brokenBody)
@@ -127,12 +132,13 @@ func TestBoundHostMissingSecretFailsClosedRedaction(t *testing.T) {
 
 	var sawRedactErr bool
 	for _, ev := range gw.AuditEvents(t) {
-		if ev.Error == "redaction-secret-unresolved" && ev.Status == http.StatusBadGateway {
+		if ev.Reason == "secret-unresolved" && ev.Status == http.StatusForbidden && ev.Effect == audit.EffectDeny &&
+			len(ev.Secrets) == 1 && ev.Secrets[0] == "broken-b" {
 			sawRedactErr = true
 		}
 	}
 	if !sawRedactErr {
-		t.Fatal("missing audit record for redaction-secret-unresolved")
+		t.Fatal("missing deny audit record naming the unresolved secret")
 	}
 }
 

@@ -155,7 +155,6 @@ var knownRequestReasons = map[string]struct{}{
 	"client-canceled":                   {},
 	"ws-egress-cap-exceeded":            {},
 	"compressed-response-on-bound-host": {},
-	"redaction-secret-unresolved":       {},
 	"unexpected-101":                    {},
 	"unexpected-101-non-websocket":      {},
 	"upstream-error":                    {},

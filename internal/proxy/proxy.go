@@ -351,7 +351,7 @@ type reqContext struct {
 	maxBody       int64
 	flowID        string
 	secretNames   []string
-	subPairs      []secret.Pair
+	redactor      *secret.Redactor // non-nil exactly on bound hosts
 	outHeaders    http.Header
 }
 
@@ -411,7 +411,7 @@ func completionMetricReason(admitReason, errText string) string {
 	}
 	switch errText {
 	case TeardownRevoked, TeardownGrantExpired, TeardownReload, TeardownClientCanceled,
-		"compressed-response-on-bound-host", "redaction-secret-unresolved",
+		"compressed-response-on-bound-host",
 		"unexpected-101", "unexpected-101-non-websocket":
 		return errText
 	default:
@@ -527,18 +527,20 @@ func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
 		return true
 	}
 
-	secretNames, subPairs, subErr := secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, rc.dstPort)
-	if subErr != nil {
+	// Every secret of a bound host is resolved before dispatch: a request whose
+	// response could not be scrubbed must never reach the upstream.
+	pairs, err := secret.ResolveHostPairs(rc.dec.HostBindings)
+	if err != nil {
 		var resErr *secret.ResolveError
-		if errors.As(subErr, &resErr) && resErr.Name != "" {
+		if errors.As(err, &resErr) {
 			rc.secretNames = []string{resErr.Name}
 		}
 		rc.deny(w, http.StatusForbidden, "secret-unresolved")
 		return false
 	}
-	rc.secretNames = secretNames
-	rc.subPairs = subPairs
-	if rc.dec.HasBindings || len(rc.subPairs) > 0 {
+	rc.secretNames = secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, pairs, rc.dstPort)
+	if rc.dec.HasBindings {
+		rc.redactor = secret.NewRedactor(pairs)
 		// Force identity encoding on every request to a bound host.
 		rc.outHeaders.Set("Accept-Encoding", "identity")
 	}
@@ -619,12 +621,13 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		return
 	}
 
-	redactor, ok := s.prepareResponseRedactor(w, rc, resp, countingBody.n.Load())
-	if !ok {
+	if reason := refuseBoundResponse(rc, resp); reason != "" {
+		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, reason)
+		http.Error(w, "bound host response refused: "+reason, http.StatusBadGateway)
 		return
 	}
 
-	bytesIn, copyErr := writeProxiedResponse(w, resp, rc.dec.HasBindings || len(rc.subPairs) > 0, redactor)
+	bytesIn, copyErr := writeProxiedResponse(w, resp, rc.redactor)
 	errText := ""
 	if reason := af.reason(); reason != "" {
 		errText = reason
@@ -674,30 +677,24 @@ func buildOutboundRequest(ctx context.Context, rc *reqContext, body io.Reader) (
 	return outReq, nil
 }
 
-func (s *Server) prepareResponseRedactor(w http.ResponseWriter, rc *reqContext, resp *http.Response, bytesOut int64) (*secret.Redactor, bool) {
-	if !rc.dec.HasBindings && len(rc.subPairs) == 0 {
-		return nil, true
+// refuseBoundResponse returns why a bound host's response cannot be scrubbed,
+// or "" when it can be forwarded.
+func refuseBoundResponse(rc *reqContext, resp *http.Response) string {
+	switch {
+	case rc.redactor == nil:
+		return ""
+	case !isIdentityContentEncoding(resp.Header.Values("Content-Encoding")):
+		return "compressed-response-on-bound-host"
+	default:
+		return ""
 	}
-	if !isIdentityContentEncoding(resp.Header.Values("Content-Encoding")) {
-		rc.auditCompleted(http.StatusBadGateway, bytesOut, 0, "compressed-response-on-bound-host")
-		http.Error(w, "bound host returned compressed response", http.StatusBadGateway)
-		return nil, false
-	}
-	hostPairs, pairErr := secret.ResolveHostPairs(rc.dec.HostBindings, rc.subPairs)
-	if pairErr != nil {
-		rc.auditCompleted(http.StatusBadGateway, bytesOut, 0, "redaction-secret-unresolved")
-		http.Error(w, "bound secret unavailable for response redaction", http.StatusBadGateway)
-		return nil, false
-	}
-	return secret.NewRedactor(hostPairs), true
 }
 
-func writeProxiedResponse(w http.ResponseWriter, resp *http.Response, hasBindings bool, redactor *secret.Redactor) (int64, error) {
+// writeProxiedResponse forwards resp, scrubbing it when redactor is non-nil.
+func writeProxiedResponse(w http.ResponseWriter, resp *http.Response, redactor *secret.Redactor) (int64, error) {
 	copyEndToEndHeaders(w.Header(), resp.Header, false)
-	if hasBindings {
-		if redactor.Active() {
-			redactor.ScrubHeader(w.Header())
-		}
+	if redactor != nil {
+		redactor.ScrubHeader(w.Header())
 		// Always strip Content-Length on bound hosts before WriteHeader.
 		w.Header().Del("Content-Length")
 	}
@@ -705,12 +702,11 @@ func writeProxiedResponse(w http.ResponseWriter, resp *http.Response, hasBinding
 		w.Header().Add("Trailer", k)
 	}
 	w.WriteHeader(resp.StatusCode)
-
 	var (
 		bytesIn int64
 		copyErr error
 	)
-	if redactor != nil && redactor.Active() {
+	if redactor.Active() {
 		bytesIn, copyErr = copyStreamingRedacted(w, resp.Body, redactor)
 		redactor.ScrubHeader(resp.Trailer)
 	} else {
