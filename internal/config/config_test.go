@@ -217,6 +217,21 @@ func TestConfigValidationInvariants(t *testing.T) {
 			wantError: "dataplane.dhcp.lease_file",
 		},
 		{
+			name:      "reject duplicate ct_zone",
+			yaml:      strings.Replace(validYAML, "ct_zone: 102", "ct_zone: 101", 1),
+			wantError: "duplicate ct_zone 101",
+		},
+		{
+			name:      "reject duplicate route_table",
+			yaml:      strings.Replace(validYAML, "route_table: 102", "route_table: 101", 1),
+			wantError: "duplicate route_table 101",
+		},
+		{
+			name:      "reject duplicate interface",
+			yaml:      strings.Replace(validYAML, "interface: sbx1", "interface: sbx0", 1),
+			wantError: "duplicate interface",
+		},
+		{
 			name:      "reject missing ready_file when Linux link exists",
 			yaml:      strings.Replace(validYAML, "  ready_file: /run/gateway-dataplane/dataplane.ready\n", "", 1),
 			wantError: "dataplane.ready_file",
