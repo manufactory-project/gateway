@@ -266,7 +266,7 @@ func Apply(ctx context.Context, cfg *config.Config) error {
 
 func applyWithPaths(ctx context.Context, cfg *config.Config, procSysRoot string, expectedUID uint32) error {
 	if cfg.Dataplane.ReadyFile != "" {
-		if err := os.Remove(cfg.Dataplane.ReadyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := removeOwnedFile(cfg.Dataplane.ReadyFile, expectedUID); err != nil {
 			return fmt.Errorf("netsetup: remove stale ready_file %s: %w", cfg.Dataplane.ReadyFile, err)
 		}
 	}
@@ -322,21 +322,10 @@ func applyWithPaths(ctx context.Context, cfg *config.Config, procSysRoot string,
 	return nil
 }
 
-// writeOwnedFile ensures path's parent directory is a real (non-symlink) directory
-// owned by expectedUID with no group/other write permissions (creating it 0755 if
-// missing), refuses a symlink destination, and atomically replaces path via temp file + rename.
-func writeOwnedFile(path string, data []byte, expectedUID uint32) error {
-	dir := filepath.Dir(path)
+// verifyOwnedDir confirms dir is a real (non-symlink) directory owned by expectedUID
+// with no group or other write bits set.
+func verifyOwnedDir(dir string, expectedUID uint32) error {
 	dirInfo, err := os.Lstat(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
-			return fmt.Errorf("mkdir %s: %w", dir, mkErr)
-		}
-		if chErr := os.Chmod(dir, 0o755); chErr != nil {
-			return fmt.Errorf("chmod %s: %w", dir, chErr)
-		}
-		dirInfo, err = os.Lstat(dir)
-	}
 	if err != nil {
 		return fmt.Errorf("lstat dir %s: %w", dir, err)
 	}
@@ -355,6 +344,52 @@ func writeOwnedFile(path string, data []byte, expectedUID uint32) error {
 	}
 	if dirInfo.Mode().Perm()&0o022 != 0 {
 		return fmt.Errorf("directory %s has unsafe mode %04o (group/other writable)", dir, dirInfo.Mode().Perm())
+	}
+	return nil
+}
+
+// removeOwnedFile verifies path's parent directory is owned by expectedUID, not a
+// symlink, and not group/other writable, refuses a symlink path, and removes path if
+// present. A missing parent directory or missing file is not an error.
+func removeOwnedFile(path string, expectedUID uint32) error {
+	dir := filepath.Dir(path)
+	if err := verifyOwnedDir(dir, expectedUID); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lstat %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing symlink %s", path)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// writeOwnedFile ensures path's parent directory is a real (non-symlink) directory
+// owned by expectedUID with no group/other write permissions (creating it 0755 if
+// missing), refuses a symlink destination, and atomically replaces path via temp file + rename.
+func writeOwnedFile(path string, data []byte, expectedUID uint32) error {
+	dir := filepath.Dir(path)
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, mkErr)
+		}
+		if chErr := os.Chmod(dir, 0o755); chErr != nil {
+			return fmt.Errorf("chmod %s: %w", dir, chErr)
+		}
+	}
+	if err := verifyOwnedDir(dir, expectedUID); err != nil {
+		return err
 	}
 
 	if destInfo, lErr := os.Lstat(path); lErr == nil {
