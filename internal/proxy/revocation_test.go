@@ -1027,3 +1027,149 @@ func TestNewServerRequiresFlows(t *testing.T) {
 		t.Fatal("expected proxy.NewServer with Flows=nil to return an error")
 	}
 }
+
+func TestReloadFlowPathDecodingInvariants(t *testing.T) {
+	t.Run("utf8_path_survives_unchanged_reload", func(t *testing.T) {
+		streamOpen := make(chan struct{}, 2)
+		sendSecond := make(chan struct{})
+		release := make(chan struct{})
+		gw := newTestGateway(t, testGatewaySpec{
+			OnCleanupFirst: func() { close(release) },
+			Hosts:          []string{"utf8.example.com"},
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				rc := http.NewResponseController(w)
+				if _, err := io.WriteString(w, "data: one\n\n"); err != nil {
+					return
+				}
+				if err := rc.Flush(); err != nil {
+					return
+				}
+				streamOpen <- struct{}{}
+				select {
+				case <-sendSecond:
+					if _, err := io.WriteString(w, "data: two\n\n"); err != nil {
+						return
+					}
+					if err := rc.Flush(); err != nil {
+						return
+					}
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}),
+			RulesYAML: `
+  - id: allow-cafe
+    principal: worker-test
+    effect: allow
+    hosts: [utf8.example.com]
+    ports: [443]
+    paths: ["/files/café"]
+`,
+		})
+
+		resp, err := gw.H1Client(t, "utf8.example.com").Get("https://utf8.example.com/files/caf%C3%A9")
+		if err != nil {
+			t.Fatalf("GET /files/caf%%C3%%A9: %v", err)
+		}
+		defer func() {
+			if cErr := resp.Body.Close(); cErr != nil {
+				t.Logf("close resp: %v", cErr)
+			}
+		}()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		<-streamOpen
+
+		_, _, revoked, err := gw.Store.Reload()
+		if err != nil {
+			t.Fatalf("unchanged Reload: %v", err)
+		}
+		if revoked != 0 {
+			t.Fatalf("unchanged reload revoked %d flow(s) on /files/café, want 0", revoked)
+		}
+		close(sendSecond)
+		body, rErr := io.ReadAll(resp.Body)
+		if rErr != nil {
+			t.Fatalf("read surviving stream: %v", rErr)
+		}
+		if !strings.Contains(string(body), "data: two") {
+			t.Fatalf("stream did not receive post-reload data: %q", string(body))
+		}
+	})
+
+	t.Run("percent_encoded_ascii_revoked_when_reload_adds_deny", func(t *testing.T) {
+		streamOpen := make(chan struct{}, 2)
+		release := make(chan struct{})
+		gw := newTestGateway(t, testGatewaySpec{
+			OnCleanupFirst: func() { close(release) },
+			Hosts:          []string{"enc.example.com"},
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				if _, err := io.WriteString(w, "data: open\n\n"); err != nil {
+					return
+				}
+				if err := http.NewResponseController(w).Flush(); err != nil {
+					return
+				}
+				streamOpen <- struct{}{}
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}),
+			RulesYAML: `
+  - id: allow-all
+    principal: worker-test
+    effect: allow
+    hosts: [enc.example.com]
+    ports: [443]
+    paths: ["/**"]
+`,
+		})
+
+		conn := gw.DialTLS(t, "enc.example.com")
+		defer func() {
+			if cErr := conn.Close(); cErr != nil {
+				t.Logf("close conn: %v", cErr)
+			}
+		}()
+		if _, err := io.WriteString(conn, "GET /v1/%61dmin HTTP/1.1\r\nHost: enc.example.com\r\n\r\n"); err != nil {
+			t.Fatalf("write raw request: %v", err)
+		}
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /v1/%%61dmin resp=%+v err=%v", resp, err)
+		}
+		<-streamOpen
+
+		denyRule := `  - id: deny-admin
+    principal: worker-test
+    effect: deny
+    hosts: [enc.example.com]
+    ports: [443]
+    paths: ["/v1/admin"]
+`
+		if err := os.WriteFile(gw.CfgPath, []byte(gw.BaseYAML+denyRule), 0o600); err != nil {
+			t.Fatalf("write updated config: %v", err)
+		}
+		_, _, revoked, err := gw.Store.Reload()
+		if err != nil {
+			t.Fatalf("Reload with deny rule: %v", err)
+		}
+		if revoked != 1 {
+			t.Fatalf("reload adding deny /v1/admin revoked %d flow(s) for /v1/%%61dmin, want 1", revoked)
+		}
+		if _, rErr := io.Copy(io.Discard, resp.Body); rErr != nil {
+			t.Logf("revoked stream ended: %v", rErr)
+		}
+		if cErr := resp.Body.Close(); cErr != nil {
+			t.Logf("close resp: %v", cErr)
+		}
+		waitAuditCompletedError(t, gw, "/v1/%61dmin", "reload")
+	})
+}

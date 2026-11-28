@@ -542,7 +542,7 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		Host:      rc.host,
 		Port:      rc.dstPort,
 		Method:    rc.r.Method,
-		Path:      rc.r.URL.EscapedPath(),
+		Path:      rc.r.URL.Path,
 		RuleID:    rc.dec.RuleID,
 		GrantID:   rc.dec.GrantID,
 		Protocol:  rc.proto,
