@@ -1,6 +1,7 @@
 package proxy_test
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -72,6 +73,52 @@ func writeRawHTTP1(w http.ResponseWriter, raw string) {
 	_, writeErr := buf.WriteString(raw)
 	if err := errors.Join(writeErr, buf.Flush(), conn.Close()); err != nil {
 		panic(http.ErrAbortHandler)
+	}
+}
+
+func TestBoundHostStreamsHeadersAndEventsWhileUpstreamIsOpen(t *testing.T) {
+	secretFile := writeSecretFile(t, t.TempDir(), "key", "sk-"+strings.Repeat("a", 100))
+	sendEvent := make(chan struct{})
+	release := make(chan struct{})
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rc := http.NewResponseController(w)
+			w.Header().Set("Content-Type", "text/event-stream")
+			if err := rc.Flush(); err != nil {
+				return
+			}
+			select {
+			case <-sendEvent:
+			case <-r.Context().Done():
+				return
+			}
+			if _, err := io.WriteString(w, "data: first\n\n"); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}),
+		RulesYAML:      boundRule("r", "api.example.com", secretFile),
+		OnCleanupFirst: func() { close(release) },
+	})
+
+	// Headers arrive before the upstream has written any body.
+	resp := do(t, gw.H1Client(t, "api.example.com"), http.MethodGet, "https://api.example.com/events", nil)
+	close(sendEvent)
+
+	// A complete event arrives while the upstream response is still open.
+	br := bufio.NewReader(resp.Body)
+	for _, want := range []string{"data: first\n", "\n"} {
+		got, err := br.ReadString('\n')
+		if err != nil || got != want {
+			t.Fatalf("event line = %q, %v; want %q", got, err, want)
+		}
 	}
 }
 

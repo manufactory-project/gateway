@@ -739,6 +739,15 @@ func writeProxiedResponse(w http.ResponseWriter, resp *http.Response, redactor *
 		w.Header().Add("Trailer", k)
 	}
 	w.WriteHeader(resp.StatusCode)
+	// A streaming upstream may send headers long before its first body byte. A
+	// response of known length is not flushed here, so that an empty one still
+	// completes only after its completion audit is written.
+	if resp.ContentLength < 0 {
+		if err := flush(w); err != nil {
+			return 0, err
+		}
+	}
+
 	var (
 		bytesIn int64
 		copyErr error
@@ -941,8 +950,15 @@ func copyEndToEndHeaders(dst, src http.Header, keepWS bool) {
 	}
 }
 
+// flush pushes buffered response bytes to the guest.
+func flush(w http.ResponseWriter) error {
+	if err := http.NewResponseController(w).Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return err
+	}
+	return nil
+}
+
 func copyStreaming(w http.ResponseWriter, src io.Reader) (int64, error) {
-	rc := http.NewResponseController(w)
 	buf := make([]byte, 32<<10)
 	var total int64
 	for {
@@ -953,7 +969,7 @@ func copyStreaming(w http.ResponseWriter, src io.Reader) (int64, error) {
 			if writeErr != nil {
 				return total, writeErr
 			}
-			if flushErr := rc.Flush(); flushErr != nil && !errors.Is(flushErr, http.ErrNotSupported) {
+			if flushErr := flush(w); flushErr != nil {
 				return total, flushErr
 			}
 		}
@@ -967,15 +983,7 @@ func copyStreaming(w http.ResponseWriter, src io.Reader) (int64, error) {
 }
 
 func copyStreamingRedacted(w http.ResponseWriter, src io.Reader, redactor *secret.Redactor) (int64, error) {
-	rc := http.NewResponseController(w)
-	flushFn := func() error {
-		err := rc.Flush()
-		if errors.Is(err, http.ErrNotSupported) {
-			return nil
-		}
-		return err
-	}
-	sw := redactor.StreamWriter(w, flushFn)
+	sw := redactor.StreamWriter(w, func() error { return flush(w) })
 	buf := make([]byte, 32<<10)
 	for {
 		n, readErr := src.Read(buf)

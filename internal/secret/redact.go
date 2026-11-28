@@ -19,8 +19,7 @@ type needle struct {
 // secrets back to their inert placeholders across headers, streaming bodies,
 // and trailers.
 type Redactor struct {
-	needles []needle
-	maxLen  int
+	needles []needle // longest first
 }
 
 // NewRedactor builds a Redactor for pairs. Empty values are ignored.
@@ -71,13 +70,7 @@ func NewRedactor(pairs []Pair) *Redactor {
 		return bytes.Compare(needles[i].pattern, needles[j].pattern) < 0
 	})
 
-	maxLen := 0
-	for _, n := range needles {
-		if len(n.pattern) > maxLen {
-			maxLen = len(n.pattern)
-		}
-	}
-	return &Redactor{needles: needles, maxLen: maxLen}
+	return &Redactor{needles: needles}
 }
 
 // Active reports whether the redactor has any secret patterns to scrub.
@@ -95,45 +88,45 @@ func (r *Redactor) ScrubBytes(b []byte) []byte {
 	return emitted
 }
 
-// scan processes buf left-to-right matching longest secrets first.
-// When final is false, it stops before the last maxLen-1 raw bytes and returns
-// them as unscrubbed remainder so a shorter secret that is a prefix of a longer
-// secret cannot prematurely match and leak the longer secret's suffix across a
-// chunk boundary.
+// scan processes buf left-to-right matching longest secrets first. When final is
+// false it stops at the first position whose tail could still grow into a secret
+// and returns that tail as the unscrubbed remainder, so nothing else is delayed.
 func (r *Redactor) scan(buf []byte, final bool) (emitted []byte, remainder []byte) {
-	safeLimit := len(buf)
-	if !final {
-		keep := r.maxLen - 1
-		if keep < 0 {
-			keep = 0
+	out := make([]byte, 0, len(buf))
+	for i := 0; i < len(buf); {
+		tail := buf[i:]
+		if !final && r.mayExtend(tail) {
+			return out, append([]byte(nil), tail...)
 		}
-		if len(buf) <= keep {
-			return nil, append([]byte(nil), buf...)
+		if n, ok := r.match(tail); ok {
+			out = append(out, n.replacement...)
+			i += len(n.pattern)
+			continue
 		}
-		safeLimit = len(buf) - keep
+		out = append(out, buf[i])
+		i++
 	}
+	return out, nil
+}
 
-	out := make([]byte, 0, safeLimit)
-	i := 0
-	for i < safeLimit {
-		matched := false
-		for _, n := range r.needles {
-			if len(buf)-i >= len(n.pattern) && bytes.HasPrefix(buf[i:], n.pattern) {
-				out = append(out, n.replacement...)
-				i += len(n.pattern)
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			out = append(out, buf[i])
-			i++
+// mayExtend reports whether tail is a proper prefix of any secret pattern.
+func (r *Redactor) mayExtend(tail []byte) bool {
+	for _, n := range r.needles {
+		if len(n.pattern) > len(tail) && bytes.HasPrefix(n.pattern, tail) {
+			return true
 		}
 	}
-	if i < len(buf) {
-		remainder = append([]byte(nil), buf[i:]...)
+	return false
+}
+
+// match returns the longest secret pattern that b starts with.
+func (r *Redactor) match(b []byte) (needle, bool) {
+	for _, n := range r.needles {
+		if bytes.HasPrefix(b, n.pattern) {
+			return n, true
+		}
 	}
-	return out, remainder
+	return needle{}, false
 }
 
 // ScrubString replaces all matching secret forms in s with their placeholders.
@@ -167,7 +160,7 @@ func (r *Redactor) StreamWriter(dst io.Writer, flushFn func() error) *StreamWrit
 	}
 }
 
-// StreamWriter scrubs streaming bytes in constant O(maxPatternLen) tail memory.
+// StreamWriter scrubs streaming bytes, holding back at most one partial secret.
 type StreamWriter struct {
 	redactor *Redactor
 	dst      io.Writer
@@ -176,9 +169,8 @@ type StreamWriter struct {
 	written  int64
 }
 
-// Write appends raw p to the unscrubbed sliding window, emits only safe prefix
-// bytes where longest-match is unambiguous, and retains at most maxLen-1 raw
-// trailing bytes for cross-boundary matches.
+// Write appends raw p to the carried tail, emits every byte that cannot be part
+// of a still-incomplete secret, and carries the rest to the next call.
 func (sw *StreamWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
