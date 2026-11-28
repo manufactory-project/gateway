@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/netguard"
 )
 
@@ -445,5 +446,37 @@ func TestWebSocketUpgradeRefusedOnBoundHostAndSweepsHeaders(t *testing.T) {
 	}
 	if h.Get("Authorization") != "" {
 		t.Fatalf("Basic mf_ph_* Authorization leaked on WebSocket upgrade: %q", h.Get("Authorization"))
+	}
+}
+
+func TestTruncatedNonUpgradeResponseIsAuditedByClass(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"ws.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRawHTTP1(w, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+		}),
+		RulesYAML: `
+  - id: allow-ws
+    principal: worker-test
+    effect: allow
+    hosts: [ws.example.com]
+    ports: [443]
+    allow_websocket: true
+`,
+	})
+	resp := do(t, gw.H1Client(t, "ws.example.com"), http.MethodGet, "https://ws.example.com/ws",
+		map[string]string{"Connection": "Upgrade", "Upgrade": "websocket"})
+	// The abort follows the completion audit, so the failed read orders the check.
+	if body, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatalf("truncated response read cleanly: %q", body)
+	}
+	var got []string
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Kind == audit.KindWebSocket {
+			got = append(got, ev.Error)
+		}
+	}
+	if len(got) != 1 || got[0] != "upstream-error: connection-closed" {
+		t.Fatalf("websocket completion errors = %q, want [upstream-error: connection-closed]", got)
 	}
 }
