@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -35,7 +36,6 @@ import (
 	"github.com/manufactory-project/gateway/internal/ca"
 	"github.com/manufactory-project/gateway/internal/config"
 	"github.com/manufactory-project/gateway/internal/metrics"
-	"github.com/manufactory-project/gateway/internal/netguard"
 	"github.com/manufactory-project/gateway/internal/policy"
 	"github.com/manufactory-project/gateway/internal/proxy"
 )
@@ -401,9 +401,6 @@ metrics:
   listen: 127.0.0.1:%d
 http:
   max_header_bytes: 2048
-records:
-  stress.example.com: 127.0.0.1
-  ephemeral.example.com: 127.0.0.1
 dataplane:
   ready_file: /run/gateway-dataplane/dataplane.ready
   dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
@@ -453,14 +450,10 @@ rules:
 		}
 	})
 
-	guardDialer := netguard.NewDialer(netguard.Options{Store: store})
-	upPort := tcpPort(t, upSrv.Listener.Addr())
-	dialUp := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		return guardDialer.DialHost(ctx, network, host, upPort)
+	upAddr := upSrv.Listener.Addr().String()
+	dialUp := func(ctx context.Context, network, _ string, _ netip.Addr) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, upAddr)
 	}
 
 	eval := policy.NewEvaluator(store)
@@ -939,7 +932,7 @@ func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.C
 	pSrv, err := proxy.NewServer(proxy.Options{
 		Link: store.Current().Config.Links[0], Store: store, Evaluator: eval,
 		Leaves: ca.NewLeafCache(rootCA), Audit: aw, Flows: flows, OnServeError: func(error) {},
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network, _ string, _ netip.Addr) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, upAddr)
 		},

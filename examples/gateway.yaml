@@ -38,9 +38,6 @@ http:
   max_conns_per_link: 512
   upstream_response_header_timeout: 10m
 
-records:
-  forge.internal.example: <forge-ip>
-
 links:
   - name: sbx0
     interface: sbx0
@@ -87,6 +84,9 @@ rules:
         scheme: basic
         placeholder: mf_ph_forgejo_token
         secret_file: /run/credentials/gateway/forgejo-token
+    # The forge is on the LAN: dial this address, only for requests this rule allows.
+    pins:
+      forge.internal.example: <forge-ip>
 
   - id: codex-chatgpt-ws
     principal: worker-codex

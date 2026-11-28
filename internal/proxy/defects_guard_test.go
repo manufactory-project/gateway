@@ -533,31 +533,32 @@ func TestWebSocketDefaultEgressCapAppliesWhenRuleOmitsCap(t *testing.T) {
 	}
 }
 
-func TestHostWideDenyWithPathScopedAllowEndToEnd(t *testing.T) {
+// A deny with no ports covers port 80 as well as 443: the zone is allowed on both,
+// one name in it is denied, and neither DNS nor either port reaches it.
+func TestDenyWithoutPortsRefusesDNSAndBothPortsEndToEnd(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, "allowed-ok"); err != nil {
+			return
+		}
+	})
 	gw := newTestGateway(t, testGatewaySpec{
-		Hosts: []string{"example.com"},
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			if _, err := io.WriteString(w, "allowed-ok"); err != nil {
-				return
-			}
-		}),
+		Hosts:        []string{"good.example.com", "evil.example.com"},
+		Handler:      handler,
+		PlainHandler: handler,
 		RulesYAML: `
-  - id: deny-example
-    principal: worker-test
-    effect: deny
-    hosts: [example.com]
-    ports: [443]
-  - id: allow-example-ok
+  - id: allow-zone
     principal: worker-test
     effect: allow
-    hosts: [example.com]
-    ports: [443]
-    paths: ["/ok"]
+    hosts: ["*.example.com"]
+    ports: [80, 443]
+  - id: deny-evil
+    principal: worker-test
+    effect: deny
+    hosts: [evil.example.com]
 `,
 	})
 
-	// 1. Real fake-IP DNS resolves example.com (NOERROR + A record).
 	link := gw.Store.Current().Config.Links[0]
 	alloc, err := gwdns.NewAllocator(netip.MustParsePrefix("198.18.0.0/15"))
 	if err != nil {
@@ -585,35 +586,56 @@ func TestHostWideDenyWithPathScopedAllowEndToEnd(t *testing.T) {
 		}
 	})
 	dnsAddr := net.JoinHostPort(link.ParsedGatewayIP.String(), strconv.Itoa(int(link.DNSPort)))
-	q := new(mdns.Msg)
-	q.SetQuestion("example.com.", mdns.TypeA)
-	ans, _, err := (&mdns.Client{Net: "udp", Timeout: 2 * time.Second}).Exchange(q, dnsAddr)
-	if err != nil || ans.Rcode != mdns.RcodeSuccess || len(ans.Answer) != 1 {
-		t.Fatalf("DNS query example.com = (ans=%+v, err=%v), want NOERROR with 1 A record", ans, err)
+	query := func(name string) *mdns.Msg {
+		q := new(mdns.Msg)
+		q.SetQuestion(name+".", mdns.TypeA)
+		ans, _, qErr := (&mdns.Client{Net: "udp", Timeout: 2 * time.Second}).Exchange(q, dnsAddr)
+		if qErr != nil {
+			t.Fatalf("DNS %s: %v", name, qErr)
+		}
+		return ans
+	}
+	get := func(client *http.Client, url string) (int, string) {
+		resp, gErr := client.Get(url)
+		if gErr != nil {
+			return 0, gErr.Error()
+		}
+		body, rErr := io.ReadAll(resp.Body)
+		if cErr := resp.Body.Close(); cErr != nil || rErr != nil {
+			t.Fatalf("read %s: %v %v", url, rErr, cErr)
+		}
+		return resp.StatusCode, string(body)
 	}
 
-	// 2. TLS handshake succeeds, GET /ok -> 200, GET /other -> 403.
-	client := gw.H1Client(t, "example.com")
-	rOK, err := client.Get("https://example.com/ok")
-	if err != nil {
-		t.Fatalf("GET /ok: %v", err)
+	// Positive control: the rest of the zone resolves and is served on both ports.
+	if ans := query("good.example.com"); ans.Rcode != mdns.RcodeSuccess || len(ans.Answer) != 1 {
+		t.Fatalf("DNS good.example.com = %+v, want NOERROR with 1 A record", ans)
 	}
-	if err := rOK.Body.Close(); err != nil {
-		t.Fatalf("close /ok: %v", err)
+	if code, body := get(gw.H1Client(t, "good.example.com"), "https://good.example.com/"); code != http.StatusOK || body != "allowed-ok" {
+		t.Fatalf("https good.example.com = %d %q, want 200 allowed-ok", code, body)
 	}
-	if rOK.StatusCode != http.StatusOK {
-		t.Fatalf("GET /ok status = %d, want 200", rOK.StatusCode)
+	if code, body := get(gw.PlainClient(t), "http://good.example.com/"); code != http.StatusOK || body != "allowed-ok" {
+		t.Fatalf("http good.example.com = %d %q, want 200 allowed-ok", code, body)
 	}
 
-	rOther, err := client.Get("https://example.com/other")
-	if err != nil {
-		t.Fatalf("GET /other: %v", err)
+	// Containment: the denied name is refused at DNS and on port 80 and 443.
+	if ans := query("evil.example.com"); ans.Rcode != mdns.RcodeRefused {
+		t.Fatalf("DNS evil.example.com = %+v, want REFUSED", ans)
 	}
-	if err := rOther.Body.Close(); err != nil {
-		t.Fatalf("close /other: %v", err)
+	if code, body := get(gw.PlainClient(t), "http://evil.example.com/"); code != http.StatusForbidden || !strings.Contains(body, "rule-deny") {
+		t.Fatalf("http evil.example.com = %d %q, want 403 rule-deny", code, body)
 	}
-	if rOther.StatusCode != http.StatusForbidden {
-		t.Fatalf("GET /other status = %d, want 403", rOther.StatusCode)
+	if code, body := get(gw.H1Client(t, "evil.example.com"), "https://evil.example.com/"); code != 0 {
+		t.Fatalf("https evil.example.com = %d %q, want a failed TLS handshake", code, body)
+	}
+	denied := map[int]bool{}
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Host == "evil.example.com" && ev.Effect == audit.EffectDeny && ev.RuleID == "deny-evil" {
+			denied[ev.Port] = true
+		}
+	}
+	if !denied[80] || !denied[443] {
+		t.Fatalf("audit lacks deny-evil refusals on both ports: %v", denied)
 	}
 }
 

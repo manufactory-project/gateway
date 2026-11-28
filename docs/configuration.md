@@ -72,39 +72,56 @@ rules:
 | `principal` | yes | | A principal declared by a link |
 | `effect` | yes | | `allow` or `deny` |
 | `hosts` | yes | | Exact hostnames, or `*.zone.tld`. No IP addresses |
-| `ports` | no | `[443]` | 80 and 443 only |
+| `ports` | no | `[443]` for `allow`, `[80, 443]` for `deny` | 80 and 443 only |
 | `methods` | no | any method | HTTP methods |
 | `paths` | no | any path | Path patterns |
 | `allow_websocket` | no | `false` | Permit WebSocket upgrades |
 | `ws_max_egress_bytes` | no | `http.ws_max_egress_bytes` | Bytes a guest may send on one WebSocket. 0 means the default |
 | `bindings` | no | none | [Secrets](#secrets) |
+| `pins` | no | none | [Pins](#pins) |
 
-A guest can resolve a name only if some rule or grant allows that name on port 80 or 443.
+A guest can resolve a name only if some rule or grant allows that name on port 80 or 443, and no `deny` covers it.
+
+A key that narrows a rule must not be empty: `hosts: []`, `ports: []`, `methods: []` and `paths: []` are errors, not "any". Leave the key out to get its default. A `deny` without `ports` therefore covers port 80 as well as 443.
 
 ### Hosts
 
-`*.example.com` matches any name under `example.com`, at any depth, but not `example.com` itself. The part after `*.` needs at least two labels, so `*.com` is rejected.
+`*.example.com` matches any name under `example.com`, at any depth, but not `example.com` itself. The part after `*.` needs at least two labels, and must not be a public suffix, so `*.com`, `*.co.uk` and `*.github.io` are rejected; name a registrable domain such as `*.example.co.uk`.
 
 A wildcard lets a guest choose DNS labels that reach the zone's name servers, which can carry data out. Prefer exact names.
 
 ### Paths
 
-A path pattern starts with `/`. `*` matches within one segment and `**` matches across segments. A pattern may hold one `**` and up to four `*` per segment. Patterns are matched against the decoded path; the query string is not matched.
+A path pattern starts with `/`. `*` matches within one segment and `**` matches across segments. A pattern may hold one `**` and up to four `*` per segment. A pattern ending in `/**` also matches the path without it: `/v1/admin/**` matches `/v1/admin`. Patterns are matched against the decoded path; the query string is not matched. Matching is case-sensitive and exact: `/Admin` is not `/admin`, so deny every spelling your upstream treats alike, or allow only exact paths.
 
-`gateway` also refuses some requests before rules are consulted, including paths with `..`, `//`, `/./`, a backslash, or an encoded `/` or `\`.
+### Request validation
+
+`gateway` refuses some requests with `403`, and records the reason in the audit log, before rules are consulted:
+
+- `CONNECT`, `*` and absolute-URI targets, and `Upgrade` other than an allowed WebSocket.
+- Paths with `..`, `//`, `/./`, a backslash, or an encoded `/` or `\` (`%2f`, `%5c`).
+- Methods that are not already upper case (`get`, `Get`). A method is forwarded as sent, and rules match it upper-cased.
+- Paths that are not valid UTF-8, hold a control byte (below `0x20`, or `0x7f`, including `%00`), or have a segment that starts or ends with a space (`/admin%20`). Servers strip or re-read these.
+- Paths with a `;`, plain or encoded (`%3b`). Tomcat, Spring and Jetty drop `;params` from path segments, so `/v1/public/..;/admin` would reach `/admin` after the gateway matched it against `/v1/**`.
+- Paths with double encoding: `%25` followed by two hex digits, such as `%252e`. A server that decodes twice turns `%252e%252e` into `..`. A `%25` followed by anything else (`/files/100%25`) is a literal percent sign and passes.
+
+A `;` or an encoded escape in the query string is not refused. Rules match the path as the gateway received it, so an upstream that rewrites paths in other ways is outside what path rules can protect.
 
 ### Which rule wins
 
-Among the rules and grants that match, the most specific one decides. Compare in this order:
+1. **A matching `deny` wins.** If any `deny` rule matches the request, it is refused, whatever `allow` rules or temporary grants also match and however specific they are. A `deny` is absolute.
+2. Otherwise the most specific matching `allow` rule or grant decides. Compare in this order:
+   1. Host: an exact name beats a wildcard, and a longer wildcard beats a shorter one.
+   2. A rule with `paths` beats one without.
+   3. Between path patterns, an exact path beats a pattern with `*`. Between patterns with `*`, more literal characters win.
+   4. A rule with `methods` beats one without.
 
-1. Host: an exact name beats a wildcard, and a longer wildcard beats a shorter one.
-2. A rule with `paths` beats one without.
-3. Between path patterns, an exact path beats a pattern with `*`. Between patterns with `*`, more literal characters win.
-4. A rule with `methods` beats one without.
+   If two are still tied, the earlier rule in the file wins, and a rule wins over a grant. The winner matters for [secrets](#secrets), [pins](#pins) and WebSockets, which apply only when the winning rule owns them.
+3. If nothing matches, the request is refused.
 
-If two are still tied, `deny` wins.
+A `deny` is not narrowed by a more specific `allow`. To allow only part of a host, narrow the `allow` and leave the host alone: allow `api.example.com` with `paths: ["/v1/**"]` and it refuses everything else by default. Use a `deny` for what must stay closed whatever else is added later, such as `methods: [DELETE]`.
 
-A narrow `allow` therefore beats a broad `deny`: with a `deny` for all of `api.example.com` and an `allow` for its `/v1/**`, requests under `/v1/` are allowed. A `deny` that lists `methods` or `paths` applies to HTTP requests only; it does not block the DNS lookup or the TLS handshake.
+A `deny` that lists `methods` or `paths` applies to HTTP requests only; it does not block the DNS lookup or the TLS handshake. A `deny` that lists neither blocks the name itself, on the ports it lists.
 
 ## Secrets
 
@@ -170,18 +187,25 @@ A host with a binding is a bound host for every principal. On each request to it
 - It removes `Range` and `If-Range` and asks for an uncompressed response. A compressed or partial (`206`) response is answered with `502`.
 - It replaces echoed secrets in the response with their placeholders. The [threat model](threat-model.md#goal-2-keep-secrets-out-of-the-guest) lists what that misses.
 
-## Records
+## Pins
 
-`records` maps an exact hostname to one IP address. `gateway` then connects to that address without a DNS lookup, even if it is private.
+A rule may pin hosts it covers to an address. `gateway` then connects to that address without a DNS lookup, even if it is private. This is how a LAN service is reached without opening the private address space.
 
 ```yaml
-records:
-  forge.internal.example: 10.0.0.20
+rules:
+  - id: guest0-forge
+    principal: guest0
+    effect: allow
+    hosts: [forge.internal.example]
+    pins:
+      forge.internal.example: 10.0.0.20
 ```
 
-A record grants no access by itself: a rule must still allow the host. Records apply to every principal, so any principal allowed that host reaches the address.
+A pin applies only to requests that its rule decides, for its principal. A request for the same host that a different rule or a grant decides is resolved normally and is refused if the name resolves to a private address. Pinned connections are never reused for another request, so every pinned request opens a new upstream connection.
 
-Upstream TLS certificates are always checked against the gateway's system roots. If the address uses a private CA, install that CA on the gateway.
+A pin's host must be an exact name that one of the rule's `hosts` covers. The address must be unicast. These are refused: loopback, `0.0.0.0/8`, link-local (including `169.254.0.0/16`), multicast, anything inside `dns.fake_cidr`, anything inside a link's subnet (which includes every `gateway_ip`), and IPv6 outside global unicast `2000::/3` and unique local `fc00::/7`. Private RFC 1918, carrier-grade NAT (`100.64.0.0/10`) and unique local addresses are the intended use and are accepted.
+
+A rule that pins grants no access by itself, and is subject to every `deny`. Upstream TLS certificates are always checked against the gateway's system roots. If the address uses a private CA, install that CA on the gateway.
 
 ## Other settings
 
@@ -204,7 +228,7 @@ Upstream TLS certificates are always checked against the gateway's system roots.
 | `max_total_bytes` | no | 10737418240 (10 GiB) | Size limit for the directory; oldest files go first |
 | `stdout_json` | no | `false` | Also write records to stdout |
 
-A value of 0 selects the default. Both limits are applied when a new file is opened, and the file being written is never deleted, so the directory can exceed the total limit between rotations.
+A value of 0 selects the default. `max_file_bytes` must not exceed `max_total_bytes`. Both limits are applied when a new file is opened, and the file being written is never deleted, so the directory can exceed the total limit between rotations.
 
 ### `admin` and `metrics`
 
@@ -235,8 +259,19 @@ Keep `state_file` on storage that survives reboots. If you move or delete it and
 
 | Key | Default | Value |
 |---|---|---|
-| `fake_cidr` | `198.18.0.0/15` | IPv4 range for the placeholder addresses guests receive, `/30` or larger |
+| `fake_cidr` | `198.18.0.0/15` | IPv4 range for the placeholder addresses guests receive, `/30` or larger. Must not overlap any link's `subnet` |
 | `ttl_seconds` | 60 | TTL of those answers |
+
+Guests connect to these addresses, and `gateway` redirects the connection, so the range never carries real traffic and `gateway` never dials an address inside it.
+
+Some clients refuse to connect to special-purpose addresses before they ever reach the network. What the default meets:
+
+- Python `ipaddress`: `198.18.0.0/15` is `is_private` and not `is_global`. `100.64.0.0/10` is neither private nor global.
+- `ipaddr.js` and the Node filters built on it (`ssrf-req-filter`, `request-filtering-agent`) accept only the `unicast` range name. They refuse `198.18.0.0/15` (`reserved`) and `100.64.0.0/10` (`carrierGradeNat`).
+- Go libraries that follow the IANA special-purpose registry, such as `code.dny.dev/ssrf`, refuse both. Filters built on `netip.Addr.IsPrivate` accept both.
+- Gemini CLI's web fetch refuses `198.18.0.0/15` by name and every non-`unicast` `ipaddr.js` range.
+
+No special-purpose range passes a strict filter, so no default can be accepted everywhere. The default stays `198.18.0.0/15`, which no real host uses and no guest can reach. If a client in your guests refuses it, set `fake_cidr` to a globally routable range that nothing in your guests needs to reach directly. That is safe here, because every guest connection on ports 80 and 443 goes to the gateway, but a name that really resolves into the range then cannot be reached.
 
 ### `http`
 
@@ -262,7 +297,7 @@ If the new file is invalid or changes a setting that needs a restart, the comman
 
 | Applied on reload | Needs a restart |
 |---|---|
-| `rules`, `records`, `dns.ttl_seconds`, `http.max_request_body_bytes`, `http.ws_max_egress_bytes` | `links`, `ca`, `audit`, `admin`, `metrics`, `dataplane`, `dns.fake_cidr`, `http.max_header_bytes`, `http.max_conns_per_link`, `http.upstream_response_header_timeout` |
+| `rules` (including `pins`), `dns.ttl_seconds`, `http.max_request_body_bytes`, `http.ws_max_egress_bytes` | `links`, `ca`, `audit`, `admin`, `metrics`, `dataplane`, `dns.fake_cidr`, `http.max_header_bytes`, `http.max_conns_per_link`, `http.upstream_response_header_timeout` |
 
 A successful reload:
 
@@ -280,7 +315,7 @@ A grant allows one exact host for one principal until it expires. It exists only
 gateway grant --principal guest0 --host example.com --ttl 5m
 ```
 
-The port defaults to 443 and the TTL to `5m`; `--methods` and `--paths` take comma-separated lists. A grant competes with rules under [the same precedence](#which-rule-wins) and carries no secrets.
+The port defaults to 443 and the TTL to `5m`; `--methods` and `--paths` take comma-separated lists. A grant competes with the `allow` rules under [the same precedence](#which-rule-wins), is overridden by any `deny`, and carries no secrets or pins.
 
 The CLI cannot grant WebSocket access. Use the admin API, where `ttl` is required:
 
@@ -289,7 +324,7 @@ curl --unix-socket /run/gateway/admin.sock http://localhost/v1/grants \
   -d '{"principal":"guest0","host":"example.com","ttl":"5m","allow_websocket":true}'
 ```
 
-`gateway grant revoke <id>` removes a grant and closes its connections. `gateway revoke --flow ID` or `--principal NAME [--host HOST]` only closes current connections; the guest can open new ones. To remove access that rules give, remove every allow rule that covers it and reload. A `deny` loses to a more specific `allow`.
+`gateway grant revoke <id>` removes a grant and closes its connections. `gateway revoke --flow ID` or `--principal NAME [--host HOST]` only closes current connections; the guest can open new ones. To remove access that rules give, add a `deny` that covers it, or remove the allow rules, and reload. A `deny` wins over every allow rule and grant.
 
 ## Paths used by the systemd units
 

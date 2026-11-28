@@ -40,8 +40,6 @@ dataplane:
     user: dnsmasq
     lease_file: /var/lib/gateway/dnsmasq.leases
     config_path: /run/gateway-dataplane/dnsmasq.conf
-records:
-  forge.internal.example: 10.10.20.5
 links:
   - name: sbx0
     interface: sbx0
@@ -70,6 +68,8 @@ rules:
         scheme: basic
         placeholder: mf_ph_forgejo
         secret_file: /run/credentials/gateway/forgejo
+    pins:
+      forge.internal.example: 10.10.20.5
   - id: codex-ws
     principal: worker-codex
     effect: allow
@@ -97,8 +97,8 @@ func TestParseValidAndDefaults(t *testing.T) {
 	if cfg.HTTP.WSMaxEgressBytes != config.DefaultWSMaxEgressBytes {
 		t.Fatalf("default ws_max_egress_bytes = %d, want %d", cfg.HTTP.WSMaxEgressBytes, config.DefaultWSMaxEgressBytes)
 	}
-	if got := cfg.ParsedRecords["forge.internal.example"].String(); got != "10.10.20.5" {
-		t.Fatalf("parsed record = %q, want 10.10.20.5", got)
+	if got := cfg.Rules[0].ParsedPins["forge.internal.example"].String(); got != "10.10.20.5" {
+		t.Fatalf("parsed pin = %q, want 10.10.20.5", got)
 	}
 }
 
@@ -524,7 +524,7 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 		})
 	}
 
-	// Positive control: hot-reloading rules/records and per-request HTTP limits succeeds and wipes grants.
+	// Positive control: hot-reloading rules and per-request HTTP limits succeeds and wipes grants.
 	ruleUpdated := strings.Replace(validYAML, "deb.debian.org", "security.debian.org", 1) + "\nhttp:\n  max_request_body_bytes: 1048576\n  ws_max_egress_bytes: 2097152\n"
 	if err := os.WriteFile(cfgPath, []byte(ruleUpdated), 0o600); err != nil {
 		t.Fatalf("write ruleUpdated: %v", err)

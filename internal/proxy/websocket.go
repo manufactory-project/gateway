@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +33,7 @@ func wsCancelOrErr(af *activeFlow, ctx context.Context, fallback string) (status
 }
 
 func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activeFlow) {
-	upConn, err := s.dialWebSocketUpstream(rc.r.Context(), rc.host, rc.dstPort)
+	upConn, err := s.dialWebSocketUpstream(rc.r.Context(), rc.host, rc.dstPort, rc.dec.PinnedIP)
 	if err != nil {
 		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), upstreamErrorText(err))
 		rc.auditCompleted(status, 0, 0, errText)
@@ -105,13 +106,13 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	rc.auditCompleted(http.StatusSwitchingProtocols, bytesOut, bytesIn, errText)
 }
 
-func (s *Server) dialWebSocketUpstream(ctx context.Context, host string, dstPort uint16) (net.Conn, error) {
-	return s.dialWebSocketUpstreamWithTimeout(ctx, host, dstPort, wsHandshakeTimeout)
+func (s *Server) dialWebSocketUpstream(ctx context.Context, host string, dstPort uint16, pin netip.Addr) (net.Conn, error) {
+	return s.dialWebSocketUpstreamWithTimeout(ctx, host, dstPort, pin, wsHandshakeTimeout)
 }
 
-func (s *Server) dialWebSocketUpstreamWithTimeout(ctx context.Context, host string, dstPort uint16, tlsTimeout time.Duration) (net.Conn, error) {
+func (s *Server) dialWebSocketUpstreamWithTimeout(ctx context.Context, host string, dstPort uint16, pin netip.Addr, tlsTimeout time.Duration) (net.Conn, error) {
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
-	rawUpstream, err := s.dialContext(ctx, "tcp", targetAddr)
+	rawUpstream, err := s.dial(ctx, "tcp", targetAddr, pin)
 	if err != nil {
 		return nil, err
 	}

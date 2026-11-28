@@ -280,7 +280,7 @@ func TestWebSocketDeniedOnBoundHostPolicyDefenseInDepth(t *testing.T) {
 	}
 }
 
-func TestPathScopedAllowOverridesHostDenyAndDecideDNSPreservesRuleDeny(t *testing.T) {
+func TestHostDenyBeatsPathScopedAllowAndDecideDNSPreservesRuleDeny(t *testing.T) {
 	yamlCfg := `
 ca:
   cert_path: /tmp/ca.crt
@@ -310,6 +310,12 @@ rules:
     hosts: ["example.com"]
     ports: [443]
     paths: ["/ok"]
+  - id: allow-free-ok
+    principal: worker-a
+    effect: allow
+    hosts: ["free.example.org"]
+    ports: [443]
+    paths: ["/ok"]
   - id: deny-blocked
     principal: worker-a
     effect: deny
@@ -319,19 +325,25 @@ rules:
 	st := makeStore(t, yamlCfg, time.Now)
 	ev := policy.NewEvaluator(st)
 
-	// Path-scoped allow on exact host beats host-wide deny at DNS and SNI scope,
-	// while request scope still enforces /ok vs /other.
-	if d := ev.DecideDNS("worker-a", "example.com"); !d.Allow || d.RuleID != "allow-example-ok" {
-		t.Fatalf("DecideDNS(example.com) = %+v, want allow by allow-example-ok", d)
+	// A host-wide deny is absolute: the narrower path-scoped allow on the same
+	// host changes nothing at DNS, SNI or request scope.
+	if d := ev.DecideDNS("worker-a", "example.com"); d.Allow || d.Reason != "rule-deny" || d.RuleID != "deny-example" {
+		t.Fatalf("DecideDNS(example.com) = %+v, want rule-deny by deny-example", d)
 	}
-	if d := ev.DecideHost("worker-a", "example.com", 443); !d.Allow || d.RuleID != "allow-example-ok" {
-		t.Fatalf("DecideHost(example.com, 443) = %+v, want allow by allow-example-ok", d)
+	if d := ev.DecideHost("worker-a", "example.com", 443); d.Allow || d.RuleID != "deny-example" {
+		t.Fatalf("DecideHost(example.com, 443) = %+v, want rule-deny by deny-example", d)
 	}
-	if d := ev.DecideRequest("worker-a", "example.com", 443, "GET", "/ok"); !d.Allow || d.RuleID != "allow-example-ok" {
-		t.Fatalf("DecideRequest(/ok) = %+v, want allow", d)
+	for _, reqPath := range []string{"/ok", "/other"} {
+		if d := ev.DecideRequest("worker-a", "example.com", 443, "GET", reqPath); d.Allow || d.Reason != "rule-deny" || d.RuleID != "deny-example" {
+			t.Fatalf("DecideRequest(%s) = %+v, want rule-deny by deny-example", reqPath, d)
+		}
 	}
-	if d := ev.DecideRequest("worker-a", "example.com", 443, "GET", "/other"); d.Allow || d.Reason != "rule-deny" || d.RuleID != "deny-example" {
-		t.Fatalf("DecideRequest(/other) = %+v, want rule-deny by deny-example", d)
+	// Positive control: the same allow, on a host with no deny, admits /ok and only /ok.
+	if d := ev.DecideRequest("worker-a", "free.example.org", 443, "GET", "/ok"); !d.Allow || d.RuleID != "allow-free-ok" {
+		t.Fatalf("DecideRequest(free.example.org /ok) = %+v, want allow by allow-free-ok", d)
+	}
+	if d := ev.DecideRequest("worker-a", "free.example.org", 443, "GET", "/other"); d.Allow {
+		t.Fatalf("DecideRequest(free.example.org /other) = %+v, want denied", d)
 	}
 
 	// Explicit rule-deny is preserved by DecideDNS instead of collapsing to default-deny.

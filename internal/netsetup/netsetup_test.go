@@ -26,19 +26,24 @@ func loadExampleConfig(t *testing.T) *config.Config {
 	if err != nil {
 		t.Fatalf("read examples/gateway.yaml: %v", err)
 	}
-	// Example config must use <forge-ip> placeholder and never hardcode a literal IPv4 in records:.
+	// Example config must use <forge-ip> placeholder and never hardcode a literal IPv4 in a rule's pins:.
 	if !strings.Contains(string(raw), "<forge-ip>") {
 		t.Fatal("examples/gateway.yaml must contain <forge-ip> placeholder")
 	}
 	var doc struct {
-		Records map[string]string `yaml:"records"`
+		Rules []struct {
+			ID   string            `yaml:"id"`
+			Pins map[string]string `yaml:"pins"`
+		} `yaml:"rules"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("unmarshal records from examples/gateway.yaml: %v", err)
+		t.Fatalf("unmarshal rules from examples/gateway.yaml: %v", err)
 	}
-	for host, val := range doc.Records {
-		if addr, err := netip.ParseAddr(strings.TrimSpace(val)); err == nil && addr.Is4() {
-			t.Fatalf("examples/gateway.yaml records[%q] must not contain literal IPv4 address %q", host, val)
+	for _, r := range doc.Rules {
+		for host, val := range r.Pins {
+			if addr, err := netip.ParseAddr(strings.TrimSpace(val)); err == nil && addr.Is4() {
+				t.Fatalf("examples/gateway.yaml rules[%s].pins[%q] must not contain literal IPv4 address %q", r.ID, host, val)
+			}
 		}
 	}
 	replaced := strings.ReplaceAll(string(raw), "<forge-ip>", "10.10.20.5")

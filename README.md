@@ -224,7 +224,7 @@ A [removed link](docs/configuration.md#removing-a-link) stays blocked until you 
 Examples:
 
 - [examples/two-links.yaml](examples/two-links.yaml): two guests, one allowed host each
-- [examples/gateway.yaml](examples/gateway.yaml): secrets, WebSockets and a static DNS record. It does not load until you replace `<forge-ip>`, and its binding needs a secret file at `/run/credentials/gateway/forgejo-token`, which nothing creates for you
+- [examples/gateway.yaml](examples/gateway.yaml): secrets, WebSockets and a pinned LAN address. It does not load until you replace `<forge-ip>`, and its binding needs a secret file at `/run/credentials/gateway/forgejo-token`, which nothing creates for you
 - [examples/workers.yaml](examples/workers.yaml): path rules for three coding agent CLIs, with [notes](examples/workers.md)
 
 ## Operate

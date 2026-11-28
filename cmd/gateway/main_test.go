@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -842,7 +843,7 @@ rules:
 	}
 	eval := policy.NewEvaluator(store)
 	leaves := ca.NewLeafCache(mitmCA)
-	dialer := netguard.NewDialer(netguard.Options{Store: store})
+	dialer := netguard.NewDialer(netguard.Options{FakePrefix: cfg.FakePrefix})
 	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, rt.reportServeErr); err != nil {
 		t.Fatalf("startLinks: %v", err)
 	}
@@ -1001,7 +1002,7 @@ links:
 		Leaves:       ca.NewLeafCache(mitmCA),
 		Flows:        flows,
 		OnServeError: func(error) {},
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network, _ string, _ netip.Addr) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, upSrv.Listener.Addr().String())
 		},

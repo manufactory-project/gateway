@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/audit"
-	"github.com/manufactory-project/gateway/internal/netguard"
 )
 
 func wsEchoHandler(w http.ResponseWriter, r *http.Request) {
@@ -250,13 +249,13 @@ func TestWebSocketGuestDisconnectDuringHandshakeClosesUpstreamAndUnregistersFlow
     ports: [443]
     allow_websocket: true
 `,
-		DialOverride: func(guard *netguard.Dialer, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
+		DialOverride: func(guard guardDial, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return func(ctx context.Context, network, addr string) (net.Conn, error) {
 				h, _, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
 				}
-				return guard.DialHost(ctx, network, h, silentPort)
+				return guard(ctx, network, h, silentPort)
 			}
 		},
 	})

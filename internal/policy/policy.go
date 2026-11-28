@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Package policy implements pure, I/O-free default-deny egress policy evaluation
-// per link principal, including specificity ranking (exact > wildcard; deny beats allow
-// on ties) and live in-memory ephemeral TTL grants.
+// per link principal: any matching deny wins, otherwise the most specific allow
+// rule or live in-memory ephemeral TTL grant decides.
 package policy
 
 import (
@@ -25,6 +25,9 @@ type Decision struct {
 	HasBindings      bool
 	MatchedBindings  []config.BindingConfig
 	HostBindings     []config.BindingConfig
+	// PinnedIP is the address the deciding rule pins for the host, or the zero
+	// Addr. Only a request decided by that rule may dial it.
+	PinnedIP netip.Addr
 }
 
 type compiledRule struct {
@@ -38,6 +41,7 @@ type compiledRule struct {
 	allowWebSocket   bool
 	wsMaxEgressBytes int64
 	bindings         []config.BindingConfig
+	pins             map[string]netip.Addr
 }
 
 type hostPattern struct {
@@ -102,6 +106,7 @@ func compileConfig(cfg *config.Config) *compiledSet {
 			allowWebSocket:   r.AllowWebSocket,
 			wsMaxEgressBytes: r.WSMaxEgressBytes,
 			bindings:         slices.Clone(r.Bindings),
+			pins:             r.ParsedPins,
 		}
 		for _, h := range r.Hosts {
 			hp := hostPattern{raw: h}
@@ -164,25 +169,32 @@ func (e *Evaluator) decide(principal, rawHost string, port uint16, hostScope boo
 	if !ok {
 		return Decision{Allow: false, Reason: "invalid-host"}
 	}
-	methodUpper := ""
+	q := query{host: host, port: port, hostScope: hostScope}
 	if !hostScope {
 		if !strings.HasPrefix(reqPath, "/") {
 			return Decision{Allow: false, Reason: "invalid-path"}
 		}
-		methodUpper = strings.ToUpper(method)
+		q.method = strings.ToUpper(method)
+		q.path = reqPath
 	}
 
 	cs := e.currentCompiled()
-	grants := e.store.ActiveGrants()
 	hostBindings := slices.Clone(cs.boundHosts[host])
 	hasBindings := len(hostBindings) > 0
+	rules := cs.byPrincipal[principal]
 
-	best, hasBest := matchBestCandidate(cs, grants, principal, host, port, hostScope, methodUpper, reqPath)
+	// A matching deny is absolute: no allow rule or grant, however specific, overrides it.
+	for _, r := range rules {
+		if !r.allow {
+			if _, ok := r.match(q); ok {
+				return Decision{Allow: false, RuleID: r.id, Reason: "rule-deny", HasBindings: hasBindings, HostBindings: hostBindings}
+			}
+		}
+	}
+
+	best, hasBest := bestAllow(rules, e.store.ActiveGrants(), cs.wsDefault, principal, q)
 	if !hasBest {
 		return Decision{Allow: false, Reason: "default-deny", HasBindings: hasBindings, HostBindings: hostBindings}
-	}
-	if !best.allow {
-		return Decision{Allow: false, RuleID: best.ruleID, Reason: "rule-deny", HasBindings: hasBindings, HostBindings: hostBindings}
 	}
 	reason := "rule-allow"
 	if best.grantID != "" {
@@ -190,7 +202,7 @@ func (e *Evaluator) decide(principal, rawHost string, port uint16, hostScope boo
 	}
 	var matchedBindings []config.BindingConfig
 	if !hostScope && best.ruleID != "" {
-		matchedBindings = matchRuleBindings(best.bindings, host, port, methodUpper, reqPath)
+		matchedBindings = matchRuleBindings(best.bindings, host, port, q.method, reqPath)
 	}
 	return Decision{
 		Allow:            true,
@@ -199,108 +211,88 @@ func (e *Evaluator) decide(principal, rawHost string, port uint16, hostScope boo
 		Reason:           reason,
 		AllowWebSocket:   best.allowWebSocket && !hasBindings,
 		WSMaxEgressBytes: best.wsMaxEgressBytes,
+		PinnedIP:         best.pin,
 		HasBindings:      hasBindings,
 		MatchedBindings:  matchedBindings,
 		HostBindings:     hostBindings,
 	}
 }
 
-func matchBestCandidate(
-	cs *compiledSet,
-	grants []config.Grant,
-	principal, host string,
-	port uint16,
-	hostScope bool,
-	methodUpper, reqPath string,
-) (candidate, bool) {
-	var best candidate
-	hasBest := false
+// query is one normalized policy question. hostScope asks only whether the host
+// may be reached at all (DNS, TLS handshake); otherwise method and path apply.
+type query struct {
+	host      string
+	port      uint16
+	hostScope bool
+	method    string
+	path      string
+}
 
-	for _, r := range cs.byPrincipal[principal] {
-		c, ok := evalRuleCandidate(r, cs.wsDefault, host, port, hostScope, methodUpper, reqPath)
-		if ok && (!hasBest || c.beats(best)) {
-			best = c
-			hasBest = true
+// bestAllow picks the most specific matching allow rule or grant. Among equally
+// specific matches the first rule in config order wins, and rules win over grants.
+func bestAllow(rules []compiledRule, grants []config.Grant, wsDefault int64, principal string, q query) (candidate, bool) {
+	var best candidate
+	found := false
+	consider := func(c candidate, ok bool) {
+		if ok && (!found || c.rank.compare(best.rank) > 0) {
+			best, found = c, true
 		}
+	}
+	for _, r := range rules {
+		if !r.allow {
+			continue
+		}
+		rank, ok := r.match(q)
+		wsCap := r.wsMaxEgressBytes
+		if wsCap == 0 {
+			wsCap = wsDefault
+		}
+		consider(candidate{
+			rank:             rank,
+			ruleID:           r.id,
+			allowWebSocket:   r.allowWebSocket,
+			wsMaxEgressBytes: wsCap,
+			bindings:         r.bindings,
+			pin:              r.pins[q.host],
+		}, ok)
 	}
 	for _, g := range grants {
-		c, ok := evalGrantCandidate(g, cs.wsDefault, principal, host, port, hostScope, methodUpper, reqPath)
-		if ok && (!hasBest || c.beats(best)) {
-			best = c
-			hasBest = true
+		if g.Principal != principal || g.Port != q.port || g.Host != q.host {
+			continue
 		}
+		rank, ok := matchScope(g.Methods, g.Paths, exactHostRank, q)
+		consider(candidate{rank: rank, grantID: g.ID, allowWebSocket: g.AllowWebSocket, wsMaxEgressBytes: wsDefault}, ok)
 	}
-	return best, hasBest
+	return best, found
 }
 
-func evalRuleCandidate(r compiledRule, wsDefault int64, host string, port uint16, hostScope bool, methodUpper, reqPath string) (candidate, bool) {
-	if !slices.Contains(r.ports, port) {
-		return candidate{}, false
+// match reports whether the rule applies to q and how specifically. A deny that
+// narrows by method or path applies to HTTP requests only, never to the host as a whole.
+func (r compiledRule) match(q query) (rankKey, bool) {
+	if !slices.Contains(r.ports, q.port) {
+		return rankKey{}, false
 	}
-	if hostScope && !r.allow && (len(r.methods) > 0 || len(r.paths) > 0) {
-		return candidate{}, false
+	if q.hostScope && !r.allow && (len(r.methods) > 0 || len(r.paths) > 0) {
+		return rankKey{}, false
 	}
-	hr, matched := matchHosts(r.hosts, host)
-	if !matched {
-		return candidate{}, false
+	hr, ok := matchHosts(r.hosts, q.host)
+	if !ok {
+		return rankKey{}, false
 	}
-	pathSpec := 0
-	if !hostScope {
-		if len(r.methods) > 0 && !slices.Contains(r.methods, methodUpper) {
-			return candidate{}, false
-		}
-		var pathMatched bool
-		pathSpec, pathMatched = matchPaths(r.paths, reqPath)
-		if !pathMatched {
-			return candidate{}, false
-		}
-	}
-	wsCap := r.wsMaxEgressBytes
-	if wsCap == 0 {
-		wsCap = wsDefault
-	}
-	return candidate{
-		rank: rankKey{
-			hostRank:        hr,
-			methodSpecified: len(r.methods) > 0,
-			pathSpecified:   len(r.paths) > 0,
-			pathSpecificity: pathSpec,
-		},
-		allow:            r.allow,
-		ruleID:           r.id,
-		allowWebSocket:   r.allowWebSocket,
-		wsMaxEgressBytes: wsCap,
-		bindings:         r.bindings,
-	}, true
+	return matchScope(r.methods, r.paths, hr, q)
 }
 
-func evalGrantCandidate(g config.Grant, wsDefault int64, principal, host string, port uint16, hostScope bool, methodUpper, reqPath string) (candidate, bool) {
-	if g.Principal != principal || g.Port != port || g.Host != host {
-		return candidate{}, false
+func matchScope(methods, paths []string, hostRank int, q query) (rankKey, bool) {
+	rank := rankKey{hostRank: hostRank, methodSpecified: len(methods) > 0, pathSpecified: len(paths) > 0}
+	if q.hostScope {
+		return rank, true
 	}
-	pathSpec := 0
-	if !hostScope {
-		if len(g.Methods) > 0 && !slices.Contains(g.Methods, methodUpper) {
-			return candidate{}, false
-		}
-		var pathMatched bool
-		pathSpec, pathMatched = matchPaths(g.Paths, reqPath)
-		if !pathMatched {
-			return candidate{}, false
-		}
+	if len(methods) > 0 && !slices.Contains(methods, q.method) {
+		return rankKey{}, false
 	}
-	return candidate{
-		rank: rankKey{
-			hostRank:        exactHostRank,
-			methodSpecified: len(g.Methods) > 0,
-			pathSpecified:   len(g.Paths) > 0,
-			pathSpecificity: pathSpec,
-		},
-		allow:            true,
-		grantID:          g.ID,
-		allowWebSocket:   g.AllowWebSocket,
-		wsMaxEgressBytes: wsDefault,
-	}, true
+	spec, ok := matchPaths(paths, q.path)
+	rank.pathSpecificity = spec
+	return rank, ok
 }
 
 func matchRuleBindings(bindings []config.BindingConfig, host string, port uint16, methodUpper, reqPath string) []config.BindingConfig {
@@ -363,24 +355,12 @@ func (a rankKey) compare(b rankKey) int {
 
 type candidate struct {
 	rank             rankKey
-	allow            bool
 	ruleID           string
 	grantID          string
 	allowWebSocket   bool
 	wsMaxEgressBytes int64
 	bindings         []config.BindingConfig
-}
-
-func (c candidate) beats(other candidate) bool {
-	cmp := c.rank.compare(other.rank)
-	if cmp != 0 {
-		return cmp > 0
-	}
-	// On exact tie, deny always beats allow.
-	if !c.allow && other.allow {
-		return true
-	}
-	return false
+	pin              netip.Addr
 }
 
 func matchHosts(patterns []hostPattern, host string) (int, bool) {
@@ -440,6 +420,11 @@ func pathPatternSpecificity(pat string) int {
 func globPathMatch(pattern, value string) bool {
 	if pattern == "/**" {
 		return strings.HasPrefix(value, "/")
+	}
+	// "/x/**" covers "/x" itself, so a deny on "/v1/admin/**" cannot be sidestepped
+	// by asking for "/v1/admin".
+	if base, ok := strings.CutSuffix(pattern, "/**"); ok && value == base {
+		return true
 	}
 	return matchGlob(pattern, value)
 }

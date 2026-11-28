@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,7 +59,7 @@ func TestAdmissionRecheckBlocksRevokedGrantBetweenAdmitAndRegister(t *testing.T)
 		Leaves:       ca.NewLeafCache(rootCA),
 		Flows:        NewFlowRegistry(),
 		OnServeError: func(error) {},
-		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+		DialContext: func(_ context.Context, _, _ string, _ netip.Addr) (net.Conn, error) {
 			dialHits.Add(1)
 			return nil, net.ErrClosed
 		},
@@ -139,7 +140,7 @@ func TestAdmissionRecheckBlocksWhenOnlyAllowWebSocketChanges(t *testing.T) {
 		Leaves:       ca.NewLeafCache(rootCA),
 		Flows:        NewFlowRegistry(),
 		OnServeError: func(error) {},
-		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+		DialContext: func(_ context.Context, _, _ string, _ netip.Addr) (net.Conn, error) {
 			dialHits.Add(1)
 			return nil, net.ErrClosed
 		},

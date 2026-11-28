@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/ca"
@@ -44,8 +45,8 @@ type Options struct {
 	Leaves    *ca.LeafCache
 	Dialer    *netguard.Dialer
 	// DialContext is a test hook: tests redirect ports 443 and 80 to local mock
-	// upstreams, still through netguard.Dialer. Production leaves it nil.
-	DialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
+	// upstreams and observe the pin. Production leaves it nil.
+	DialContext    func(ctx context.Context, network, addr string, pin netip.Addr) (net.Conn, error)
 	Flows          *FlowRegistry
 	OnRequest      func(principal, effect string, status int, reason string)
 	OnConnRejected func(link string)
@@ -60,13 +61,13 @@ type Server struct {
 	eval           *policy.Evaluator
 	audit          *audit.Writer
 	leaves         *ca.LeafCache
-	dialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
+	dial           func(ctx context.Context, network, addr string, pin netip.Addr) (net.Conn, error)
 	flows          *FlowRegistry
 	onRequest      func(principal, effect string, status int, reason string)
 	onConnRejected func(link string)
 	onServeError   func(error)
 
-	transport *http.Transport
+	transport *http.Transport // unpinned requests only; see upstreamTransport
 
 	httpsLn  net.Listener
 	httpLn   net.Listener
@@ -88,12 +89,32 @@ func NewServer(opts Options) (*Server, error) {
 		if opts.Dialer == nil {
 			return nil, errors.New("proxy: dialer or dialContext is required")
 		}
-		dialFn = opts.Dialer.DialContext
+		dialFn = opts.Dialer.DialPinned
 	}
 
-	hCfg := opts.Store.Current().Config.HTTP
-	tr := &http.Transport{
-		DialContext: dialFn,
+	s := &Server{
+		link:           opts.Link,
+		store:          opts.Store,
+		eval:           opts.Evaluator,
+		audit:          opts.Audit,
+		leaves:         opts.Leaves,
+		dial:           dialFn,
+		flows:          opts.Flows,
+		onRequest:      opts.OnRequest,
+		onConnRejected: opts.OnConnRejected,
+		onServeError:   opts.OnServeError,
+	}
+	s.transport = s.newTransport(netip.Addr{})
+	return s, nil
+}
+
+// newTransport builds an upstream transport that dials with pin.
+func (s *Server) newTransport(pin netip.Addr) *http.Transport {
+	hCfg := s.store.Current().Config.HTTP
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return s.dial(ctx, network, addr, pin)
+		},
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12, // uses system roots; never InsecureSkipVerify
 		},
@@ -106,21 +127,19 @@ func NewServer(opts Options) (*Server, error) {
 		ExpectContinueTimeout:  1 * time.Second,
 		MaxResponseHeaderBytes: int64(hCfg.MaxHeaderBytes),
 	}
+}
 
-	s := &Server{
-		link:           opts.Link,
-		store:          opts.Store,
-		eval:           opts.Evaluator,
-		audit:          opts.Audit,
-		leaves:         opts.Leaves,
-		dialContext:    dialFn,
-		flows:          opts.Flows,
-		onRequest:      opts.OnRequest,
-		onConnRejected: opts.OnConnRejected,
-		onServeError:   opts.OnServeError,
-		transport:      tr,
+// upstreamTransport returns the transport for a request. A request decided by a
+// rule that pins its host gets a transport of its own, used once: pooled
+// connections are keyed by host alone, so sharing one would let a pinned
+// connection serve another rule's request, or a pinned request ride a connection
+// dialed elsewhere. The returned func releases it and runs after the response body is closed.
+func (s *Server) upstreamTransport(pin netip.Addr) (*http.Transport, func()) {
+	if !pin.IsValid() {
+		return s.transport, func() {}
 	}
-	return s, nil
+	tr := s.newTransport(pin)
+	return tr, tr.CloseIdleConnections
 }
 
 // CloseIdleConnections closes any idle pooled upstream connections held by this server.
@@ -594,8 +613,11 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		return
 	}
 
+	transport, release := s.upstreamTransport(rc.dec.PinnedIP)
+	defer release()
+
 	// RoundTrip directly (never follow 3xx redirects).
-	resp, err := s.transport.RoundTrip(outReq)
+	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
@@ -750,6 +772,11 @@ func isIdentityContentEncoding(vals []string) bool {
 }
 
 func validateOriginForm(r *http.Request) string {
+	// Policy compares methods upper-cased, but the method is forwarded verbatim:
+	// "get" would be matched as GET and reach an upstream that treats it differently.
+	if r.Method != strings.ToUpper(r.Method) {
+		return "non-canonical-method"
+	}
 	if r.RequestURI == "*" {
 		return "asterisk-target-forbidden"
 	}
@@ -762,6 +789,14 @@ func validateOriginForm(r *http.Request) string {
 	if !strings.HasPrefix(r.URL.Path, "/") {
 		return "non-origin-form-target"
 	}
+	// Tomcat, Spring and Jetty normalise ";param" segments and decode again after
+	// the gateway has matched rules, so "/public/..;/admin" would reach "/admin".
+	if strings.Contains(r.URL.Path, ";") {
+		return "semicolon-in-path"
+	}
+	if hasDoubleEncoding(r.URL.EscapedPath()) {
+		return "double-encoded-path"
+	}
 	if r.URL.RawPath != "" {
 		lowerRaw := strings.ToLower(r.URL.RawPath)
 		if strings.Contains(lowerRaw, "%2f") || strings.Contains(lowerRaw, "%5c") {
@@ -770,6 +805,9 @@ func validateOriginForm(r *http.Request) string {
 	}
 	if strings.Contains(r.URL.Path, "\\") {
 		return "backslash-in-path"
+	}
+	if reason := checkPathBytes(r.URL.Path); reason != "" {
+		return reason
 	}
 	for _, seg := range strings.Split(r.URL.Path, "/") {
 		if seg == ".." {
@@ -780,6 +818,42 @@ func validateOriginForm(r *http.Request) string {
 		return "non-canonical-path"
 	}
 	return ""
+}
+
+// checkPathBytes refuses decoded paths a rule could match differently from the
+// upstream: invalid UTF-8, control bytes (including NUL), and segments padded
+// with spaces, which servers trim ("/admin%20" is "/admin" to some).
+func checkPathBytes(p string) string {
+	if !utf8.ValidString(p) {
+		return "invalid-utf8-path"
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return "control-byte-in-path"
+		}
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg != strings.Trim(seg, " ") {
+			return "padded-path-segment"
+		}
+	}
+	return ""
+}
+
+// hasDoubleEncoding reports an escaped "%25" followed by two hex digits: an
+// encoded percent sign that is itself the start of an escape ("%252e"). A "%25"
+// followed by anything else is a literal percent sign and is fine.
+func hasDoubleEncoding(escaped string) bool {
+	for i := 0; i+4 < len(escaped); i++ {
+		if escaped[i:i+3] == "%25" && isHexDigit(escaped[i+3]) && isHexDigit(escaped[i+4]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 func isCanonicalPath(p string) bool {

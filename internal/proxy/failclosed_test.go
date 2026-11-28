@@ -51,13 +51,13 @@ func TestUntrustedUpstreamCertRefused(t *testing.T) {
 
 	gw := newTestGateway(t, testGatewaySpec{
 		Hosts: []string{"untrusted.example.com"},
-		DialOverride: func(guard *netguard.Dialer, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
+		DialOverride: func(guard guardDial, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return func(ctx context.Context, network, addr string) (net.Conn, error) {
 				host, _, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
 				}
-				return guard.DialHost(ctx, network, host, untrustedPort)
+				return guard(ctx, network, host, untrustedPort)
 			}
 		},
 		RulesYAML: `
@@ -294,6 +294,10 @@ type stepResolver struct {
 }
 
 func (r *stepResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
+	host, rooted := strings.CutSuffix(host, ".")
+	if !rooted {
+		return nil, errors.New("unrooted lookup: the resolver search list could rewrite the name")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	i := r.calls[host]
@@ -348,13 +352,13 @@ func TestDNSRebindingBlockedThroughProxy(t *testing.T) {
 
 	gw := newTestGateway(t, testGatewaySpec{
 		Resolver: rebindRes,
-		DialOverride: func(guard *netguard.Dialer, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
+		DialOverride: func(guard guardDial, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return func(ctx context.Context, network, addr string) (net.Conn, error) {
 				host, _, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
 				}
-				return guard.DialHost(ctx, network, host, rebindPort)
+				return guard(ctx, network, host, rebindPort)
 			}
 		},
 		RulesYAML: `
@@ -765,6 +769,10 @@ type countingStaticResolver struct {
 
 func (r *countingStaticResolver) LookupNetIP(_ context.Context, _, host string) ([]netip.Addr, error) {
 	r.hits.Add(1)
+	host, rooted := strings.CutSuffix(host, ".")
+	if !rooted {
+		return nil, errors.New("unrooted lookup: the resolver search list could rewrite the name")
+	}
 	return r.hosts[host], nil
 }
 
@@ -850,9 +858,9 @@ rules:
 		Audit:     aw,
 		Leaves:    ca.NewLeafCache(mitmCA),
 		Dialer: netguard.NewDialer(netguard.Options{
-			Store:    store,
-			Resolver: resolver,
-			Timeout:  time.Second,
+			FakePrefix: store.Current().Config.FakePrefix,
+			Resolver:   resolver,
+			Timeout:    time.Second,
 		}),
 		Flows:        proxy.NewFlowRegistry(),
 		OnServeError: func(error) {},

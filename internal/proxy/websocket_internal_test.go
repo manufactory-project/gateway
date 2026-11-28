@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -47,7 +48,7 @@ func TestDialWebSocketUpstreamBoundsTLSHandshake(t *testing.T) {
 	})
 
 	srv := &Server{
-		dialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		dial: func(ctx context.Context, network, _ string, _ netip.Addr) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, ln.Addr().String())
 		},
@@ -56,7 +57,7 @@ func TestDialWebSocketUpstreamBoundsTLSHandshake(t *testing.T) {
 	parentCtx, parentCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer parentCancel()
 
-	conn, dialErr := srv.dialWebSocketUpstreamWithTimeout(parentCtx, "stall.example.com", 443, 60*time.Millisecond)
+	conn, dialErr := srv.dialWebSocketUpstreamWithTimeout(parentCtx, "stall.example.com", 443, netip.Addr{}, 60*time.Millisecond)
 	if conn != nil {
 		if cErr := conn.Close(); cErr != nil {
 			t.Errorf("close conn: %v", cErr)

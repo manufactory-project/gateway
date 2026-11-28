@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -22,7 +23,6 @@ import (
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/ca"
-	"github.com/manufactory-project/gateway/internal/netguard"
 	"github.com/manufactory-project/gateway/internal/policy"
 	"github.com/manufactory-project/gateway/internal/proxy"
 )
@@ -289,13 +289,13 @@ func TestTeardownDuringDialRaceHTTPAndWebSocket(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusOK)
 		}),
-		DialOverride: func(guard *netguard.Dialer, upTLSPort, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
+		DialOverride: func(guard guardDial, upTLSPort, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return func(ctx context.Context, network, addr string) (net.Conn, error) {
 				host, _, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
 				}
-				conn, err := guard.DialHost(ctx, network, host, upTLSPort)
+				conn, err := guard(ctx, network, host, upTLSPort)
 				if err != nil {
 					return nil, err
 				}
@@ -481,13 +481,13 @@ func TestWebSocketRevokedDuringHandshake(t *testing.T) {
 			StartGrantPruner: byGrantExpiry,
 			Hosts:            []string{host},
 			RulesYAML:        rulesYAML,
-			DialOverride: func(guard *netguard.Dialer, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
+			DialOverride: func(guard guardDial, _, _ uint16) func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return func(ctx context.Context, network, addr string) (net.Conn, error) {
 					h, _, err := net.SplitHostPort(addr)
 					if err != nil {
 						return nil, err
 					}
-					return guard.DialHost(ctx, network, h, silentPort)
+					return guard(ctx, network, h, silentPort)
 				}
 			},
 		})
@@ -1139,7 +1139,7 @@ func TestNewServerRequiresFlows(t *testing.T) {
 		Evaluator: policy.NewEvaluator(gw.Store),
 		Audit:     gw.Audit,
 		Leaves:    ca.NewLeafCache(testUpstreamCA),
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network, addr string, _ netip.Addr) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, addr)
 		},
@@ -1155,7 +1155,7 @@ func TestNewServerRequiresFlows(t *testing.T) {
 		Evaluator: policy.NewEvaluator(gw.Store),
 		Audit:     gw.Audit,
 		Leaves:    ca.NewLeafCache(testUpstreamCA),
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		DialContext: func(ctx context.Context, network, addr string, _ netip.Addr) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, network, addr)
 		},

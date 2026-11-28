@@ -22,7 +22,7 @@ Protected, given the assumptions:
 Not protected:
 
 - **Globally routed host or LAN addresses.** The gateway cannot tell them apart from the internet. An allowed name that resolves to one is reachable.
-- **Addresses listed in `records`.** These are deliberate exceptions, open to every principal that may reach that host.
+- **Addresses in a rule's `pins`.** These are deliberate exceptions to the private-address guard, open only to requests that rule decides. A pin can never be loopback, link-local, multicast, inside `dns.fake_cidr` or inside a link subnet.
 
 ## Goal 2: keep secrets out of the guest
 
@@ -70,11 +70,11 @@ Not prevented:
 | Connection limits are per link, and the kernel conntrack table is shared | Many guests together can use up shared capacity | Size the host for the number of links |
 | Denied requests are logged | A guest can fill the audit log up to its limit and push out older records | Ship records elsewhere with `audit.stdout_json` |
 | Audit writes are not `fsync`ed | A crash or power loss can lose the latest records | Ship records elsewhere |
-| Guests receive addresses from `198.18.0.0/15` | A client with its own private-address filter may refuse them | Change `dns.fake_cidr` |
+| Guests receive addresses from `198.18.0.0/15` | A client that refuses every special-purpose address (Python `ipaddress.is_global`, `ipaddr.js` `unicast`-only filters) refuses them, and no special-purpose range avoids that | Set `dns.fake_cidr` to a globally routable range the guests never need to reach. `gateway` refuses to dial it either way. See [`dns`](configuration.md#dns) |
 
 ## Stopping access
 
-Removing access needs a policy change: remove every allow rule and grant that covers it, then reload. Adding a `deny` is not enough if a more specific `allow` still matches. `gateway revoke --flow` or `--principal` closes current connections, and the guest can open new ones. Stopping the guest always works. See [rule precedence](configuration.md#which-rule-wins) and [reload](configuration.md#reload).
+Removing access needs a policy change: remove every allow rule and grant that covers it, then reload. A matching `deny` wins over every allow rule and grant, so adding one also works. `gateway revoke --flow` or `--principal` closes current connections, and the guest can open new ones. Stopping the guest always works. See [rule precedence](configuration.md#which-rule-wins) and [reload](configuration.md#reload).
 
 ## Verification
 

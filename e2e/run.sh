@@ -354,7 +354,8 @@ if [[ "$UPSTREAM_EXPLICIT" -eq 0 ]]; then
   fi
   incus file push "$TMPDIR_WORK/up-ca.crt" "${GW_INST}/usr/local/share/ca-certificates/e2e-upstream-ca.crt" --project "$PROJECT" --mode 0644
   gw_exec update-ca-certificates >/dev/null
-  printf '\nrecords:\n  %s: %s\n' "$UPSTREAM_HOST" "$GW_UPSTREAM_GW" >> "$TMPDIR_WORK/gateway.yaml"
+  # The upstream sits on a private address: pin it on the rules that allow the host.
+  sed -i "s|^    hosts: \[${UPSTREAM_HOST}\]\$|&\n    pins: {${UPSTREAM_HOST}: ${GW_UPSTREAM_GW}}|" "$TMPDIR_WORK/gateway.yaml"
 fi
 
 incus file push "$TMPDIR_WORK/gateway" "${GW_INST}/usr/local/bin/gateway" --project "$PROJECT" --mode 0755

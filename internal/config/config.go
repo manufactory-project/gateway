@@ -16,9 +16,11 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
+	"golang.org/x/net/publicsuffix"
 	"gopkg.in/yaml.v3"
 )
 
@@ -44,20 +46,18 @@ const (
 
 // Config is the validated, normalized gateway configuration.
 type Config struct {
-	CA        CAConfig          `yaml:"ca"`
-	Audit     AuditConfig       `yaml:"audit"`
-	Admin     AdminConfig       `yaml:"admin"`
-	Metrics   MetricsConfig     `yaml:"metrics"`
-	Dataplane DataplaneConfig   `yaml:"dataplane"`
-	DNS       DNSConfig         `yaml:"dns"`
-	HTTP      HTTPConfig        `yaml:"http"`
-	Records   map[string]string `yaml:"records"`
-	Links     []LinkConfig      `yaml:"links"`
-	Rules     []RuleConfig      `yaml:"rules"`
+	CA        CAConfig        `yaml:"ca"`
+	Audit     AuditConfig     `yaml:"audit"`
+	Admin     AdminConfig     `yaml:"admin"`
+	Metrics   MetricsConfig   `yaml:"metrics"`
+	Dataplane DataplaneConfig `yaml:"dataplane"`
+	DNS       DNSConfig       `yaml:"dns"`
+	HTTP      HTTPConfig      `yaml:"http"`
+	Links     []LinkConfig    `yaml:"links"`
+	Rules     []RuleConfig    `yaml:"rules"`
 
 	// Parsed fields derived during validation (never serialized).
-	FakePrefix    netip.Prefix          `yaml:"-"`
-	ParsedRecords map[string]netip.Addr `yaml:"-"`
+	FakePrefix netip.Prefix `yaml:"-"`
 }
 
 // CAConfig holds operator-supplied MITM CA file paths.
@@ -150,6 +150,11 @@ type RuleConfig struct {
 	AllowWebSocket   bool            `yaml:"allow_websocket"`
 	WSMaxEgressBytes int64           `yaml:"ws_max_egress_bytes"`
 	Bindings         []BindingConfig `yaml:"bindings"`
+	// Pins maps an exact host this rule covers to the address it is dialed at,
+	// bypassing DNS and the private-address guard. Only requests this rule decides use it.
+	Pins map[string]string `yaml:"pins"`
+
+	ParsedPins map[string]netip.Addr `yaml:"-"`
 }
 
 // BindingConfig declares a substitution-only secret placeholder binding.
@@ -256,9 +261,16 @@ func applyDefaults(cfg *Config) {
 			cfg.Links[i].RoutePref = 1000 + i
 		}
 	}
+	// Only an omitted ports key is defaulted; an explicit empty list stays empty
+	// and is rejected by validation.
 	for i := range cfg.Rules {
-		if len(cfg.Rules[i].Ports) == 0 {
-			cfg.Rules[i].Ports = []uint16{443}
+		r := &cfg.Rules[i]
+		switch {
+		case r.Ports != nil:
+		case r.Effect == "deny":
+			r.Ports = []uint16{80, 443}
+		default:
+			r.Ports = []uint16{443}
 		}
 	}
 }
@@ -282,6 +294,9 @@ func validate(cfg *Config) error {
 	if cfg.Audit.MaxTotalBytes < 0 {
 		return fmt.Errorf("audit.max_total_bytes must be >= 0, got %d", cfg.Audit.MaxTotalBytes)
 	}
+	if cfg.Audit.MaxFileBytes > cfg.Audit.MaxTotalBytes {
+		return fmt.Errorf("audit.max_file_bytes %d must not exceed audit.max_total_bytes %d", cfg.Audit.MaxFileBytes, cfg.Audit.MaxTotalBytes)
+	}
 	if cfg.Metrics.Listen != "" {
 		if err := validateExplicitListenAddr(cfg.Metrics.Listen); err != nil {
 			return fmt.Errorf("metrics.listen: %w", err)
@@ -293,11 +308,11 @@ func validate(cfg *Config) error {
 	if err := validateHTTP(&cfg.HTTP); err != nil {
 		return err
 	}
-	if err := validateRecords(cfg); err != nil {
-		return err
-	}
 	declaredPrincipals, err := validateLinks(cfg)
 	if err != nil {
+		return err
+	}
+	if err := validateFakeCIDR(cfg); err != nil {
 		return err
 	}
 	if !filepath.IsAbs(cfg.Dataplane.ReadyFile) {
@@ -404,25 +419,67 @@ func validateHTTP(h *HTTPConfig) error {
 	return nil
 }
 
-func validateRecords(cfg *Config) error {
-	cfg.ParsedRecords = make(map[string]netip.Addr, len(cfg.Records))
-	for rawHost, rawIP := range cfg.Records {
+// validateFakeCIDR refuses a fake range that a link's subnet or gateway address
+// lives in: the gateway could not tell fake addresses from real ones there.
+func validateFakeCIDR(cfg *Config) error {
+	for _, l := range cfg.Links {
+		if cfg.FakePrefix.Overlaps(l.ParsedSubnet) {
+			return fmt.Errorf("dns.fake_cidr %s overlaps link %q subnet %s", cfg.FakePrefix, l.Name, l.ParsedSubnet)
+		}
+	}
+	return nil
+}
+
+var (
+	ipv6ULA           = netip.MustParsePrefix("fc00::/7")
+	ipv6GlobalUnicast = netip.MustParsePrefix("2000::/3")
+	ipv4ThisNetwork   = netip.MustParsePrefix("0.0.0.0/8")
+)
+
+// validatePin accepts an address a rule may pin: any routable unicast address,
+// including RFC 1918, CGNAT and ULA, but never one that reaches the gateway
+// itself or its guests (loopback, this-network, link-local, multicast, the fake
+// range, a link subnet) or a non-global, non-ULA IPv6 address.
+func validatePin(cfg *Config, addr netip.Addr) error {
+	if !addr.IsGlobalUnicast() || ipv4ThisNetwork.Contains(addr) {
+		return errors.New("must be a global unicast address (not loopback, unspecified, link-local, multicast or 0.0.0.0/8)")
+	}
+	if addr.Is6() && !ipv6ULA.Contains(addr) && !ipv6GlobalUnicast.Contains(addr) {
+		return errors.New("IPv6 must be global unicast (2000::/3) or unique local (fc00::/7)")
+	}
+	if cfg.FakePrefix.Contains(addr) {
+		return fmt.Errorf("is inside dns.fake_cidr %s", cfg.FakePrefix)
+	}
+	for _, l := range cfg.Links {
+		if l.ParsedSubnet.Contains(addr) {
+			return fmt.Errorf("is inside link %q subnet %s", l.Name, l.ParsedSubnet)
+		}
+	}
+	return nil
+}
+
+func validateRulePins(cfg *Config, r *RuleConfig) error {
+	r.ParsedPins = make(map[string]netip.Addr, len(r.Pins))
+	for rawHost, rawIP := range r.Pins {
 		host, err := NormalizeExactHost(rawHost)
 		if err != nil {
-			return fmt.Errorf("records[%q]: %w", rawHost, err)
+			return fmt.Errorf("rules[%s].pins[%q]: %w", r.ID, rawHost, err)
 		}
-		if _, dup := cfg.ParsedRecords[host]; dup {
-			return fmt.Errorf("records: duplicate normalized host %q", host)
+		if !slices.ContainsFunc(r.Hosts, func(pat string) bool { return pat == host || wildcardMatches(pat, host) }) {
+			return fmt.Errorf("rules[%s].pins[%q]: host is not covered by the rule's hosts", r.ID, rawHost)
+		}
+		if _, dup := r.ParsedPins[host]; dup {
+			return fmt.Errorf("rules[%s].pins: duplicate normalized host %q", r.ID, host)
 		}
 		addr, err := netip.ParseAddr(strings.TrimSpace(rawIP))
 		if err != nil {
-			return fmt.Errorf("records[%q]: invalid IP %q: %w", rawHost, rawIP, err)
+			return fmt.Errorf("rules[%s].pins[%q]: invalid IP %q: %w", r.ID, rawHost, rawIP, err)
 		}
 		addr = addr.Unmap()
-		if addr.IsUnspecified() || addr.IsMulticast() {
-			return fmt.Errorf("records[%q]: IP %s must be unicast", rawHost, addr)
+		if err := validatePin(cfg, addr); err != nil {
+			return fmt.Errorf("rules[%s].pins[%q]: %s %w", r.ID, rawHost, addr, err)
 		}
-		cfg.ParsedRecords[host] = addr
+		r.ParsedPins[host] = addr
 	}
 	return nil
 }
@@ -588,6 +645,9 @@ func validateRules(cfg *Config, declaredPrincipals map[string]bool) error {
 		if err := validateRuleFlags(r, has443); err != nil {
 			return err
 		}
+		if err := validateRulePins(cfg, r); err != nil {
+			return err
+		}
 		if r.AllowWebSocket {
 			for _, h := range r.Hosts {
 				wsHosts[h] = r.ID
@@ -624,6 +684,9 @@ func validateRuleBasics(i int, r *RuleConfig, seenIDs, declaredPrincipals map[st
 	if err != nil {
 		return nil, false, err
 	}
+	if err := rejectEmpty("rules["+r.ID+"]", r.Methods, r.Paths); err != nil {
+		return nil, false, err
+	}
 	for mi, m := range r.Methods {
 		if !isValidHTTPMethod(m) {
 			return nil, false, fmt.Errorf("rules[%s].methods[%d] %q is invalid", r.ID, mi, m)
@@ -636,6 +699,18 @@ func validateRuleBasics(i int, r *RuleConfig, seenIDs, declaredPrincipals map[st
 		}
 	}
 	return seenHosts, has443, nil
+}
+
+// rejectEmpty refuses an explicitly empty methods or paths list: it would read
+// as "any", and a narrowing key must never silently widen.
+func rejectEmpty(what string, methods, paths []string) error {
+	if methods != nil && len(methods) == 0 {
+		return fmt.Errorf("%s.methods must not be an empty list (omit it to match any method)", what)
+	}
+	if paths != nil && len(paths) == 0 {
+		return fmt.Errorf("%s.paths must not be an empty list (omit it to match any path)", what)
+	}
+	return nil
 }
 
 func normalizeRuleHosts(r *RuleConfig) (map[string]bool, error) {
@@ -660,6 +735,9 @@ func normalizeRuleHosts(r *RuleConfig) (map[string]bool, error) {
 }
 
 func validateRulePorts(r *RuleConfig) (bool, error) {
+	if len(r.Ports) == 0 {
+		return false, fmt.Errorf("rules[%s].ports must not be an empty list (omit it for the default)", r.ID)
+	}
 	seenPorts := make(map[uint16]bool, len(r.Ports))
 	has443 := false
 	for _, p := range r.Ports {
@@ -740,6 +818,9 @@ func validateBinding(ruleID string, b *BindingConfig, ruleHosts map[string]bool)
 		return fmt.Errorf("rules[%s].bindings[%s].host %q must be one of the rule's hosts", ruleID, b.Name, host)
 	}
 	b.Host = host
+	if err := rejectEmpty(fmt.Sprintf("rules[%s].bindings[%s]", ruleID, b.Name), b.Methods, b.Paths); err != nil {
+		return err
+	}
 
 	for mi, m := range b.Methods {
 		if !isValidHTTPMethod(m) {
@@ -850,6 +931,10 @@ func NormalizeHostPattern(raw string) (string, error) {
 		}
 		if err := validateHostnameLabels(rest); err != nil {
 			return "", fmt.Errorf("invalid wildcard host %q: %w", raw, err)
+		}
+		// "*.co.uk" or "*.github.io" would cover every registrant under the suffix.
+		if suffix, _ := publicsuffix.PublicSuffix(rest); suffix == rest {
+			return "", fmt.Errorf("wildcard pattern %q covers a public suffix; name a registrable domain", raw)
 		}
 		return "*." + rest, nil
 	}

@@ -19,9 +19,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,6 +114,33 @@ func (c *closeTrackingConn) Close() error {
 	return c.Conn.Close()
 }
 
+// guardDial dials host:port through the real netguard.Dialer. It is what a
+// DialOverride uses to redirect a name to a local mock upstream.
+type guardDial func(ctx context.Context, network, host string, port uint16) (net.Conn, error)
+
+// dialLog records every upstream dial the proxy asked for, with the pin it carried.
+type dialLog struct {
+	mu    sync.Mutex
+	dials []dialRecord
+}
+
+type dialRecord struct {
+	addr string
+	pin  netip.Addr
+}
+
+func (l *dialLog) add(addr string, pin netip.Addr) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.dials = append(l.dials, dialRecord{addr, pin})
+}
+
+func (l *dialLog) all() []dialRecord {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.dials)
+}
+
 type testGatewaySpec struct {
 	Principal         string
 	AuditMaxFileBytes int64
@@ -121,7 +150,7 @@ type testGatewaySpec struct {
 	Handler           http.Handler
 	PlainHandler      http.Handler
 	Resolver          netguard.Resolver
-	DialOverride      func(guard *netguard.Dialer, upTLSPort, upPlainPort uint16) func(ctx context.Context, network, addr string) (net.Conn, error)
+	DialOverride      func(guard guardDial, upTLSPort, upPlainPort uint16) func(ctx context.Context, network, addr string) (net.Conn, error)
 	CountCASigns      bool
 	StartGrantPruner  bool
 	OnCleanupFirst    func()
@@ -146,6 +175,7 @@ type testGateway struct {
 	UpPlain   *httptest.Server
 	CASigns   *countingSigner
 	Records   *recordSignal
+	Dials     *dialLog
 }
 
 func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
@@ -218,12 +248,6 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 			sb.WriteByte('\n')
 		}
 	}
-	if len(spec.Hosts) > 0 {
-		sb.WriteString("records:\n")
-		for _, h := range spec.Hosts {
-			fmt.Fprintf(&sb, "  %s: 127.0.0.1\n", h)
-		}
-	}
 	sb.WriteString("dataplane:\n  ready_file: /run/gateway-dataplane/dataplane.ready\n  dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}\n")
 	fmt.Fprintf(&sb, "links:\n  - name: sbx0\n    interface: sbx0\n    ct_zone: 101\n    route_table: 101\n    principal: %s\n    subnet: %s\n    gateway_ip: %s\n    https_port: %d\n    http_port: %d\n    dns_port: %d\n",
 		principal, linkSubnet, linkIP, httpsPort, httpPort, dnsPort)
@@ -275,24 +299,36 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	}
 
 	guardDialer := netguard.NewDialer(netguard.Options{
-		Store:    store,
-		Resolver: spec.Resolver,
-		Timeout:  time.Second,
+		FakePrefix: store.Current().Config.FakePrefix,
+		Resolver:   spec.Resolver,
+		Timeout:    time.Second,
 	})
-	var dialFn func(ctx context.Context, network, addr string) (net.Conn, error)
-	if spec.DialOverride != nil {
-		dialFn = spec.DialOverride(guardDialer, upTLSPort, upPlainPort)
-	} else {
-		dialFn = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, portStr, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			if portStr == "80" && upPlain != nil {
-				return guardDialer.DialHost(ctx, network, host, upPlainPort)
-			}
-			return guardDialer.DialHost(ctx, network, host, upTLSPort)
+	// Hosts in spec.Hosts stand in for private upstreams: the test pins them to
+	// loopback, as a rule's pin would. Every other host resolves through spec.Resolver.
+	guard := func(ctx context.Context, network, host string, port uint16) (net.Conn, error) {
+		var pin netip.Addr
+		if slices.Contains(spec.Hosts, host) {
+			pin = netip.MustParseAddr("127.0.0.1")
 		}
+		return guardDialer.DialPinned(ctx, network, net.JoinHostPort(host, strconv.Itoa(int(port))), pin)
+	}
+	inner := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if portStr == "80" && upPlain != nil {
+			return guard(ctx, network, host, upPlainPort)
+		}
+		return guard(ctx, network, host, upTLSPort)
+	}
+	if spec.DialOverride != nil {
+		inner = spec.DialOverride(guard, upTLSPort, upPlainPort)
+	}
+	dials := &dialLog{}
+	dialFn := func(ctx context.Context, network, addr string, pin netip.Addr) (net.Conn, error) {
+		dials.add(addr, pin)
+		return inner(ctx, network, addr)
 	}
 
 	eval := policy.NewEvaluator(store)
@@ -374,6 +410,7 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		UpPlain:   upPlain,
 		CASigns:   cs,
 		Records:   records,
+		Dials:     dials,
 	}
 }
 

@@ -51,12 +51,12 @@ Replies leave through the right link by a per-link routing table.
 
 1. Accept the connection if the link is under its connection limit.
 2. For HTTPS, check the TLS server name. Only an allowed name gets a certificate, signed by the gateway CA.
-3. Check the request: no `CONNECT`, a canonical origin-form path, a `Host` that matches the port and the TLS server name, and no upgrade other than WebSocket.
+3. Check the request: no `CONNECT`, a canonical origin-form path with no `;` and no double encoding, a `Host` that matches the port and the TLS server name, and no upgrade other than WebSocket.
 4. Evaluate rules and grants for this request.
 5. Build the outbound headers. For a bound host, read all its secrets first and remove range and compression requests. Substitute, then remove leftover placeholders.
 6. Register the flow, and check the decision again if the config or grants changed meanwhile.
 7. Write the admission audit record.
-8. Connect by hostname. Unless `records` pins the address, resolve it and check every address at connect time.
+8. Connect by hostname. If the rule that allowed the request pins the host, connect to that address. Otherwise resolve the rooted name (so the host's DNS search list cannot rewrite it) and check every address at connect time, trying at most four within one overall deadline. Nothing inside `dns.fake_cidr` is ever dialed.
 9. Relay the response without following redirects. On a bound host, refuse compressed or partial responses and replace echoed secrets, holding back only bytes that could begin one.
 10. Write the completion record.
 

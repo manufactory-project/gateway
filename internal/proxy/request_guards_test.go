@@ -190,18 +190,32 @@ func TestHTTP1RequestGuardsAndMethodPathDeny(t *testing.T) {
 	})
 
 	cAPI := gw.H1Client(t, "api.example.com")
+	// Positive control: the same client and rules admit an allowed request, so the
+	// refusals below are not a blanket deny.
+	okResp, err := cAPI.Get("https://api.example.com/v1/ok")
+	if err != nil {
+		t.Fatalf("control GET /v1/ok: %v", err)
+	}
+	if err := okResp.Body.Close(); err != nil {
+		t.Fatalf("close control body: %v", err)
+	}
+	if okResp.StatusCode != http.StatusOK {
+		t.Fatalf("control GET /v1/ok status=%d, want 200", okResp.StatusCode)
+	}
+	controlHits := httpsReceived.Load()
 	for _, tc := range []struct {
 		method string
 		url    string
 		host   string
 		hdrs   map[string]string
+		reason string
 	}{
-		{http.MethodDelete, "https://api.example.com/v1/ok", "", nil},
-		{http.MethodGet, "https://api.example.com/v2/forbidden", "", nil},
-		{http.MethodGet, "https://api.example.com/ws", "ws.example.com", nil},
-		{http.MethodGet, "https://api.example.com/v1/ok", "api.example.com:8443", nil},
-		{http.MethodGet, "https://api.example.com/v1/ok", "", map[string]string{"Connection": "Upgrade", "Upgrade": "h2c"}},
-		{http.MethodGet, "https://api.example.com/v1/ok", "", map[string]string{"Connection": "Upgrade", "Upgrade": "websocket"}},
+		{http.MethodDelete, "https://api.example.com/v1/ok", "", nil, "default-deny"},
+		{http.MethodGet, "https://api.example.com/v2/forbidden", "", nil, "default-deny"},
+		{http.MethodGet, "https://api.example.com/ws", "ws.example.com", nil, "sni-host-mismatch"},
+		{http.MethodGet, "https://api.example.com/v1/ok", "api.example.com:8443", nil, "host-port-mismatch"},
+		{http.MethodGet, "https://api.example.com/v1/ok", "", map[string]string{"Connection": "Upgrade", "Upgrade": "h2c"}, "upgrade-forbidden"},
+		{http.MethodGet, "https://api.example.com/v1/ok", "", map[string]string{"Connection": "Upgrade", "Upgrade": "websocket"}, "websocket-not-allowed"},
 	} {
 		req, err := http.NewRequest(tc.method, tc.url, nil)
 		if err != nil {
@@ -217,11 +231,15 @@ func TestHTTP1RequestGuardsAndMethodPathDeny(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Do %s %s (host=%q): %v", tc.method, tc.url, tc.host, err)
 		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
 		if err := r.Body.Close(); err != nil {
 			t.Fatalf("close body: %v", err)
 		}
-		if r.StatusCode != http.StatusForbidden {
-			t.Fatalf("%s %s (host=%q hdrs=%v): status=%d, want 403", tc.method, tc.url, tc.host, tc.hdrs, r.StatusCode)
+		if r.StatusCode != http.StatusForbidden || !strings.Contains(string(body), tc.reason) {
+			t.Fatalf("%s %s (host=%q hdrs=%v): status=%d body=%q, want 403 %s", tc.method, tc.url, tc.host, tc.hdrs, r.StatusCode, body, tc.reason)
 		}
 	}
 
@@ -258,8 +276,8 @@ func TestHTTP1RequestGuardsAndMethodPathDeny(t *testing.T) {
 		}
 	}
 
-	if httpsReceived.Load() != 0 {
-		t.Fatalf("blocked requests reached upstream: received=%d, want 0", httpsReceived.Load())
+	if got := httpsReceived.Load(); got != controlHits {
+		t.Fatalf("blocked requests reached upstream: received=%d, want %d (the control request only)", got, controlHits)
 	}
 }
 
@@ -309,11 +327,15 @@ func TestNonCanonicalPathsRejectedH1AndH2(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s Do %q: %v", protoLabel, p, err)
 			}
+			refusal, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("%s read %q: %v", protoLabel, p, err)
+			}
 			if err := resp.Body.Close(); err != nil {
 				t.Fatalf("close body: %v", err)
 			}
-			if resp.StatusCode != http.StatusForbidden {
-				t.Fatalf("%s path %q: status=%d, want 403", protoLabel, p, resp.StatusCode)
+			if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(refusal), "non-canonical-path") {
+				t.Fatalf("%s path %q: status=%d body=%q, want 403 non-canonical-path", protoLabel, p, resp.StatusCode, refusal)
 			}
 		}
 		if upReceived.Load() != before {

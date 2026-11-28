@@ -346,7 +346,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	}
 	eval := policy.NewEvaluator(store)
 	leaves := ca.NewLeafCache(mitmCA)
-	dialer := netguard.NewDialer(netguard.Options{Store: store})
+	dialer := netguard.NewDialer(netguard.Options{FakePrefix: cfg.FakePrefix})
 
 	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, rt.reportServeErr); err != nil {
 		return errors.Join(err, rt.shutdownAll())
