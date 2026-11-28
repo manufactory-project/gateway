@@ -49,7 +49,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runVersion(rest, jsonOut, stdout, stderr)
 	}
 	if len(rest) == 0 {
-		return errors.New("usage: gateway [--socket PATH] [--json] <run|netsetup|status|reload|flows|revoke|grants|grant|ca|dataplane|version>")
+		return errors.New("usage: gateway [--socket PATH] [--json] <run|netsetup|status|reload|flows|revoke|grants|grant|audit|ca|dataplane|version>")
 	}
 
 	cmd := rest[0]
@@ -62,6 +62,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runNetsetup(cmdArgs, stdout, stderr)
 	case "ca":
 		return runCA(cmdArgs, jsonOut, stdout, stderr)
+	case "audit":
+		return runAudit(ctx, cmdArgs, jsonOut, stdout, stderr)
 	case "dataplane":
 		return runDataplane(ctx, cmdArgs, jsonOut, stdout, stderr)
 	case "version":

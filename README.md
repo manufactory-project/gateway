@@ -118,8 +118,6 @@ gateway dataplane check --config /etc/gateway/gateway.yaml
 gateway status
 ```
 
-If `gateway status` reports `no such file or directory`, the daemon has not created its socket yet. Run it again.
-
 Leave the container with `exit`.
 
 ### 3. Create the guests

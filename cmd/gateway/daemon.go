@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -104,6 +105,13 @@ func runNetsetup(args []string, stdout, stderr io.Writer) error {
 }
 
 func runDaemon(args []string, stdout, stderr io.Writer) error {
+	// Take SIGHUP before anything else: its default action kills the process, and a
+	// reload requested while the daemon is still starting must be neither fatal nor
+	// lost. It is queued here and applied once the daemon is ready.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
 	fs := flag.NewFlagSet("gateway run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("config", "", "path to gateway YAML config")
@@ -119,7 +127,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return serveDaemon(ctx, *cfgPath, "/proc/sys", stdout, stderr)
+	return serveDaemon(ctx, hup, *cfgPath, "/proc/sys", stdout, stderr)
 }
 
 type daemonRuntime struct {
@@ -303,7 +311,7 @@ func handleSIGHUPReload(snap *config.Snapshot, revokedFlows int, reloadErr error
 	})
 }
 
-func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stderr io.Writer) error {
+func serveDaemon(ctx context.Context, hup <-chan os.Signal, cfgPath, procSysRoot string, stdout, stderr io.Writer) error {
 	store, err := config.NewStore(cfgPath)
 	if err != nil {
 		return err
@@ -368,6 +376,10 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		return errors.Join(err, rt.shutdownAll())
 	}
 
+	if err := notifyReady(); err != nil {
+		return errors.Join(err, rt.shutdownAll())
+	}
+
 	runCtx, runCancel := context.WithCancel(ctx)
 	var bgWG sync.WaitGroup
 	bgWG.Add(2)
@@ -377,12 +389,31 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	}()
 	go func() {
 		defer bgWG.Done()
-		store.WatchSIGHUP(runCtx, func(snap *config.Snapshot, _ []string, revokedFlows int, reloadErr error) {
+		store.WatchSIGHUP(runCtx, hup, func(snap *config.Snapshot, _ []string, revokedFlows int, reloadErr error) {
 			handleSIGHUPReload(snap, revokedFlows, reloadErr, collector, auditWriter, stderr)
 		})
 	}()
 
 	return rt.waitAndShutdown(ctx, runCancel, &bgWG, stderr)
+}
+
+// notifyReady tells systemd (Type=notify) that every listener, the admin socket
+// included, is up, so `systemctl start` returns only once `gateway status` works.
+// It does nothing when not run under systemd.
+func notifyReady() error {
+	path := os.Getenv("NOTIFY_SOCKET")
+	if path == "" {
+		return nil
+	}
+	if strings.HasPrefix(path, "@") {
+		path = string(rune(0)) + path[1:] // abstract socket
+	}
+	conn, err := net.Dial("unixgram", path)
+	if err != nil {
+		return fmt.Errorf("sd_notify: %w", err)
+	}
+	_, err = conn.Write([]byte("READY=1"))
+	return errors.Join(err, conn.Close())
 }
 
 func (rt *daemonRuntime) waitAndShutdown(

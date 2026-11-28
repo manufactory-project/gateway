@@ -407,9 +407,12 @@ func TestStoreSIGHUPReloadWipesGrantsAndKeepsOldOnInvalid(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	reloaded := make(chan []string, 1)
 	done := make(chan struct{})
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
 	go func() {
 		defer close(done)
-		store.WatchSIGHUP(ctx, func(_ *config.Snapshot, wiped []string, _ int, err error) {
+		store.WatchSIGHUP(ctx, hup, func(_ *config.Snapshot, wiped []string, _ int, err error) {
 			if err != nil {
 				t.Errorf("SIGHUP reload error: %v", err)
 				return

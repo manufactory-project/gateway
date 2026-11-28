@@ -531,9 +531,12 @@ rules:
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	var bgWG sync.WaitGroup
 	bgWG.Add(2)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
 	go func() {
 		defer bgWG.Done()
-		store.WatchSIGHUP(bgCtx, func(_ *config.Snapshot, _ []string, _ int, reloadErr error) {
+		store.WatchSIGHUP(bgCtx, hup, func(_ *config.Snapshot, _ []string, _ int, reloadErr error) {
 			col.ObserveReload(reloadErr == nil)
 		})
 	}()

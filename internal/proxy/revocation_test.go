@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
 	"sync"
@@ -390,15 +391,18 @@ func TestSIGHUPWipesGrantsAndTearsDownStream(t *testing.T) {
 		}),
 	})
 
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
 	sigCtx, sigCancel := context.WithCancel(context.Background())
 	sigDone := make(chan struct{})
 	go func() {
 		defer close(sigDone)
-		gw.Store.WatchSIGHUP(sigCtx, nil)
+		gw.Store.WatchSIGHUP(sigCtx, hup, nil)
 	}()
 	t.Cleanup(func() {
 		sigCancel()
 		<-sigDone
+		signal.Stop(hup)
 	})
 
 	gHUP, err := gw.Store.AddGrant("worker-test", "h2grant.example.com", 443, []string{"GET"}, []string{"/stream-hup"}, 5*time.Minute, false)

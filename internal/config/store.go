@@ -9,12 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -207,19 +205,16 @@ func checkReloadImmutable(prev, next *Config) error {
 	return nil
 }
 
-// WatchSIGHUP listens for syscall.SIGHUP until ctx is cancelled, calling Reload
-// on each signal and invoking onResult (if non-nil) with the outcome.
-// It returns only after unregistering its signal channel so callers can join cleanly.
-func (s *Store) WatchSIGHUP(ctx context.Context, onResult func(*Snapshot, []string, int, error)) {
-	ch := make(chan os.Signal, 4)
-	signal.Notify(ch, syscall.SIGHUP)
-	defer signal.Stop(ch)
-
+// WatchSIGHUP calls Reload on each signal received on hup until ctx is cancelled,
+// invoking onResult (if non-nil) with the outcome. The caller registers hup with
+// signal.Notify, early enough that a SIGHUP arriving before the watcher starts is
+// queued rather than lost, and stops it after WatchSIGHUP returns.
+func (s *Store) WatchSIGHUP(ctx context.Context, hup <-chan os.Signal, onResult func(*Snapshot, []string, int, error)) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ch:
+		case <-hup:
 			snap, wiped, revokedFlows, err := s.Reload()
 			if onResult != nil {
 				onResult(snap, wiped, revokedFlows, err)

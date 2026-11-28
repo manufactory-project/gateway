@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=gateway
 Group=gateway
 ExecStartPre=+/usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml

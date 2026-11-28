@@ -241,7 +241,7 @@ rules:
 	// A daemon that wrongly starts returns nil when startCtx ends, failing the assertion.
 	startCtx, startCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer startCancel()
-	if err := serveDaemon(startCtx, cfgPath, procSysRoot, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "ready_file") {
+	if err := serveDaemon(startCtx, nil, cfgPath, procSysRoot, &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "ready_file") {
 		t.Fatalf("expected daemon to refuse startup when ready_file is missing, got %v", err)
 	}
 
@@ -255,7 +255,7 @@ rules:
 	// With the ready_file present, missing sysctls alone still refuse startup.
 	sysCtx, sysCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer sysCancel()
-	if err := serveDaemon(sysCtx, cfgPath, t.TempDir(), &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "sysctl") {
+	if err := serveDaemon(sysCtx, nil, cfgPath, t.TempDir(), &bytes.Buffer{}, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "sysctl") {
 		t.Fatalf("expected daemon to refuse startup without required sysctls, got %v", err)
 	}
 
@@ -263,7 +263,7 @@ rules:
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(ctx, cfgPath, procSysRoot, records, &bytes.Buffer{})
+		done <- serveDaemon(ctx, nil, cfgPath, procSysRoot, records, &bytes.Buffer{})
 	}()
 
 	client := admin.NewClient(sockPath)
@@ -475,7 +475,7 @@ rules:
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- serveDaemon(ctx, cfgPath, procSysRoot, records, &bytes.Buffer{})
+		done <- serveDaemon(ctx, nil, cfgPath, procSysRoot, records, &bytes.Buffer{})
 	}()
 
 	client := admin.NewClient(sockPath)
