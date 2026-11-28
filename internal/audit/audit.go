@@ -107,7 +107,13 @@ type Options struct {
 	Now           func() time.Time
 	OnWriteError  func()
 	OnSizePrune   func(bytesRemoved int64)
+	// OnMirrorDropped is called for each record left out of the Stdout mirror
+	// because the mirror had fallen mirrorQueue records behind.
+	OnMirrorDropped func()
 }
+
+// mirrorQueue is how many records the Stdout mirror may lag behind the file.
+const mirrorQueue = 1024
 
 // Writer appends structured JSONL audit events synchronously and fails closed
 // whenever the underlying file sink cannot be opened or written.
@@ -121,6 +127,12 @@ type Writer struct {
 	now           func() time.Time
 	onWriteError  func()
 	onSizePrune   func(bytesRemoved int64)
+
+	// mirror feeds the Stdout mirror, written by one goroutine so that a stalled
+	// consumer (a blocked pipe, a hung journald) can never hold mu.
+	mirror          chan []byte
+	mirrorDone      chan struct{}
+	onMirrorDropped func()
 
 	mu          sync.Mutex
 	closed      bool
@@ -168,6 +180,8 @@ func NewWriter(opts Options) (*Writer, error) {
 		now:           nowFn,
 		onWriteError:  opts.OnWriteError,
 		onSizePrune:   opts.OnSizePrune,
+
+		onMirrorDropped: opts.OnMirrorDropped,
 	}
 
 	if err := w.openSegmentLocked(nowFn().UTC(), false); err != nil {
@@ -175,7 +189,25 @@ func NewWriter(opts Options) (*Writer, error) {
 		return nil, err
 	}
 	w.healthy.Store(true)
+	if w.stdout != nil {
+		w.mirror = make(chan []byte, mirrorQueue)
+		w.mirrorDone = make(chan struct{})
+		go w.runMirror()
+	}
 	return w, nil
+}
+
+// runMirror writes queued records to the Stdout mirror until Close drains it.
+func (w *Writer) runMirror() {
+	defer close(w.mirrorDone)
+	for line := range w.mirror {
+		if _, err := w.stdout.Write(line); err != nil {
+			if _, dErr := fmt.Fprintf(w.diag, "audit: stdout mirror write failed: %v\n", err); dErr != nil {
+				// diag itself failed; the file sink is authoritative and unaffected.
+				continue
+			}
+		}
+	}
 }
 
 // WriteSync sanitizes, encodes, and synchronously writes ev to the current audit
@@ -231,11 +263,14 @@ func (w *Writer) writeLineLocked(line []byte) error {
 	w.fileSize += int64(n)
 	w.healthy.Store(true)
 
-	if w.stdout != nil {
-		if _, err := w.stdout.Write(line); err != nil {
-			if _, dErr := fmt.Fprintf(w.diag, "audit: stdout mirror write failed: %v\n", err); dErr != nil {
-				// diag itself failed; primary file sink succeeded.
-				return nil
+	if w.mirror != nil {
+		// The file is the authoritative record. The mirror is best effort: a full
+		// queue drops the record from the mirror only, and counts it.
+		select {
+		case w.mirror <- line:
+		default:
+			if w.onMirrorDropped != nil {
+				w.onMirrorDropped()
 			}
 		}
 	}
@@ -245,9 +280,17 @@ func (w *Writer) writeLineLocked(line []byte) error {
 // Close flushes and closes the active audit segment file.
 func (w *Writer) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	if !w.closed && w.mirror != nil {
+		// Sends happen under mu and only while not closed, so closing here is safe.
+		close(w.mirror)
+	}
 	w.closed = true
-	return w.closeFileLocked()
+	err := w.closeFileLocked()
+	w.mu.Unlock()
+	if w.mirrorDone != nil {
+		<-w.mirrorDone // the queued records are drained, outside mu
+	}
+	return err
 }
 
 // WriteErrors returns the total number of failed audit writes since creation.

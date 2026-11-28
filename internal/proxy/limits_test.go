@@ -640,3 +640,60 @@ func TestUnreadResponseIsCutOff(t *testing.T) {
 		t.Fatal("gateway never cut off a guest that does not read its response")
 	}
 }
+
+// stalledMirror is an audit stdout mirror whose consumer has hung.
+type stalledMirror struct{ release chan struct{} }
+
+func (m stalledMirror) Write(p []byte) (int, error) {
+	<-m.release
+	return len(p), nil
+}
+
+// A stalled stdout consumer must not stall another link's admission, which
+// needs an audit write before the request is sent.
+func TestStalledAuditMirrorDoesNotStallAnotherLink(t *testing.T) {
+	mirror := stalledMirror{release: make(chan struct{})}
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts:     []string{"ok.example.com"},
+		Mirror:    mirror,
+		RulesYAML: fmt.Sprintf(allowRule("ok.example.com"), "worker-test"),
+	})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(mirror.release) }) })
+	peer := newPeer(t, gw, "ok.example.com")
+
+	// Far more records than the mirror queue holds, all written to the file.
+	client := peer.H1Client(t, "ok.example.com")
+	done := make(chan error, 1)
+	go func() {
+		for range 600 {
+			resp, err := client.Get("https://ok.example.com/")
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := resp.Body.Close(); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("peer request: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("another link's requests stalled behind a blocked audit mirror")
+	}
+	admitted := 0
+	for _, ev := range peer.AuditEvents(t) {
+		if ev.Kind == audit.KindRequestAdmitted && ev.Principal == "worker-peer" {
+			admitted++
+		}
+	}
+	if admitted != 600 {
+		t.Fatalf("admission records for the peer link in the audit file = %d, want 600", admitted)
+	}
+}

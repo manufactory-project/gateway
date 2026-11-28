@@ -118,6 +118,10 @@ func TestAuditQueryRedactionAndPeerEscaping(t *testing.T) {
 		t.Fatalf("WriteSync positive control: %v", err)
 	}
 
+	// The mirror is written asynchronously; Close drains it.
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 	raw := stdout.String()
 	if strings.Contains(raw, secretToken) {
 		t.Fatalf("audit output leaked query secret %q:\n%s", secretToken, raw)

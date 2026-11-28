@@ -161,6 +161,8 @@ type testGatewaySpec struct {
 	// ShareAuditWith makes this gateway write to the other's audit log through
 	// the same Writer, as the links of one daemon do.
 	ShareAuditWith *testGateway
+	// Mirror replaces the audit stdout mirror (default: the record signal).
+	Mirror io.Writer
 }
 
 type testGateway struct {
@@ -284,6 +286,10 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	flows.SetOnRevoke(col.AddRevocations)
 
 	records := newRecordSignal()
+	var mirror io.Writer = records
+	if spec.Mirror != nil {
+		mirror = spec.Mirror
+	}
 	var aw *audit.Writer
 	if spec.ShareAuditWith != nil {
 		aw = spec.ShareAuditWith.Audit
@@ -291,7 +297,7 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	} else {
 		aw, err = audit.NewWriter(audit.Options{
 			Dir:          auditDir,
-			Stdout:       records,
+			Stdout:       mirror,
 			MaxFileBytes: spec.AuditMaxFileBytes,
 			OnWriteError: func() {
 				col.IncAuditWriteError()

@@ -337,6 +337,8 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 		Diag:          stderr,
 		OnWriteError:  collector.IncAuditWriteError,
 		OnSizePrune:   collector.ObserveAuditSizePruned,
+
+		OnMirrorDropped: collector.IncAuditMirrorDropped,
 	})
 	if err != nil {
 		return err

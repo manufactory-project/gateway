@@ -24,6 +24,7 @@ type Collector struct {
 	registry                  *prometheus.Registry
 	auditWriteErrors          prometheus.Counter
 	auditSizePrunedBytesTotal prometheus.Counter
+	auditMirrorDroppedTotal   prometheus.Counter
 	requestsTotal             *prometheus.CounterVec
 	dnsQueriesTotal           *prometheus.CounterVec
 	reloadsTotal              *prometheus.CounterVec
@@ -52,6 +53,10 @@ func NewCollector(opts Options) *Collector {
 		auditSizePrunedBytesTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "gateway_audit_size_pruned_bytes_total",
 			Help: "Total bytes removed from closed audit segments by max_total_bytes pruning.",
+		}),
+		auditMirrorDroppedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gateway_audit_mirror_dropped_total",
+			Help: "Total audit records left out of the stdout mirror because it fell too far behind; the audit file still has them.",
 		}),
 		requestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_requests_total",
@@ -86,6 +91,7 @@ func NewCollector(opts Options) *Collector {
 	reg.MustRegister(
 		c.auditWriteErrors,
 		c.auditSizePrunedBytesTotal,
+		c.auditMirrorDroppedTotal,
 		c.requestsTotal,
 		c.dnsQueriesTotal,
 		c.reloadsTotal,
@@ -113,6 +119,11 @@ func NewCollector(opts Options) *Collector {
 // IncAuditWriteError increments gateway_audit_write_errors_total.
 func (c *Collector) IncAuditWriteError() {
 	c.auditWriteErrors.Inc()
+}
+
+// IncAuditMirrorDropped increments gateway_audit_mirror_dropped_total.
+func (c *Collector) IncAuditMirrorDropped() {
+	c.auditMirrorDroppedTotal.Inc()
 }
 
 // ObserveAuditSizePruned adds bytesRemoved to gateway_audit_size_pruned_bytes_total.

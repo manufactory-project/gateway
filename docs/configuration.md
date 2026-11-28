@@ -226,7 +226,7 @@ A rule that pins grants no access by itself, and is subject to every `deny`. Ups
 | `retain_days` | no | 30 | Age at which files are deleted |
 | `max_file_bytes` | no | 104857600 (100 MiB) | Size at which a new file starts |
 | `max_total_bytes` | no | 10737418240 (10 GiB) | Size limit for the directory; oldest files go first |
-| `stdout_json` | no | `false` | Also write records to stdout |
+| `stdout_json` | no | `false` | Also write records to stdout. The file stays authoritative; stdout is a best-effort copy fed through a queue of 1024 records, so a stalled consumer cannot delay any link. Records it cannot take are left out of stdout only and counted in `gateway_audit_mirror_dropped_total` |
 
 A value of 0 selects the default. `max_file_bytes` must not exceed `max_total_bytes`. Both limits are applied when a new file is opened, and the file being written is never deleted, so the directory can exceed the total limit between rotations.
 

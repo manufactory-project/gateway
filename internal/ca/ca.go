@@ -211,8 +211,9 @@ func NewLeafCacheWithOptions(c CA, capacity int, now func() time.Time) *LeafCach
 var ErrMintLimited = errors.New("ca: leaf mint rate limit exceeded")
 
 // Leaf returns a valid cached leaf for name or mints one without holding c.mu.
-// A cache hit never calls admit; a mint calls it once first, and Leaf returns
-// ErrMintLimited when it refuses, so each caller can budget its own minting.
+// A cache hit never calls admit; a miss calls it once before minting or joining
+// a mint in progress, and Leaf returns ErrMintLimited when it refuses, so each
+// caller budgets its own minting.
 func (c *LeafCache) Leaf(name string, admit func() bool) (*tls.Certificate, error) {
 	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
 	if name == "" {
@@ -228,6 +229,11 @@ func (c *LeafCache) Leaf(name string, admit func() bool) (*tls.Certificate, erro
 	}
 	c.mu.RUnlock()
 
+	// Each caller spends its own budget after its own miss, before joining the
+	// flight, so a refused caller never makes another link's mint fail.
+	if !admit() {
+		return nil, ErrMintLimited
+	}
 	v, err, _ := c.sf.Do(name, func() (any, error) {
 		nowInner := c.now().UTC()
 		c.mu.RLock()
@@ -238,9 +244,6 @@ func (c *LeafCache) Leaf(name string, admit func() bool) (*tls.Certificate, erro
 		}
 		c.mu.RUnlock()
 
-		if !admit() {
-			return nil, ErrMintLimited
-		}
 		// Mint ECDSA key and X.509 certificate with NO cache lock held.
 		cert, notAfter, err := c.mint(name, nowInner)
 		if err != nil {
