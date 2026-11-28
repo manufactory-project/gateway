@@ -32,7 +32,7 @@ func wsCancelOrErr(af *activeFlow, ctx context.Context, fallback string) (status
 func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activeFlow) {
 	upConn, err := s.dialWebSocketUpstream(rc.r.Context(), rc.host, rc.dstPort)
 	if err != nil {
-		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), err.Error())
+		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), upstreamErrorText(err))
 		rc.auditCompleted(status, 0, 0, errText)
 		if canceled {
 			panic(http.ErrAbortHandler)
@@ -52,7 +52,7 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 	outReq := buildWSUpgradeRequest(rc)
 	upReader, resp, err := performWSHandshake(rc.r.Context(), upConn, outReq, wsHandshakeTimeout)
 	if err != nil {
-		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), err.Error())
+		status, errText, canceled := wsCancelOrErr(af, rc.r.Context(), upstreamErrorText(err))
 		rc.auditCompleted(status, 0, 0, errText)
 		if canceled {
 			panic(http.ErrAbortHandler)
@@ -189,7 +189,7 @@ func handleNonWSResponse(w http.ResponseWriter, rc *reqContext, af *activeFlow, 
 		if rc.r.Context().Err() != nil {
 			errText = TeardownClientCanceled
 		} else {
-			errText = copyErr.Error()
+			errText = upstreamErrorText(copyErr)
 		}
 	}
 	rc.auditCompleted(resp.StatusCode, 0, bytesIn, errText)

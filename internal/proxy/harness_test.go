@@ -119,6 +119,7 @@ type testGatewaySpec struct {
 	CountCASigns      bool
 	StartGrantPruner  bool
 	OnCleanupFirst    func()
+	UpstreamH1        bool
 }
 
 type testGateway struct {
@@ -167,7 +168,7 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		certHosts = []string{"example.com"}
 	}
 	upTLS := httptest.NewUnstartedServer(handler)
-	upTLS.EnableHTTP2 = true
+	upTLS.EnableHTTP2 = !spec.UpstreamH1
 	upTLS.TLS = &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{makeSignedServerCert(t, testUpstreamCA, certHosts)},

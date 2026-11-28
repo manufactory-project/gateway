@@ -2,6 +2,7 @@ package proxy_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,6 +62,19 @@ func readAll(t *testing.T, r io.Reader) string {
 	return string(b)
 }
 
+// writeRawHTTP1 answers an HTTP/1.1 upstream request with exactly raw. A failure
+// aborts the handler, which the calling test sees as a missing audit token.
+func writeRawHTTP1(w http.ResponseWriter, raw string) {
+	conn, buf, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	_, writeErr := buf.WriteString(raw)
+	if err := errors.Join(writeErr, buf.Flush(), conn.Close()); err != nil {
+		panic(http.ErrAbortHandler)
+	}
+}
+
 func TestBoundHostNeverServesPartialResponses(t *testing.T) {
 	secretValue := "sk-" + strings.Repeat("Z", 40)
 	secretFile := writeSecretFile(t, t.TempDir(), "key", secretValue)
@@ -99,6 +113,33 @@ func TestBoundHostNeverServesPartialResponses(t *testing.T) {
 	}
 }
 
+func TestUpstreamControlledErrorTextNeverReachesAudit(t *testing.T) {
+	secretValue := "sk-" + strings.Repeat("Q", 30)
+	secretFile := writeSecretFile(t, t.TempDir(), "key", secretValue)
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			writeRawHTTP1(w, "HTTP/1.1 "+token+" nope\r\n\r\n")
+		}),
+		RulesYAML:  boundRule("r", "api.example.com", secretFile),
+		UpstreamH1: true,
+	})
+
+	resp := do(t, gw.H1Client(t, "api.example.com"), http.MethodGet, "https://api.example.com/x",
+		map[string]string{"Authorization": "Bearer mf_ph_key"})
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	gw.AssertAuditNotContains(t, secretValue)
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Error == "upstream-error" {
+			return
+		}
+	}
+	t.Fatalf("no completion event with error upstream-error: %+v", gw.AuditEvents(t))
+}
+
 func TestUnreadableBoundSecretFailsBeforeDispatch(t *testing.T) {
 	var hits atomic.Int32
 	gw := newTestGateway(t, testGatewaySpec{
@@ -112,4 +153,25 @@ func TestUnreadableBoundSecretFailsBeforeDispatch(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden || hits.Load() != 0 {
 		t.Fatalf("status = %d, upstream requests = %d; want 403 and 0", resp.StatusCode, hits.Load())
 	}
+}
+
+func TestUpstreamHangingUpIsAuditedAsConnectionClosed(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRawHTTP1(w, "")
+		}),
+		RulesYAML:  boundRule("r", "api.example.com", writeSecretFile(t, t.TempDir(), "key", "sk-unused-value")),
+		UpstreamH1: true,
+	})
+	resp := do(t, gw.H1Client(t, "api.example.com"), http.MethodGet, "https://api.example.com/x", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Error == "upstream-error: connection-closed" {
+			return
+		}
+	}
+	t.Fatalf("no completion event classed connection-closed: %+v", gw.AuditEvents(t))
 }

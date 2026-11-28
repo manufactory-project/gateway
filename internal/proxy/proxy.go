@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/manufactory-project/gateway/internal/audit"
@@ -399,6 +400,37 @@ func (rc *reqContext) auditAdmitted() error {
 	return rc.srv.audit.WriteSync(ev)
 }
 
+// upstreamErrorText returns what may be audited about a failed upstream exchange.
+// Failures before the request is sent are recorded verbatim. Later errors can
+// quote upstream bytes, including a reflected secret or header value, so they are
+// reduced to a fixed class chosen by type, never by text.
+func upstreamErrorText(err error) string {
+	var (
+		opErr     *net.OpError
+		dnsErr    *net.DNSError
+		certErr   *tls.CertificateVerificationError
+		netErr    net.Error
+		alertErr  tls.AlertError
+		recordErr tls.RecordHeaderError
+		protoErr  textproto.ProtocolError
+	)
+	switch {
+	case errors.As(err, &opErr) && opErr.Op == "dial", errors.As(err, &dnsErr), errors.As(err, &certErr),
+		errors.Is(err, netguard.ErrBlockedAddress), errors.Is(err, netguard.ErrIPLiteralHost):
+		return err.Error()
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "upstream-error: timeout"
+	case errors.As(err, &alertErr), errors.As(err, &recordErr):
+		return "upstream-error: tls"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, syscall.ECONNRESET):
+		return "upstream-error: connection-closed"
+	case errors.As(err, &protoErr):
+		return "upstream-error: malformed-response"
+	default:
+		return "upstream-error"
+	}
+}
+
 func completionMetricReason(admitReason, errText string) string {
 	if errText == "" {
 		if admitReason != "" {
@@ -612,7 +644,7 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 			rc.auditCompleted(statusClientClosedRequest, countingBody.n.Load(), 0, TeardownClientCanceled)
 			panic(http.ErrAbortHandler)
 		}
-		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, err.Error())
+		rc.auditCompleted(http.StatusBadGateway, countingBody.n.Load(), 0, upstreamErrorText(err))
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
@@ -638,7 +670,7 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 		if parentCtx.Err() != nil {
 			errText = TeardownClientCanceled
 		} else {
-			errText = copyErr.Error()
+			errText = upstreamErrorText(copyErr)
 		}
 	}
 	rc.auditCompleted(resp.StatusCode, countingBody.n.Load(), bytesIn, errText)
