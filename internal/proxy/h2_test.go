@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/manufactory-project/gateway/internal/proxy"
 )
 
 func TestHTTP2GRPCTrailersAndSSEFlush(t *testing.T) {
@@ -249,7 +251,7 @@ func TestHTTP2GrantIsolationAcrossConnections(t *testing.T) {
 
 	// Revoke gA: tears down stream A while leaving separate connection stream C intact.
 	gw.Store.RevokeGrant(gA.ID)
-	if n := gw.Flows.RevokeByGrant(gA.ID); n != 1 {
+	if n := gw.Flows.RevokeByGrant(gA.ID, proxy.TeardownRevoked); n != 1 {
 		t.Fatalf("RevokeByGrant(gA) = %d, want 1", n)
 	}
 	doneA := make(chan error, 1)

@@ -110,7 +110,7 @@ func (a testFlowAdapter) ListFlows() []admin.FlowInfo {
 
 func (a testFlowAdapter) CountFlows() int                   { return a.flows.Count() }
 func (a testFlowAdapter) RevokeByID(id string) int          { return a.flows.RevokeByID(id) }
-func (a testFlowAdapter) RevokeByGrant(id string) int       { return a.flows.RevokeByGrant(id) }
+func (a testFlowAdapter) RevokeByGrant(id string) int       { return a.flows.RevokeByGrant(id, proxy.TeardownRevoked) }
 func (a testFlowAdapter) RevokeByPrincipal(p, h string) int { return a.flows.RevokeByPrincipal(p, h) }
 
 func tcpPort(t *testing.T, addr net.Addr) uint16 {
@@ -448,7 +448,7 @@ rules:
 		return n
 	})
 	store.OnGrantExpired(func(g config.Grant) {
-		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+		flows.RevokeByGrant(g.ID, proxy.TeardownGrantExpired)
 	})
 	if err := pSrv.Start(); err != nil {
 		t.Fatalf("proxy.Start: %v", err)
@@ -902,7 +902,7 @@ func startAdminAuditHarness(t *testing.T, baseYAML, auditDir string, rootCA ca.C
 		return n
 	})
 	store.OnGrantExpired(func(g config.Grant) {
-		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+		flows.RevokeByGrant(g.ID, proxy.TeardownGrantExpired)
 	})
 	if err := pSrv.Start(); err != nil {
 		t.Fatalf("proxy.Start: %v", err)
@@ -1038,6 +1038,18 @@ rules:
 	}
 	drainStreamResp(t, r1)
 
+	// 1b. Create a second grant and revoke it via POST /v1/revoke {grant_id}; verify audit records Principal/Host/Port.
+	gRevoke, err := admClient.CreateGrant(context.Background(), admin.GrantRequest{
+		Principal: "worker-a", Host: "revoke.example.com", Port: 443,
+		TTL: "5m",
+	})
+	if err != nil {
+		t.Fatalf("CreateGrant for revoke-grant: %v", err)
+	}
+	if _, err := admClient.Revoke(context.Background(), admin.RevokeRequest{GrantID: gRevoke.ID}); err != nil {
+		t.Fatalf("Revoke grant_id: %v", err)
+	}
+
 	// 2. Open stream on allow-rule, then revoke principal.
 	r2 := openStream("rule.example.com", "/hold")
 	<-streamOpen
@@ -1058,7 +1070,7 @@ rules:
 	}
 	drainStreamResp(t, r3)
 
-	var sawCreated, sawDeleted, sawRevoke, sawReload bool
+	var sawCreated, sawDeleted, sawRevokeGrant, sawRevoke, sawReload bool
 	for _, ev := range readAuditEvents(t, auditDir) {
 		switch ev.Reason {
 		case "grant-created":
@@ -1075,6 +1087,13 @@ rules:
 					t.Fatalf("grant-deleted audit incomplete: %+v", ev)
 				}
 			}
+		case "revoke-grant":
+			if ev.GrantID == gRevoke.ID {
+				sawRevokeGrant = true
+				if ev.Principal != "worker-a" || ev.Host != "revoke.example.com" || ev.Port != 443 {
+					t.Fatalf("revoke-grant audit missing grant identity: principal=%q host=%q port=%d", ev.Principal, ev.Host, ev.Port)
+				}
+			}
 		case "revoke-principal":
 			sawRevoke = true
 			if ev.RevokedFlows == nil || *ev.RevokedFlows != 1 {
@@ -1087,7 +1106,7 @@ rules:
 			}
 		}
 	}
-	if !sawCreated || !sawDeleted || !sawRevoke || !sawReload {
-		t.Fatalf("missing audit events: created=%v deleted=%v revoke=%v reload=%v", sawCreated, sawDeleted, sawRevoke, sawReload)
+	if !sawCreated || !sawDeleted || !sawRevokeGrant || !sawRevoke || !sawReload {
+		t.Fatalf("missing audit events: created=%v deleted=%v revokeGrant=%v revoke=%v reload=%v", sawCreated, sawDeleted, sawRevokeGrant, sawRevoke, sawReload)
 	}
 }

@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -781,5 +784,154 @@ rules:
 	}
 	if !sawListenerErr {
 		t.Fatalf("missing audit lifecycle event with reason=listener-error and error containing %q", permErr.Error())
+	}
+}
+
+type grantExpiredOrderSpy struct {
+	flows          *proxy.FlowRegistry
+	seen           atomic.Bool
+	flowsAtAudit   atomic.Int64
+}
+
+func (s *grantExpiredOrderSpy) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"reason":"grant-expired"`)) {
+		s.flowsAtAudit.Store(int64(s.flows.Count()))
+		s.seen.Store(true)
+	}
+	return len(p), nil
+}
+
+func TestGrantExpiryTearsDownFlowsBeforeAuditWrite(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	mitmCA, err := ca.Init(certPath, keyPath)
+	if err != nil {
+		t.Fatalf("ca.Init: %v", err)
+	}
+	auditDir := filepath.Join(dir, "audit")
+	linkPorts := freePorts(t, "127.0.30.1", 3)
+
+	streamOpen := make(chan struct{})
+	releaseUp := make(chan struct{})
+	upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, wErr := io.WriteString(w, "open\n"); wErr != nil {
+			return
+		}
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		close(streamOpen)
+		select {
+		case <-r.Context().Done():
+		case <-releaseUp:
+		}
+	}))
+	t.Cleanup(func() {
+		close(releaseUp)
+		upSrv.Close()
+	})
+
+	cfgYAML := fmt.Sprintf(`
+ca:
+  cert_path: %s
+  key_path: %s
+audit:
+  dir: %s
+links:
+  - name: sbx0
+    principal: worker-claude
+    subnet: 127.0.30.0/28
+    gateway_ip: 127.0.30.1
+    https_port: %d
+    http_port: %d
+    dns_port: %d
+`, certPath, keyPath, auditDir, linkPorts[0], linkPorts[1], linkPorts[2])
+	cfgPath := filepath.Join(dir, "gateway.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	flows := proxy.NewFlowRegistry()
+	spy := &grantExpiredOrderSpy{flows: flows}
+	spy.flowsAtAudit.Store(-1)
+	aw, err := audit.NewWriter(audit.Options{Dir: auditDir, Stdout: spy})
+	if err != nil {
+		t.Fatalf("audit.NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if cErr := aw.Close(); cErr != nil {
+			t.Errorf("audit close: %v", cErr)
+		}
+	})
+
+	eval := policy.NewEvaluator(store)
+	pSrv, err := proxy.NewServer(proxy.Options{
+		Link:      store.Current().Config.Links[0],
+		Store:     store,
+		Evaluator: eval,
+		Audit:     aw,
+		Leaves:    ca.NewLeafCache(mitmCA),
+		Flows:     flows,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, upSrv.Listener.Addr().String())
+		},
+	})
+	if err != nil {
+		t.Fatalf("proxy.NewServer: %v", err)
+	}
+	if err := pSrv.Start(); err != nil {
+		t.Fatalf("proxy.Start: %v", err)
+	}
+	t.Cleanup(func() {
+		sCtx, sCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer sCancel()
+		if sErr := pSrv.Shutdown(sCtx); sErr != nil {
+			t.Errorf("proxy.Shutdown: %v", sErr)
+		}
+	})
+
+	registerDaemonCallbacks(store, eval, flows, []*proxy.Server{pSrv}, aw, &bytes.Buffer{})
+
+	if _, err := store.AddGrant("worker-claude", "order.example.com", 80, nil, nil, 80*time.Millisecond, false); err != nil {
+		t.Fatalf("AddGrant: %v", err)
+	}
+	httpAddr := fmt.Sprintf("127.0.30.1:%d", linkPorts[1])
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, httpAddr)
+		},
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://order.example.com/hold", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		t.Fatalf("Do /hold: %v", err)
+	}
+	<-streamOpen
+
+	time.Sleep(110 * time.Millisecond)
+	store.PruneExpiredGrants()
+	if _, rErr := io.ReadAll(resp.Body); rErr == nil {
+		t.Log("stream closed with EOF")
+	}
+	if cErr := resp.Body.Close(); cErr != nil {
+		t.Logf("close resp body: %v", cErr)
+	}
+
+	if !spy.seen.Load() {
+		t.Fatal("grant-expired audit line was not observed")
+	}
+	if got := spy.flowsAtAudit.Load(); got != 0 {
+		t.Fatalf("flows.Count() during grant-expired audit write = %d, want 0 (teardown must run before audit write)", got)
 	}
 }

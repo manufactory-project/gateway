@@ -299,7 +299,7 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 		return n
 	})
 	store.OnGrantExpired(func(g config.Grant) {
-		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+		flows.RevokeByGrant(g.ID, proxy.TeardownGrantExpired)
 	})
 	if err := srv.Start(); err != nil {
 		t.Fatalf("proxy.Start: %v", err)

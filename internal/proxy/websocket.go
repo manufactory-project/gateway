@@ -104,6 +104,10 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, rc *reqContext, af *activ
 }
 
 func (s *Server) dialWebSocketUpstream(ctx context.Context, host string, dstPort uint16) (net.Conn, error) {
+	return s.dialWebSocketUpstreamWithTimeout(ctx, host, dstPort, wsHandshakeTimeout)
+}
+
+func (s *Server) dialWebSocketUpstreamWithTimeout(ctx context.Context, host string, dstPort uint16, tlsTimeout time.Duration) (net.Conn, error) {
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
 	rawUpstream, err := s.dialContext(ctx, "tcp", targetAddr)
 	if err != nil {
@@ -117,7 +121,9 @@ func (s *Server) dialWebSocketUpstream(ctx context.Context, host string, dstPort
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"http/1.1"},
 	})
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
+	hsCtx, cancel := context.WithTimeout(ctx, tlsTimeout)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(hsCtx); err != nil {
 		if closeErr := rawUpstream.Close(); closeErr != nil {
 			err = errors.Join(err, closeErr)
 		}

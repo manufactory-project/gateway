@@ -314,7 +314,6 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	if err != nil {
 		return err
 	}
-	registerGrantExpiredAudit(store, auditWriter, stderr)
 
 	rt := &daemonRuntime{auditWriter: auditWriter}
 	serveErrCh := make(chan error, 1)
@@ -335,7 +334,7 @@ func serveDaemon(ctx context.Context, cfgPath, procSysRoot string, stdout, stder
 	if err := rt.startLinks(cfg, store, eval, alloc, leaves, dialer, flows, collector, reportServeErr); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
-	registerFlowLifecycleCallbacks(store, eval, flows, rt.proxyServers)
+	registerDaemonCallbacks(store, eval, flows, rt.proxyServers, auditWriter, stderr)
 	if err := rt.startControl(cfg, store, flows, collector, reportServeErr); err != nil {
 		return errors.Join(err, rt.shutdownAll())
 	}
@@ -397,6 +396,11 @@ func (rt *daemonRuntime) waitAndShutdown(
 	return rt.shutdownAll()
 }
 
+func registerDaemonCallbacks(store *config.Store, eval *policy.Evaluator, flows *proxy.FlowRegistry, servers []*proxy.Server, auditWriter *audit.Writer, stderr io.Writer) {
+	registerFlowLifecycleCallbacks(store, eval, flows, servers)
+	registerGrantExpiredAudit(store, auditWriter, stderr)
+}
+
 func registerFlowLifecycleCallbacks(store *config.Store, eval *policy.Evaluator, flows *proxy.FlowRegistry, servers []*proxy.Server) {
 	store.OnReload(func(_, _ *config.Snapshot, wipedGrantIDs []string) int {
 		n := proxy.RevokeReloadedFlows(flows, eval, wipedGrantIDs)
@@ -406,7 +410,7 @@ func registerFlowLifecycleCallbacks(store *config.Store, eval *policy.Evaluator,
 		return n
 	})
 	store.OnGrantExpired(func(g config.Grant) {
-		flows.RevokeByGrantWithReason(g.ID, proxy.TeardownGrantExpired)
+		flows.RevokeByGrant(g.ID, proxy.TeardownGrantExpired)
 	})
 }
 
@@ -460,7 +464,7 @@ func (a adminFlowAdapter) RevokeByID(flowID string) int {
 }
 
 func (a adminFlowAdapter) RevokeByGrant(grantID string) int {
-	return a.flows.RevokeByGrant(grantID)
+	return a.flows.RevokeByGrant(grantID, proxy.TeardownRevoked)
 }
 
 func (a adminFlowAdapter) RevokeByPrincipal(principal, host string) int {

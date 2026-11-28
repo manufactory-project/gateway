@@ -678,9 +678,9 @@ func TestReloadWithUnprunedExpiredGrantDoesNotDeadlock(t *testing.T) {
 		defer close(reenterDone)
 		gw.Flows.RevokeWhere(func(_ proxy.FlowInfo) bool {
 			_ = gw.Store.ActiveGrants()
-			_ = gw.Flows.RevokeByGrant("nonexistent")
+			_ = gw.Flows.RevokeByGrant("nonexistent", proxy.TeardownRevoked)
 			return false
-		})
+		}, proxy.TeardownRevoked)
 	}()
 	select {
 	case <-reenterDone:

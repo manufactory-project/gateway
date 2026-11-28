@@ -303,13 +303,20 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		revokedFlows int
 		revokedGrant bool
 		reason       string
+		principal    = req.Principal
+		host         = req.Host
+		port         int
 	)
 	switch {
 	case req.FlowID != "":
 		revokedFlows = s.flows.RevokeByID(req.FlowID)
 		reason = "revoke-flow"
 	case req.GrantID != "":
-		_, revokedGrant = s.store.RevokeGrant(req.GrantID)
+		var deletedGrant config.Grant
+		deletedGrant, revokedGrant = s.store.RevokeGrant(req.GrantID)
+		principal = deletedGrant.Principal
+		host = deletedGrant.Host
+		port = int(deletedGrant.Port)
 		revokedFlows = s.flows.RevokeByGrant(req.GrantID)
 		reason = "revoke-grant"
 	case req.Principal != "":
@@ -319,8 +326,9 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.audit.WriteSync(audit.Event{
 		Kind:         audit.KindRevoke,
-		Principal:    req.Principal,
-		Host:         req.Host,
+		Principal:    principal,
+		Host:         host,
+		Port:         port,
 		FlowID:       req.FlowID,
 		GrantID:      req.GrantID,
 		RevokedFlows: &revokedFlows,

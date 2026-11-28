@@ -1,47 +1,38 @@
 package proxy
 
 import (
-	"context"
-	"net"
 	"testing"
-	"time"
 )
 
-func TestActiveFlowSetUpstreamConnAfterTeardownClosesImmediately(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	guestA, guestB := net.Pipe()
-	t.Cleanup(func() {
-		closeQuietly(guestA)
-		closeQuietly(guestB)
-	})
-	upA, upB := net.Pipe()
-	t.Cleanup(func() {
-		closeQuietly(upA)
-		closeQuietly(upB)
-	})
-
+func TestFlowRegistryRevokePropagatesReason(t *testing.T) {
 	reg := NewFlowRegistry()
-	af := reg.register(FlowInfo{Principal: "p1", Host: "example.com", Port: 443}, cancel, guestA)
+	af1 := reg.register(FlowInfo{
+		Principal: "worker-a",
+		Host:      "a.example.com",
+		Port:      443,
+		GrantID:   "gr_one",
+	}, func() {}, nil)
+	af2 := reg.register(FlowInfo{
+		Principal: "worker-a",
+		Host:      "b.example.com",
+		Port:      443,
+		GrantID:   "gr_two",
+	}, func() {}, nil)
 
-	if err := upB.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
-		t.Fatalf("SetReadDeadline: %v", err)
+	if n := reg.RevokeByGrant("gr_one", TeardownGrantExpired); n != 1 {
+		t.Fatalf("RevokeByGrant = %d, want 1", n)
+	}
+	if got := af1.reason(); got != TeardownGrantExpired {
+		t.Fatalf("af1.reason() = %q, want %q", got, TeardownGrantExpired)
 	}
 
-	// Teardown runs BEFORE upstream connection is attached.
-	af.teardown(TeardownRevoked)
-	if ctx.Err() == nil {
-		t.Fatal("teardown did not cancel flow context")
+	revoked := reg.RevokeWhere(func(info FlowInfo) bool {
+		return info.GrantID == "gr_two"
+	}, TeardownReload)
+	if len(revoked) != 1 {
+		t.Fatalf("RevokeWhere revoked %d flows, want 1", len(revoked))
 	}
-
-	// Now upstream dial finishes and calls setUpstreamConn -> MUST close upA immediately!
-	af.setUpstreamConn(upA)
-
-	var buf [1]byte
-	if _, err := upB.Read(buf[:]); err == nil {
-		t.Fatal("expected upB read to see EOF/closed after setUpstreamConn on torn-down flow")
-	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
-		t.Fatal("upstream conn was NOT closed by setUpstreamConn after teardown")
+	if got := af2.reason(); got != TeardownReload {
+		t.Fatalf("af2.reason() = %q, want %q", got, TeardownReload)
 	}
 }

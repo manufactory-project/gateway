@@ -169,13 +169,8 @@ func (r *FlowRegistry) RevokeByID(flowID string) int {
 	}, TeardownRevoked)
 }
 
-// RevokeByGrant tears down every active flow running under grantID.
-func (r *FlowRegistry) RevokeByGrant(grantID string) int {
-	return r.RevokeByGrantWithReason(grantID, TeardownRevoked)
-}
-
-// RevokeByGrantWithReason tears down every active flow running under grantID with a specific teardown reason.
-func (r *FlowRegistry) RevokeByGrantWithReason(grantID, reason string) int {
+// RevokeByGrant tears down every active flow running under grantID with reason.
+func (r *FlowRegistry) RevokeByGrant(grantID, reason string) int {
 	if grantID == "" {
 		return 0
 	}
@@ -198,13 +193,8 @@ func (r *FlowRegistry) RevokeByPrincipal(principal, host string) int {
 	}, TeardownRevoked)
 }
 
-// RevokeWhere tears down every active flow matching pred, fires onRevoke, and returns the terminated FlowInfos.
-func (r *FlowRegistry) RevokeWhere(pred func(FlowInfo) bool) []FlowInfo {
-	return r.RevokeWhereWithReason(pred, TeardownRevoked)
-}
-
-// RevokeWhereWithReason tears down every active flow matching pred with reason, fires onRevoke, and returns the terminated FlowInfos.
-func (r *FlowRegistry) RevokeWhereWithReason(pred func(FlowInfo) bool, reason string) []FlowInfo {
+// RevokeWhere tears down every active flow matching pred with reason, fires onRevoke, and returns the terminated FlowInfos.
+func (r *FlowRegistry) RevokeWhere(pred func(FlowInfo) bool, reason string) []FlowInfo {
 	revoked := r.teardownWhere(pred, reason)
 	if len(revoked) > 0 {
 		r.mu.RLock()
@@ -261,13 +251,13 @@ func (r *FlowRegistry) teardownWhere(pred func(FlowInfo) bool, reason string) []
 }
 
 func (r *FlowRegistry) revokeMatching(pred func(FlowInfo) bool, reason string) int {
-	return len(r.RevokeWhereWithReason(pred, reason))
+	return len(r.RevokeWhere(pred, reason))
 }
 
 // RevokeReloadedFlows tears down every active flow across all links that was admitted
 // by a wiped grant or is no longer permitted by the reloaded policy.
 func RevokeReloadedFlows(flows *FlowRegistry, eval *policy.Evaluator, wipedGrantIDs []string) int {
-	revoked := flows.RevokeWhereWithReason(func(info FlowInfo) bool {
+	revoked := flows.RevokeWhere(func(info FlowInfo) bool {
 		if info.GrantID != "" && slices.Contains(wipedGrantIDs, info.GrantID) {
 			return true
 		}
