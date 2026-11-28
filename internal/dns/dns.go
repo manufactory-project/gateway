@@ -21,6 +21,7 @@ import (
 
 	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/config"
+	"github.com/manufactory-project/gateway/internal/connlimit"
 	"github.com/manufactory-project/gateway/internal/policy"
 )
 
@@ -69,13 +70,14 @@ func uint32ToIPv4(v uint32) netip.Addr {
 
 // Server serves fake-IP DNS over explicit-bind UDP and TCP sockets for a single link.
 type Server struct {
-	link         config.LinkConfig
-	store        *config.Store
-	eval         *policy.Evaluator
-	audit        *audit.Writer
-	allocator    *Allocator
-	onQuery      func(principal, effect string)
-	onServeError func(error)
+	link           config.LinkConfig
+	store          *config.Store
+	eval           *policy.Evaluator
+	audit          *audit.Writer
+	allocator      *Allocator
+	onQuery        func(principal, effect string)
+	onConnRejected func(link string)
+	onServeError   func(error)
 
 	shuttingDown atomic.Bool
 	udpConn      net.PacketConn
@@ -87,13 +89,15 @@ type Server struct {
 
 // ServerOptions configures a per-link DNS Server.
 type ServerOptions struct {
-	Link         config.LinkConfig
-	Store        *config.Store
-	Evaluator    *policy.Evaluator
-	Audit        *audit.Writer
-	Allocator    *Allocator
-	OnQuery      func(principal, effect string)
-	OnServeError func(error)
+	Link      config.LinkConfig
+	Store     *config.Store
+	Evaluator *policy.Evaluator
+	Audit     *audit.Writer
+	Allocator *Allocator
+	OnQuery   func(principal, effect string)
+	// OnConnRejected is called for each TCP connection over http.max_conns_per_link.
+	OnConnRejected func(link string)
+	OnServeError   func(error)
 }
 
 // NewServer creates a per-link fake-IP DNS Server bound to link.ParsedGatewayIP:link.DNSPort.
@@ -105,13 +109,14 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		return nil, errors.New("dns: explicit non-wildcard gateway_ip is required")
 	}
 	return &Server{
-		link:         opts.Link,
-		store:        opts.Store,
-		eval:         opts.Evaluator,
-		audit:        opts.Audit,
-		allocator:    opts.Allocator,
-		onQuery:      opts.OnQuery,
-		onServeError: opts.OnServeError,
+		link:           opts.Link,
+		onConnRejected: opts.OnConnRejected,
+		store:          opts.Store,
+		eval:           opts.Evaluator,
+		audit:          opts.Audit,
+		allocator:      opts.Allocator,
+		onQuery:        opts.OnQuery,
+		onServeError:   opts.OnServeError,
 	}, nil
 }
 
@@ -129,6 +134,13 @@ func (s *Server) Start() error {
 	}
 	s.udpConn = pc
 	s.tcpLn = ln
+	// TCP queries get their own per-link budget, so held DNS connections cannot
+	// exhaust the daemon and do not consume the proxy's slots.
+	limit := connlimit.New(s.store.Current().Config.HTTP.MaxConnsPerLink, func() {
+		if s.onConnRejected != nil {
+			s.onConnRejected(s.link.Name)
+		}
+	})
 
 	handler := mdns.HandlerFunc(s.handleDNS)
 	udpReady := make(chan struct{})
@@ -145,7 +157,7 @@ func (s *Server) Start() error {
 		NotifyStartedFunc: func() { close(udpReady) },
 	}
 	s.tcpSrv = &mdns.Server{
-		Listener:          ln,
+		Listener:          limit.Listener(ln),
 		Handler:           handler,
 		MsgAcceptFunc:     acceptAll,
 		MsgInvalidFunc:    func(_ []byte, _ error) { s.auditMalformed("tcp") },

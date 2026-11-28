@@ -67,7 +67,7 @@ func NewCollector(opts Options) *Collector {
 		}),
 		connsRejectedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_conns_rejected_total",
-			Help: "Total guest connections closed because a link reached http.max_conns_per_link.",
+			Help: "Total guest connections closed because a link reached http.max_conns_per_link (HTTP/HTTPS and DNS over TCP are limited separately).",
 		}, []string{"link"}),
 	}
 

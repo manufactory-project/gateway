@@ -189,13 +189,14 @@ func (rt *daemonRuntime) startLinks(
 ) error {
 	for _, link := range cfg.Links {
 		ds, err := gwdns.NewServer(gwdns.ServerOptions{
-			Link:         link,
-			Store:        store,
-			Evaluator:    eval,
-			Audit:        rt.auditWriter,
-			Allocator:    alloc,
-			OnQuery:      collector.ObserveDNSQuery,
-			OnServeError: onServeErr,
+			Link:           link,
+			Store:          store,
+			Evaluator:      eval,
+			Audit:          rt.auditWriter,
+			Allocator:      alloc,
+			OnQuery:        collector.ObserveDNSQuery,
+			OnConnRejected: collector.IncConnRejected,
+			OnServeError:   onServeErr,
 		})
 		if err != nil {
 			return err

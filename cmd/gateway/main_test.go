@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,6 +86,44 @@ func fakeSysctls(t *testing.T, cfgPath string) string {
 	return root
 }
 
+// assertDNSRefusalCounted fills the one-connection DNS budget, overflows it, and
+// expects the refusal in the daemon's metrics.
+func assertDNSRefusalCounted(t *testing.T, dnsAddr string, metricsPort uint16) {
+	t.Helper()
+	for range 2 {
+		c, err := net.Dial("tcp4", dnsAddr)
+		if err != nil {
+			t.Fatalf("dial dns: %v", err)
+		}
+		defer func() {
+			if err := c.Close(); err != nil {
+				t.Logf("close dns conn: %v", err)
+			}
+		}()
+	}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
+	url := fmt.Sprintf("http://127.0.0.1:%d/metrics", metricsPort)
+	const want = `gateway_conns_rejected_total{link="sbx0"} 1`
+	var body []byte
+	// The metrics listener starts after the admin socket, and the accept loop runs
+	// apart from the dial, so poll until the refusal shows.
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		resp, err := client.Get(url)
+		if err != nil {
+			body = []byte(err.Error())
+			continue
+		}
+		body, err = io.ReadAll(resp.Body)
+		if cErr := resp.Body.Close(); err != nil || cErr != nil {
+			t.Fatalf("read metrics: %v, %v", err, cErr)
+		}
+		if strings.Contains(string(body), want) {
+			return
+		}
+	}
+	t.Fatalf("metrics missing %s:\n%s", want, body)
+}
+
 func TestGatewayNetsetupDryRunAndStartupGuards(t *testing.T) {
 	dir := t.TempDir()
 
@@ -151,6 +190,8 @@ metrics:
 dataplane:
   ready_file: %s
   dhcp: {user: dnsmasq, lease_file: /var/lib/gateway/dnsmasq.leases}
+http:
+  max_conns_per_link: 1
 links:
   - name: sbx0
     interface: t201
@@ -212,6 +253,9 @@ rules:
 			break
 		}
 		time.Sleep(15 * time.Millisecond)
+	}
+	if statusOK {
+		assertDNSRefusalCounted(t, net.JoinHostPort("127.0.26.1", strconv.Itoa(int(dnsPort))), metricsPort)
 	}
 	cancel()
 	if err := <-done; err != nil {

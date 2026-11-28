@@ -25,6 +25,7 @@ import (
 	"github.com/manufactory-project/gateway/internal/audit"
 	"github.com/manufactory-project/gateway/internal/ca"
 	"github.com/manufactory-project/gateway/internal/config"
+	"github.com/manufactory-project/gateway/internal/connlimit"
 	"github.com/manufactory-project/gateway/internal/netguard"
 	"github.com/manufactory-project/gateway/internal/policy"
 	"github.com/manufactory-project/gateway/internal/secret"
@@ -140,25 +141,19 @@ func (s *Server) Start() error {
 	}
 
 	hCfg := s.store.Current().Config.HTTP
-	connSem := make(chan struct{}, hCfg.MaxConnsPerLink)
+	limit := connlimit.New(hCfg.MaxConnsPerLink, func() {
+		if s.onConnRejected != nil {
+			s.onConnRejected(s.link.Name)
+		}
+	})
 
 	tlsCfg := &tls.Config{
 		MinVersion:     tls.VersionTLS12,
 		NextProtos:     []string{"h2", "http/1.1"},
 		GetCertificate: s.getCertificate,
 	}
-	httpsLn := tls.NewListener(&cappedListener{
-		Listener:   rawHTTPSLn,
-		sem:        connSem,
-		linkName:   s.link.Name,
-		onRejected: s.onConnRejected,
-	}, tlsCfg)
-	cappedHTTPLn := &cappedListener{
-		Listener:   httpLn,
-		sem:        connSem,
-		linkName:   s.link.Name,
-		onRejected: s.onConnRejected,
-	}
+	httpsLn := tls.NewListener(limit.Listener(rawHTTPSLn), tlsCfg)
+	cappedHTTPLn := limit.Listener(httpLn)
 
 	var httpsProtos http.Protocols
 	httpsProtos.SetHTTP1(true)
@@ -230,45 +225,6 @@ func auditBestEffort(w *audit.Writer, ev audit.Event) {
 	if err := w.WriteSync(ev); err != nil {
 		return
 	}
-}
-
-type cappedListener struct {
-	net.Listener
-	sem        chan struct{}
-	linkName   string
-	onRejected func(link string)
-}
-
-func (l *cappedListener) Accept() (net.Conn, error) {
-	for {
-		c, err := l.Listener.Accept()
-		if err != nil {
-			return nil, err
-		}
-		select {
-		case l.sem <- struct{}{}:
-			return &trackedConn{Conn: c, sem: l.sem}, nil
-		default:
-			closeQuietly(c)
-			if l.onRejected != nil {
-				l.onRejected(l.linkName)
-			}
-		}
-	}
-}
-
-type trackedConn struct {
-	net.Conn
-	sem       chan struct{}
-	closeOnce sync.Once
-}
-
-func (c *trackedConn) Close() error {
-	err := c.Conn.Close()
-	c.closeOnce.Do(func() {
-		<-c.sem
-	})
-	return err
 }
 
 // Shutdown drains listeners, tears down remaining link flows, closes idle upstream connections, and waits for goroutines.
