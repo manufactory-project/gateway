@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package policy implements pure, I/O-free default-deny egress policy evaluation
 // per link principal, including specificity ranking (exact > wildcard; deny beats allow

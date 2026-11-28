@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package dns implements gateway's built-in fake-IPv4 DNS server.
 // No guest query is ever forwarded upstream: allowlisted names receive a synthetic

@@ -9,7 +9,7 @@ What `gateway` v0.1 protects against, and what it does not. For how it works, se
 - **Each guest is alone on its link.** `gateway` identifies a guest by the interface it connects through. Guests that share a network segment share a principal and can reach each other without passing through `gateway`.
 - **The admin socket is full control.** Anyone who can open it can create grants and reload the config.
 
-`gateway` controls connections that guests open. Handling ingress is a goal and is not built.
+`gateway` controls connections that guests open. It forwards nothing, so nothing outside can open a connection into a guest through it.
 
 ## Goal 1: keep guests off the host, the LAN and each other
 

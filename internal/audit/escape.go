@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package audit provides a fail-closed, bounded, structured JSONL audit log
 // for gateway. Header values are never part of the Event schema, query strings

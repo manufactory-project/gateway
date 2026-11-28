@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package secret implements gateway's file-only secret placeholder substitution,
 // unconditional post-substitution placeholder stripping, and streaming

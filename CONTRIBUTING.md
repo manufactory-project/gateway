@@ -60,7 +60,7 @@ The script refuses to use an existing project, asks before creating one, and del
 
 - `gofmt` reports no files.
 - `govulncheck` finds no known vulnerabilities in reachable code.
-- Every `.go`, `.sh` and `.py` file starts with `SPDX-License-Identifier: AGPL-3.0-or-later`.
+- Every `.go`, `.sh` and `.py` file starts with `SPDX-License-Identifier: AGPL-3.0-only`.
 - Every directory with tests calls `goleak.VerifyTestMain`.
 - `//nolint:errcheck` is not allowed. Handle the error; `errcheck` also rejects discarding it with `_`.
 - Any other `nolint` directive names its linter and explains why.

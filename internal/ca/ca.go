@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // Package ca loads operator-supplied MITM CA keypairs, initializes new CAs for
 // `gateway ca init`, and mints/caches per-SNI ECDSA P-256 leaf certificates using

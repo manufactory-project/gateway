@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 """Minimal stdlib-only HTTPS test upstream for e2e/run.sh."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ssl

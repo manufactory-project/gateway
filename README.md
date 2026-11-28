@@ -12,7 +12,7 @@ Treat the guest as hostile, including root inside it. `gateway` then:
 
 It does not stop data from leaving through destinations you allow. An agent can still send anything to an allowed host, or use a credential for everything that credential permits. Read the [threat model](docs/threat-model.md), including its accepted risks, before relying on `gateway`.
 
-Status: v0.1, egress only: it controls connections that guests open. Handling ingress is a goal and is not built.
+It controls only connections that guests open. Nothing outside can open a connection into a guest through it.
 
 ## Where it fits
 
@@ -293,4 +293,4 @@ Files are deleted by age (`retain_days`) and when the directory passes `max_tota
 
 ## License
 
-`gateway` is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (`AGPL-3.0-or-later`). If you run a modified version for others over a network, the license requires you to offer them its source.
+`gateway` is licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`). If you run a modified version for others over a network, the license requires you to offer them its source.

@@ -11,9 +11,9 @@ tasks:
       - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - |
         set -eu
-        missing=$(git ls-files '*.go' '*.sh' '*.py' | while read -r f; do head -3 "$f" | grep -q 'SPDX-License-Identifier: AGPL-3.0-or-later' || echo "$f"; done)
+        missing=$(git ls-files '*.go' '*.sh' '*.py' | while read -r f; do head -3 "$f" | grep -q 'SPDX-License-Identifier: AGPL-3.0-only' || echo "$f"; done)
         if [ -n "$missing" ]; then
-          echo "lint: missing SPDX-License-Identifier: AGPL-3.0-or-later header:" >&2
+          echo "lint: missing SPDX-License-Identifier: AGPL-3.0-only header:" >&2
           echo "$missing" >&2
           exit 1
         fi
