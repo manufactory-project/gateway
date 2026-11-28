@@ -14,7 +14,7 @@ import (
 	"net/netip"
 	"net/textproto"
 	"path"
-	"slices"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -647,35 +647,12 @@ func (s *Server) recheckAdmissionAfterRegister(w http.ResponseWriter, rc *reqCon
 		return true
 	}
 	reDec := s.eval.DecideRequest(s.link.Principal, rc.host, rc.dstPort, rc.r.Method, rc.r.URL.Path)
-	if !sameAdmissionDecision(rc.dec, reDec) {
+	if !reflect.DeepEqual(rc.dec, reDec) {
 		rc.dec = reDec
 		rc.deny(w, http.StatusForbidden, "admission-changed")
 		return false
 	}
 	return true
-}
-
-func sameAdmissionDecision(a, b policy.Decision) bool {
-	return a.Allow == b.Allow &&
-		a.RuleID == b.RuleID &&
-		a.GrantID == b.GrantID &&
-		a.AllowWebSocket == b.AllowWebSocket &&
-		a.HasBindings == b.HasBindings &&
-		bindingsEqual(a.MatchedBindings, b.MatchedBindings) &&
-		bindingsEqual(a.HostBindings, b.HostBindings)
-}
-
-func bindingsEqual(a, b []config.BindingConfig) bool {
-	return slices.EqualFunc(a, b, func(x, y config.BindingConfig) bool {
-		return x.Name == y.Name &&
-			x.Host == y.Host &&
-			x.Header == y.Header &&
-			x.Scheme == y.Scheme &&
-			x.Placeholder == y.Placeholder &&
-			x.SecretFile == y.SecretFile &&
-			slices.Equal(x.Methods, y.Methods) &&
-			slices.Equal(x.Paths, y.Paths)
-	})
 }
 
 func buildOutboundRequest(ctx context.Context, rc *reqContext, body io.Reader) (*http.Request, error) {
