@@ -239,6 +239,7 @@ gateway revoke (--flow ID | --grant ID | --principal NAME [--host HOST])
 gateway grant --principal NAME --host HOST [--port 443|80] [--methods CSV] [--paths CSV] [--ttl 5m]
 gateway grants
 gateway grant revoke <id>
+gateway version
 ```
 
 `grant` allows a host temporarily. Without `--methods` or `--paths`, it does not restrict them. The command cannot grant WebSocket access; that takes a request to the admin API.
@@ -246,6 +247,8 @@ gateway grant revoke <id>
 `revoke` closes open connections. It does not stop new ones. To block a guest's access, remove the allow rule and run `gateway reload`, or stop the guest.
 
 These commands talk to the daemon over `/run/gateway/admin.sock`. Put `--socket PATH` before the subcommand to use another socket. `--json` works anywhere on the command line.
+
+`gateway version`, or `gateway --version`, prints the build's module version, and for a build from a checkout also the revision and whether it had local changes. It does not need the daemon.
 
 The example configs serve Prometheus metrics at `http://127.0.0.1:9102/metrics`:
 

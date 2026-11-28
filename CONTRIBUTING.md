@@ -23,7 +23,7 @@ The race detector used by the tests also needs a C compiler.
 task check
 ```
 
-This runs `task lint`, then `task test` (`go test -race -count=1 ./...`).
+This runs `task lint`, then `task test` (`go test -race -count=1 ./...`). The vulnerability check in `task lint` needs network access.
 
 If you changed `e2e/run.sh`, also run what CI runs on it:
 
