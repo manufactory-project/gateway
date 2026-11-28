@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package metrics exposes gateway's Prometheus /metrics endpoint on an explicit
 // non-wildcard IP:port listener.
 package metrics

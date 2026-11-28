@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package config loads, strictly validates, and atomically reloads gateway YAML configuration.
 package config
 

@@ -286,3 +286,8 @@ Files are deleted by age (`retain_days`) and when the directory passes `max_tota
 - [Threat model](docs/threat-model.md): what is protected, what is not and accepted risks
 - [Architecture](docs/architecture.md): processes, request path, failures and packages
 - [Contributing](CONTRIBUTING.md): build, test and change the code
+- [Security policy](SECURITY.md): how to report a vulnerability privately
+
+## License
+
+`gateway` is licensed under the [GNU Affero General Public License v3.0 or later](LICENSE) (`AGPL-3.0-or-later`). If you run a modified version for others over a network, the license requires you to offer them its source.

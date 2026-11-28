@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package netsetup
 
 // Interfaces removed from the config may still have a guest attached. netsetup

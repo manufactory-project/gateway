@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package admin implements gateway's minimal Unix-domain-socket (0660) JSON Admin API
 // and its typed client for gateway.
 package admin

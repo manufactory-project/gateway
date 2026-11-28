@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package secret implements gateway's file-only secret placeholder substitution,
 // unconditional post-substitution placeholder stripping, and streaming
 // sliding-window identity response redaction.

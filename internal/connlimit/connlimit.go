@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package connlimit caps the connections a sandbox link may hold open at once.
 package connlimit
 

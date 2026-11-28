@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package proxy implements gateway's per-(link, dstPort) TLS MITM and HTTP/1.1,
 // HTTP/2, SSE, and opted-in WebSocket egress proxy with secret substitution,
 // identity response redaction, and live open-flow teardown.

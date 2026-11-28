@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package netguard enforces connect-time SSRF protection in net.Dialer.Control:
 // full IPv4 special/private deny list, IPv6 global unicast 2000::/3
 // allowlist minus special ranges, Unmap() before prefix checks, dial-by-name only,

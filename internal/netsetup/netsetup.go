@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package netsetup generates and applies the Linux data plane (nftables ruleset,
 // sysctls, per-link ip addr/route/rule commands, and DHCP-only dnsmasq config)
 // purely from gateway's YAML configuration.

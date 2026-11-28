@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Command gateway-probe is a static, stdlib-only guest probe that verifies
 // gateway and Linux nftables containment with positive controls and emits
 // one JSON line per check ({check, expect, got, pass}).

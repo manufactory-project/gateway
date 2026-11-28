@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Command gateway runs the headless, egress-only network gateway daemon and
 // provides its operator CLI subcommands (`run`, `netsetup`, `status`, `reload`,
 // `flows`, `revoke`, `grant`, `grants`, `ca init`, and `dataplane check`).
