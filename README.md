@@ -10,7 +10,7 @@ Treat the guest as hostile, including root inside it. `gateway` then:
 - keeps declared API keys outside the guest, which holds a placeholder that `gateway` swaps for the secret on the way out
 - writes a JSONL audit log, and refuses requests when it cannot write it
 
-v0.1 has a [known defect](docs/threat-model.md#known-defects) in its startup checks. It does not stop data from leaving through destinations you allow. An agent can still send anything to an allowed host, or use a credential for everything that credential permits. Read the [threat model](docs/threat-model.md), including its accepted risks, before relying on `gateway`.
+It does not stop data from leaving through destinations you allow. An agent can still send anything to an allowed host, or use a credential for everything that credential permits. Read the [threat model](docs/threat-model.md), including its accepted risks, before relying on `gateway`.
 
 Status: v0.1, egress only: it controls connections that guests open. Handling ingress is a goal and is not built.
 

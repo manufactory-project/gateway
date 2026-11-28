@@ -8,7 +8,7 @@ Parsing is strict: an unknown key, a second YAML document or an invalid value re
 gateway netsetup --config gateway.yaml --dry-run
 ```
 
-This validates the file and prints the nftables ruleset, sysctls, `ip` commands and dnsmasq config. It needs at least one link with an `interface`. It does not read the CA or secret files.
+This validates the file and prints the nftables ruleset, sysctls, `ip` commands and dnsmasq config. It does not read the CA or secret files.
 
 ## Links
 
@@ -28,12 +28,12 @@ links:
 | Key | Required | Default | Value |
 |---|---|---|---|
 | `name` | yes | | Unique name. Letters, digits, `.`, `-`, `_`; up to 64 characters |
-| `interface` | yes on Linux | | Existing interface. Up to 15 letters, digits, `-`, `_` (no `.`). Unique |
+| `interface` | yes | | Existing interface. Up to 15 letters, digits, `-`, `_` (no `.`). Unique |
 | `principal` | yes | | Same character set as `name` |
 | `subnet` | yes | | IPv4, `/29` or larger. Must not overlap another link's |
 | `gateway_ip` | yes | | The gateway's address inside `subnet`; not the network or broadcast address |
-| `ct_zone` | with `interface` | | Unique conntrack zone, 1 to 65535 |
-| `route_table` | with `interface` | | Unique routing table number above 0, other than 253, 254 or 255 |
+| `ct_zone` | yes | | Unique conntrack zone, 1 to 65535 |
+| `route_table` | yes | | Unique routing table number above 0, other than 253, 254 or 255 |
 | `route_pref` | no | 1000 plus the link's position (from 0) | Priority of the link's `ip rule` |
 | `https_port` | no | 10443 | Local listener behind guest port 443 |
 | `http_port` | no | 10080 | Local listener behind guest port 80 |
@@ -150,7 +150,7 @@ Substitution happens only when all of these hold:
 
 If a more specific rule or a grant wins instead, nothing is substituted. After substitution, `gateway` drops `Proxy-Authorization` and every header that still contains `mf_ph_`, on every request. It does not search URLs or bodies.
 
-Bindings are allowed only on `allow` rules that include port 443. WebSockets are refused on every host with a binding, for every principal. The config and grant checks reject the combination only within one principal; for another principal it loads, and the upgrade is refused.
+Bindings are allowed only on `allow` rules that include port 443. WebSockets are not available on a host with a binding, for any principal: a config whose `allow_websocket` rule covers such a host, by name or wildcard, is rejected, and so is a WebSocket grant for it.
 
 Create the file so that the `gateway` group can read it, then put the secret in it on a single line:
 
@@ -217,8 +217,6 @@ A value of 0 selects the default. Both limits are applied when a new file is ope
 Anyone who can open the admin socket can create grants and reload the config.
 
 ### `dataplane`
-
-Required when a link has an `interface`.
 
 | Key | Required | Default | Value |
 |---|---|---|---|

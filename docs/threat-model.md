@@ -58,12 +58,6 @@ Not prevented:
 - **Anything an allowed host serves**, such as telemetry endpoints or downloadable plugins on the same domain as an API. Path rules narrow this.
 - **DNS labels under a wildcard rule.** Names under `*.example.com` are resolved upstream, so the guest can send data to that zone's name servers.
 
-## Known defects
-
-This breaks the protections above and is not an accepted risk:
-
-- **Links without `interface` skip the startup checks.** If no link has one, `gateway run` does not check sysctls or require a ready file. The shipped unit still fails, because `netsetup` runs first, but starting the daemon another way serves guests with no firewall rules. Give every link an `interface`.
-
 ## Accepted risks
 
 | Risk | Effect | What you can do |
