@@ -255,14 +255,15 @@ func (r *FlowRegistry) revokeMatching(pred func(FlowInfo) bool, reason string) i
 }
 
 // RevokeReloadedFlows tears down every active flow across all links that was admitted
-// by a wiped grant or is no longer permitted by the reloaded policy.
+// by a wiped grant, is no longer permitted by the reloaded policy, or is no longer
+// admitted by the rule it is running under.
 func RevokeReloadedFlows(flows *FlowRegistry, eval *policy.Evaluator, wipedGrantIDs []string) int {
 	revoked := flows.RevokeWhere(func(info FlowInfo) bool {
 		if info.GrantID != "" && slices.Contains(wipedGrantIDs, info.GrantID) {
 			return true
 		}
 		dec := eval.DecideRequest(info.Principal, info.Host, info.Port, info.Method, info.Path)
-		if !dec.Allow {
+		if !dec.Allow || dec.RuleID != info.RuleID {
 			return true
 		}
 		if info.Protocol == "websocket" && !dec.AllowWebSocket {

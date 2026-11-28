@@ -202,6 +202,51 @@ func TestUnreadableBoundSecretFailsBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestReloadRemovingTheAdmittingRuleTearsDownItsFlow(t *testing.T) {
+	release := make(chan struct{})
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				return
+			}
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}),
+		RulesYAML: `
+  - id: narrow
+    principal: worker-test
+    effect: allow
+    hosts: [api.example.com]
+    ports: [443]
+    paths: ["/stream"]
+  - id: broad
+    principal: worker-test
+    effect: allow
+    hosts: [api.example.com]
+    ports: [443]
+`,
+		OnCleanupFirst: func() { close(release) },
+	})
+	do(t, gw.H1Client(t, "api.example.com"), http.MethodGet, "https://api.example.com/stream", nil)
+
+	head, _, found := strings.Cut(gw.BaseYAML, "  - id: narrow")
+	if !found {
+		t.Fatal("narrow rule not found in config")
+	}
+	_, broad, found := strings.Cut(gw.BaseYAML, "  - id: broad")
+	if !found {
+		t.Fatal("broad rule not found in config")
+	}
+	writeSecretFile(t, gw.Dir, "gateway.yaml", head+"  - id: broad"+broad)
+	_, _, revoked, err := gw.Store.Reload()
+	if err != nil || revoked != 1 {
+		t.Fatalf("reload revoked %d flows, err %v; want 1 although another rule still allows the request", revoked, err)
+	}
+}
+
 func TestUpstreamHangingUpIsAuditedAsConnectionClosed(t *testing.T) {
 	gw := newTestGateway(t, testGatewaySpec{
 		Hosts: []string{"api.example.com"},
