@@ -1,149 +1,87 @@
-# `gateway` Threat Model (v0.1)
+# Threat model
 
-`gateway` treats every connected guest as hostile. A guest may be steered by prompt injection,
-untrusted repository content, or malicious code it executes, up to and including root inside the
-guest. Containment does not depend on guest cooperation, agent discipline, or in-guest sandboxing;
-the locked plain-Go wire suite is the living verification inventory.
+What `gateway` v0.1 protects against, and what it does not. For how it works, see [architecture](architecture.md).
 
-## Hardening Goals
+## Assumptions
 
-1. **Protect the LAN, host, and other guests — total across every protocol and address family.**
-   By default, a guest cannot reach the host, management interfaces, LAN peers, cloud metadata
-   endpoints, loopback, link-local, non-global IPv6, or other sandbox guests. Enforcement spans
-   Linux `nftables` (per-link conntrack zones, IPv4-only sandbox links, `fib daddr type local`
-   guards, default-`drop`), kernel sysctls (`ip_forward=0`, IPv6 forwarding off, `rp_filter=2`,
-   ARP suppression), root-owned `/run/gateway-dataplane/` isolation for `dnsmasq.conf` and
-   `dataplane.ready` (preventing unprivileged `gateway` from tampering with root-read dataplane
-   files), fake-IP DNS (zero upstream query forwarding; malformed packets audited as
-   `effect=deny, reason=malformed`), dial-by-name, and connect-time `Dialer.Control` checks
-   (`Unmap()` before prefix matching). Explicit opt-in exceptions to private-IP unreachability come
-   only from global static `records` entries (`host -> exact IP`), which are not scoped per
-   principal or rule (see also the globally routed host/LAN residual below).
+- **The guest is hostile**, including root inside it. It may be steered by prompt injection, untrusted repository content or code it runs. Nothing here depends on the guest cooperating.
+- **The gateway host and the hypervisor or container runtime are trusted.**
+- **Each guest is alone on its link.** `gateway` identifies a guest by the interface it connects through. Guests that share a network segment share a principal and can reach each other without passing through `gateway`.
+- **The admin socket is full control.** Anyone who can open it can create grants and reload the config.
 
-2. **Keep declared secrets out of the guest.**
-   Declared API keys and credentials stay behind the host/gateway-container filesystem boundary
-   through a `file`-only secret provider. Guests hold only inert `mf_ph_*` placeholders for
-   declared secrets. `gateway` substitutes a secret only into the exact `(host, header, scheme)`
-   declared by a Binding and only when admitted by that binding's owning rule, unconditionally
-   strips `Proxy-Authorization` and any remaining `mf_ph_*` (including decoded Basic Auth) from
-   every outbound request, forces `Accept-Encoding: identity` on bound hosts (failing closed `502`
-   on compressed responses), and scrubs literal, URL-encoded, and JSON-escaped echoes of bound
-   secrets from response headers, bodies, and trailers back to their placeholders. This goal carries
-   the security weight because Goal 3 is open by design.
+`gateway` controls connections that guests open. Handling ingress is a goal and is not built.
 
-3. **Data leaving is bounded and attributable, not prevented.**
-   Attribution is strictly per sandbox link (`link.principal`), never derived from the guest's
-   source IP (`src_ip` is recorded in audit events for diagnostics only and is not trusted). Every
-   DNS query and HTTP request is evaluated against an explicit default-deny allowlist per link
-   principal and written to a fail-closed structured JSONL audit log (escaped paths with query
-   strings stripped and `has_query` recorded; never header values). Active flows are tracked per
-   request/stream and torn down immediately (`cancel()` + `conn.Close()`) on `gateway revoke`, TTL
-   expiry, or `SIGHUP` rule/grant removal, recording explicit teardown reasons (`revoked`,
-   `grant-expired`, `reload`, `client-canceled`) in completion audits, full grant scope (`methods`,
-   `paths`, `allow_websocket`) on `grant-created`, target metadata (`principal`, `host`, `port`) on
-   `grant-deleted`, and `revoked_flows` counts on `revoke`, `grant-deleted`, and `reload`.
-   Per-guest resource bounds cap concurrent connections per link (`http.max_conns_per_link`,
-   default `512`), upstream response header wait (`http.upstream_response_header_timeout`, default
-   `10m`), WebSocket upgrade handshakes (`30s`), glob pattern complexity (at most one `**` per
-   pattern and four `*` per segment), and total audit directory size (`audit.max_total_bytes`,
-   default `10 GiB`).
+## Goal 1: keep guests off the host, the LAN and each other
 
-## Accepted Residuals (By Design)
+Protected, given the assumptions:
 
-- **Guest-held subscription OAuth tokens and arbitrary vendor credentials:** Allowlisted LLM vendor
-  APIs accept any credential the guest presents, so data can leave to an account the operator does
-  not own. Subscription OAuth tokens (`claude`, `agy`, `codex`) live inside the guest by design so
-  workers can use personal subscriptions under unmodified vendor CLIs.
-- **Vendor account content pulled over allowed API hosts:** Any content a vendor serves on an
-  allowlisted API host—such as `claude`'s organization skills and plugins on `api.anthropic.com`—can
-  be fetched into the guest unless blocked by path rules. Path-scoped allow rules (as in
-  `examples/workers.yaml`) are the control.
-- **Vendor telemetry over allowed API hosts:** Telemetry endpoints hosted on the same allowlisted
-  API domain (such as `claude`'s `/api/event_logging/v2/batch` on `api.anthropic.com`) can leave
-  unless excluded by path-scoped rules, even when dedicated third-party telemetry hosts are denied.
-- **Steady-state token refresh vs. interactive login grants:** Interactive login hostnames are
-  granted only ephemerally (`gateway grant --ttl 5m`) and stay out of steady-state policy; OAuth
-  token-refresh endpoints instead receive permanent exact-host, exact-path `POST` rules so workers
-  can refresh tokens without keeping interactive login surfaces open.
-- **CLI CA trust without env vars (unverified):** Phase 3 verified `claude`, `codex`, and `agy`
-  through MITM with `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` pointing at `/etc/ssl/certs/ca-certificates.crt`;
-  whether each CLI trusts the system CA store with those environment variables unset is still
-  unverified.
-- **Exfiltration within a credential's scope and through allowed destinations:** A placeholder
-  prevents the guest from reading the raw secret, but an agent can still exfiltrate any data the
-  credential legitimately reaches (for example, pushing to a repository the token can write) or
-  encode data into paths, query strings, headers, or bodies sent to an allowlisted host. Scoping
-  credentials at their source and writing exact-host, method, and path rules bound the channel.
-- **Cross-host secret reflection and compressed responses on bound hosts:** A secret stored
-  upstream on bound host A and later served back from unbound host B is not scrubbed. On a bound
-  host, an upstream API that ignores `Accept-Encoding: identity` and insists on returning a
-  compressed `Content-Encoding` fails closed (`502`).
-- **Non-scrubbed secret encodings:** Response redaction covers literal, URL-encoded, and
-  JSON-escaped forms only. Base64, base64url, hex, case-changed, and HTML-entity echoes (including
-  base64-encoded Basic Auth echoes) are not scrubbed.
-- **DHCP parser attack surface:** `dnsmasq`'s DHCP parser is a second guest-facing process, holding
-  no network capabilities.
-- **Denial-flood audit volume:** Denied SNIs never mint a leaf certificate and are audited
-  unconditionally alongside denied HTTP requests and DNS queries; disk usage from denial floods is
-  bounded by total directory size pruning (`audit.max_total_bytes`, default `10 GiB`, deleting
-  oldest closed segments first) plus daily retention pruning (`audit.retain_days`), with per-segment
-  rotation at `audit.max_file_bytes`.
-- **Per-link connection caps and shared kernel conntrack table:** `http.max_conns_per_link` caps
-  accepted connections per link rather than globally across all links, and the Linux kernel
-  conntrack table is shared across links (per-link conntrack zones isolate tuple collisions, not
-  global conntrack table capacity).
-- **Daemon startup trusts `dataplane.ready` rather than reading `table inet gw`:** Unprivileged
-  `gateway run` has zero `CAP_NET_ADMIN` and checks sysctls plus `dataplane.ready` existence at
-  startup rather than querying the live `nftables` ruleset (which requires root via
-  `gateway dataplane check`). Isolation relies on systemd always running `ExecStartPre=+ gateway netsetup`
-  first, root-owned `/run/gateway-dataplane/`, and `net.ipv4.ip_forward=0`.
-- **Removed links are blocked by interface name, from the record:** `netsetup` keeps dropping all
-  traffic on interfaces removed from `links`, but only once it has run. After a reboot nothing is
-  loaded until `gateway.service` runs `netsetup`, and nothing is loaded if `netsetup` fails before
-  loading the ruleset (for example on an invalid config or a corrupt `dataplane.state_file`). Another
-  tool flushing the ruleset (`nft flush ruleset`, reloading `nftables.service`) removes the drops. An
-  interface that is renamed, or enslaved to a bridge or bond, no longer matches. An interface is not
-  recorded if the state file is lost (or `state_file` is moved) across a reboot, or if its link was removed by a version without
-  the record and the host rebooted before upgrading.
-- **Global `records` private-IP exceptions:** Private-address connect-time exceptions come only from
-  global `records` entries (`host -> exact IP`), which are not scoped per principal or rule; any
-  principal with an allow rule for that host can reach the mapped IP.
-- **Non-global fake-IP DNS range (`198.18.0.0/15`):** `198.18.0.0/15` (RFC 2544 benchmarking space)
-  is non-global, so a client library's own SSRF filter could refuse synthetic answers in that range
-  (all three tested vendor CLIs worked through `198.18.0.0/15` in Phase 3).
-- **DNS label leakage under wildcard rules:** Because `gateway` resolves allowlisted hostnames
-  upstream when dialing, wildcard allow rules (`*.example.com`) let a guest leak guest-chosen
-  labels to that zone's authoritative DNS servers via `gateway`'s upstream resolver. Prefer
-  exact-host rules wherever possible (mandatory for multi-product subscription vendor domains).
-- **Globally routed host and LAN addresses:** `gateway`'s connect-time guard denies loopback,
-  link-local, RFC 1918, CGNAT, and IANA special-purpose ranges, and restricts IPv6 to global unicast
-  `2000::/3` minus special ranges. Inside a gateway container, `gateway` cannot distinguish
-  globally routed host or LAN unicast IPv4/IPv6 addresses from ordinary internet destinations by
-  prefix alone, so an allowlisted domain resolving to such an address is reachable.
-- **CA private key at rest:** The operator-supplied `ca_cert` is the trust anchor every guest
-  accepts for any hostname, and `ca_key` is the private key that signs leaf certificates under it.
-  `ca_key` sits behind the host/gateway-container filesystem boundary; anyone holding `ca_key` plus
-  a network position between a guest and `gateway` can impersonate any TLS server to guests.
-  `gateway` always verifies upstream TLS certificates against system roots, so `ca_key` alone
-  confers no upstream interception. Because the CA carries no name constraints, guests cannot scope
-  what they trust `gateway` to intercept.
+- A guest reaches the gateway only for DHCP, DNS, HTTP and HTTPS. Other traffic to the gateway, and all traffic through it, is dropped, including IPv6.
+- Outbound connections are made by the gateway, by hostname, and only to hosts a rule or grant allows.
+- Connections to loopback, link-local (including cloud metadata), private, carrier-grade NAT and other special-purpose addresses are refused, whatever name resolves to them.
 
-## Policy Precedence & Reload Semantics
+Not protected:
 
-- **Rule precedence:** Evaluation is unified across host scope (DNS/SNI) and request scope and is
-  most-specific-first: host (exact before wildcard, longer wildcard suffix before shorter), then
-  path-scoped before host-wide (with more-specific paths winning at request scope), then
-  method-scoped before method-agnostic; `deny` wins only on an exact rank tie. Consequently, a
-  path-scoped `allow` rule or path-scoped ephemeral grant for an exact host outranks a host-wide
-  `deny` for that same host at DNS, SNI, and request scope so the handshake succeeds and request
-  evaluation enforces the allowed path(s). `DecideDNS` preserves explicit `rule-deny` decisions and
-  their `RuleID` instead of collapsing them to `default-deny`. The emergency stop for any live
-  session is `gateway revoke` or removing the matching `allow` rule and reloading.
-- **Live reload semantics:** On `SIGHUP` or `gateway reload` (serialized under a reload mutex), all
-  ephemeral grants are wiped, active flows that are no longer allowed (by host, port, method, or
-  path) are torn down immediately via `cancel()` + `conn.Close()` (audited with `error="reload"`),
-  and open WebSockets are torn down if a `Binding` is added to their host. Changes to
-  `ws_max_egress_bytes`, `records`, or `bindings` otherwise apply only to new flows. Changes to
-  `links`, principals, `dns.fake_cidr`, `ca`, `audit`, `admin`, `metrics`, `dataplane`,
-  `http.max_header_bytes`, `http.max_conns_per_link`, or `http.upstream_response_header_timeout`
-  require a daemon restart and are refused on reload.
+- **Globally routed host or LAN addresses.** The gateway cannot tell them apart from the internet. An allowed name that resolves to one is reachable.
+- **Addresses listed in `records`.** These are deliberate exceptions, open to every principal that may reach that host.
+
+## Goal 2: keep secrets out of the guest
+
+Protected:
+
+- The guest holds a placeholder. `gateway` puts the real value into one named header, only on HTTPS, and only when the rule that owns the binding allows the request.
+- Placeholders left in request headers are removed before the request leaves.
+- A host with any binding is a bound host for every principal. In its responses (headers, bodies and trailers), echoes of every secret bound to it are replaced with placeholders, in literal, URL-encoded and JSON-escaped form.
+- So that a response can always be checked, bound hosts get no `Range` requests or compression, partial and compressed responses are refused, WebSockets are refused, and nothing is sent unless every secret for the host can be read.
+- Once a request has been sent, a failure is recorded in the audit log as a category, not as the error text, which could quote the secret.
+
+Not protected:
+
+- **Use of the credential.** The guest can do anything the credential permits on the allowed methods and paths, such as pushing to a repository the token can write. Narrow the token at its issuer and narrow the rule.
+- **Credentials the guest already holds**, such as a CLI's login token stored in the guest. `gateway` does not hide or restrict them.
+- **Other echo encodings**: base64 (including Basic credentials), base64url, hex, changed case and HTML entities.
+- **Reflection through another host.** A secret that an upstream stores and later serves from a host without a binding for it is not replaced.
+
+## Goal 3: limit and record what leaves
+
+This goal is limited by design: **data can leave through any destination you allow.**
+
+Provided:
+
+- Default deny per principal, checked for each DNS lookup and each HTTP request.
+- A JSONL record of each DNS and request decision, naming the principal. Paths are recorded; query strings, headers and bodies are not. If the record cannot be written before a lookup is answered or a request is sent, it is refused. Connections dropped at the connection limit are only counted in metrics.
+- Limits on concurrent HTTP and HTTPS connections per link (DNS over TCP is not limited), request body size, header size, bytes a guest sends on a WebSocket, and total audit log size.
+
+Not prevented:
+
+- **Data in allowed requests**: paths, query strings, headers and bodies.
+- **Another account on an allowed host.** An allowed API accepts whatever credential the guest sends, so data can go to an account you do not own.
+- **Anything an allowed host serves**, such as telemetry endpoints or downloadable plugins on the same domain as an API. Path rules narrow this.
+- **DNS labels under a wildcard rule.** Names under `*.example.com` are resolved upstream, so the guest can send data to that zone's name servers.
+
+## Known defects
+
+This breaks the protections above and is not an accepted risk:
+
+- **Links without `interface` skip the startup checks.** If no link has one, `gateway run` does not check sysctls or require a ready file. The shipped unit still fails, because `netsetup` runs first, but starting the daemon another way serves guests with no firewall rules. Give every link an `interface`.
+
+## Accepted risks
+
+| Risk | Effect | What you can do |
+|---|---|---|
+| `ca.key_path` is a trust anchor with no name constraints | Anyone with the key and a position between a guest and the gateway can impersonate any TLS server to that guest. It does not let them intercept the gateway's own upstream connections | Keep the key on the gateway, readable only by root and the `gateway` group |
+| The daemon does not read the live nftables ruleset at startup | It checks sysctls and a marker file that `netsetup` writes. If the table is removed afterwards, the daemon does not notice | Start it through the shipped unit, which reruns `netsetup`. Run `gateway dataplane check` as root to monitor |
+| `gateway dataplane check` checks that the table and chains exist | Altered rules inside a chain pass | Restrict who has root on the gateway |
+| Removed links are blocked by interface name, only once `netsetup` has run | They are open between boot and `netsetup`, if it fails before loading rules, if another tool flushes the ruleset, or if the interface is renamed or added to a bridge or bond. A link removed before this record existed, or whose record is lost, is not blocked after a reboot | Detach removed guests; do not flush the ruleset |
+| dnsmasq parses DHCP from guests | A second program exposed to guests. It drops root and network capabilities after starting | Keep dnsmasq updated |
+| Connection limits are per link, and the kernel conntrack table is shared | Many guests together can use up shared capacity | Size the host for the number of links |
+| Denied requests are logged | A guest can fill the audit log up to its limit and push out older records | Ship records elsewhere with `audit.stdout_json` |
+| Audit writes are not `fsync`ed | A crash or power loss can lose the latest records | Ship records elsewhere |
+| Guests receive addresses from `198.18.0.0/15` | A client with its own private-address filter may refuse them | Change `dns.fake_cidr` |
+
+## Stopping access
+
+Removing access needs a policy change: remove every allow rule and grant that covers it, then reload. Adding a `deny` is not enough if a more specific `allow` still matches. `gateway revoke --flow` or `--principal` closes current connections, and the guest can open new ones. Stopping the guest always works. See [rule precedence](configuration.md#which-rule-wins) and [reload](configuration.md#reload).
+
+## Verification
+
+`task check` runs the unit and integration tests, including tests for the refusals above. [`e2e/run.sh`](../e2e/run.sh) builds a two-guest Incus setup and probes containment from inside the guests; CI does not run it.
