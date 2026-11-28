@@ -1298,3 +1298,147 @@ func TestReloadFlowPathDecodingInvariants(t *testing.T) {
 		waitAuditCompletedError(t, gw, "/v1/%61dmin", "reload")
 	})
 }
+
+func TestRevokeReloadedFlowsWipedGrantAndWebSocketFlagRemoved(t *testing.T) {
+	t.Run("wiped_grant_torn_down_even_when_reloaded_rule_allows", func(t *testing.T) {
+		streamOpen := make(chan struct{}, 2)
+		release := make(chan struct{})
+		gw := newTestGateway(t, testGatewaySpec{
+			OnCleanupFirst: func() { close(release) },
+			Hosts:          []string{"wiped.example.com"},
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				if _, err := io.WriteString(w, "data: open\n\n"); err != nil {
+					return
+				}
+				if err := http.NewResponseController(w).Flush(); err != nil {
+					return
+				}
+				streamOpen <- struct{}{}
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}),
+		})
+
+		if _, err := gw.Store.AddGrant("worker-test", "wiped.example.com", 443, []string{"GET"}, []string{"/stream"}, 5*time.Minute, false); err != nil {
+			t.Fatalf("AddGrant: %v", err)
+		}
+		resp, err := gw.H1Client(t, "wiped.example.com").Get("https://wiped.example.com/stream")
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /stream: resp=%+v err=%v", resp, err)
+		}
+		<-streamOpen
+
+		// Reload adds an explicit allow rule for wiped.example.com so DecideRequest allows it,
+		// yet the grant-admitted flow MUST still be torn down because its grant was wiped.
+		addedRule := `rules:
+  - id: allow-wiped-now
+    principal: worker-test
+    effect: allow
+    hosts: [wiped.example.com]
+    ports: [443]
+`
+		if err := os.WriteFile(gw.CfgPath, []byte(gw.BaseYAML+addedRule), 0o600); err != nil {
+			t.Fatalf("write reloaded config: %v", err)
+		}
+		_, _, revoked, err := gw.Store.Reload()
+		if err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
+		if revoked != 1 {
+			t.Fatalf("Reload revoked %d flow(s), want 1 (grant was wiped even though new rule allows host)", revoked)
+		}
+		if _, rErr := io.Copy(io.Discard, resp.Body); rErr != nil {
+			t.Logf("stream closed on reload: %v", rErr)
+		}
+		if cErr := resp.Body.Close(); cErr != nil {
+			t.Logf("close resp: %v", cErr)
+		}
+		waitAuditCompletedError(t, gw, "/stream", "reload")
+	})
+
+	t.Run("websocket_torn_down_when_allow_websocket_removed_while_http_stays_allowed", func(t *testing.T) {
+		streamOpen := make(chan struct{}, 2)
+		sendSecond := make(chan struct{})
+		release := make(chan struct{})
+		gw := newTestGateway(t, testGatewaySpec{
+			OnCleanupFirst: func() { close(release) },
+			Hosts:          []string{"wsdrop.example.com"},
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+					wsEchoHandler(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				rc := http.NewResponseController(w)
+				if _, err := io.WriteString(w, "data: one\n\n"); err != nil {
+					return
+				}
+				if err := rc.Flush(); err != nil {
+					return
+				}
+				streamOpen <- struct{}{}
+				select {
+				case <-sendSecond:
+					if _, err := io.WriteString(w, "data: two\n\n"); err != nil {
+						return
+					}
+					if err := rc.Flush(); err != nil {
+						return
+					}
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}),
+			RulesYAML: `
+  - id: allow-wsdrop
+    principal: worker-test
+    effect: allow
+    hosts: [wsdrop.example.com]
+    ports: [443]
+    allow_websocket: true
+`,
+		})
+
+		httpResp, err := gw.H1Client(t, "wsdrop.example.com").Get("https://wsdrop.example.com/keep-http")
+		if err != nil || httpResp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /keep-http: resp=%+v err=%v", httpResp, err)
+		}
+		defer func() {
+			if cErr := httpResp.Body.Close(); cErr != nil {
+				t.Logf("close httpResp: %v", cErr)
+			}
+		}()
+		<-streamOpen
+
+		wsConn, wsBR := openTestWSUpgrade(t, gw, "wsdrop.example.com", "/drop-ws")
+		updated := strings.Replace(gw.BaseYAML, "    allow_websocket: true\n", "", 1)
+		if err := os.WriteFile(gw.CfgPath, []byte(updated), 0o600); err != nil {
+			t.Fatalf("write config without allow_websocket: %v", err)
+		}
+		_, _, revoked, err := gw.Store.Reload()
+		if err != nil {
+			t.Fatalf("Reload removing allow_websocket: %v", err)
+		}
+		if revoked != 1 {
+			t.Fatalf("Reload revoked %d flow(s), want 1 (only WebSocket, not HTTP)", revoked)
+		}
+		if _, rErr := io.ReadAll(wsBR); rErr != nil {
+			t.Logf("ws closed on reload: %v", rErr)
+		}
+		if cErr := wsConn.Close(); cErr != nil {
+			t.Logf("close wsConn: %v", cErr)
+		}
+		waitAuditCompletedError(t, gw, "/drop-ws", "reload")
+
+		close(sendSecond)
+		body, rErr := io.ReadAll(httpResp.Body)
+		if rErr != nil || !strings.Contains(string(body), "data: two") {
+			t.Fatalf("HTTP stream should survive allow_websocket removal: body=%q err=%v", string(body), rErr)
+		}
+	})
+}
