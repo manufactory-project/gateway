@@ -345,3 +345,56 @@ func TestAuditSizePruningKeepsActiveAndEmitsLifecycleEvent(t *testing.T) {
 		t.Fatal("missing lifecycle audit event with reason=audit-size-pruned and bytes_removed>0")
 	}
 }
+
+func TestAuditActiveSegmentExceedsMaxTotalBytesSurvives(t *testing.T) {
+	dir := t.TempDir()
+	day2 := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+
+	// Pre-populate an older closed segment and an active day-2 segment that ALONE exceeds MaxTotalBytes.
+	oldSeg := filepath.Join(dir, "gateway-2026-11-25.jsonl")
+	activeSeg := filepath.Join(dir, "gateway-2026-11-26.jsonl")
+	if err := os.WriteFile(oldSeg, []byte(strings.Repeat("x", 200)+"\n"), 0o640); err != nil {
+		t.Fatalf("seed old segment: %v", err)
+	}
+	if err := os.WriteFile(activeSeg, []byte(strings.Repeat("a", 500)+"\n"), 0o640); err != nil {
+		t.Fatalf("seed active segment: %v", err)
+	}
+
+	var pruned atomic.Int64
+	w, err := audit.NewWriter(audit.Options{
+		Dir:           dir,
+		MaxFileBytes:  4096,
+		MaxTotalBytes: 300,
+		Now:           func() time.Time { return day2 },
+		OnSizePrune:   func(n int64) { pruned.Add(n) },
+	})
+	if err != nil {
+		t.Fatalf("NewWriter: %v", err)
+	}
+	t.Cleanup(func() {
+		if cErr := w.Close(); cErr != nil {
+			t.Errorf("Close: %v", cErr)
+		}
+	})
+
+	// Older segment must be removed, while active segment (> MaxTotalBytes alone) must survive.
+	if _, err := os.Stat(oldSeg); !os.IsNotExist(err) {
+		t.Fatalf("expected older closed segment %s to be pruned, stat err=%v", oldSeg, err)
+	}
+	if _, err := os.Stat(activeSeg); err != nil {
+		t.Fatalf("expected active segment %s exceeding max_total_bytes to survive: %v", activeSeg, err)
+	}
+	if pruned.Load() <= 0 {
+		t.Fatalf("expected OnSizePrune > 0, got %d", pruned.Load())
+	}
+	if err := w.WriteSync(audit.Event{
+		Kind:      audit.KindRequest,
+		Principal: "worker-test",
+		Host:      "api.example.com",
+		Path:      "/after-prune",
+		Status:    200,
+		Effect:    audit.EffectAllow,
+	}); err != nil {
+		t.Fatalf("WriteSync after active-segment survival: %v", err)
+	}
+}

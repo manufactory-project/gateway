@@ -205,7 +205,11 @@ func (w *Writer) WriteSync(ev Event) error {
 		}
 	}
 
-	return w.writeLineLocked(line)
+	if err := w.writeLineLocked(line); err != nil {
+		w.recordWriteError()
+		return err
+	}
+	return nil
 }
 
 func (w *Writer) writeLineLocked(line []byte) error {
@@ -218,7 +222,6 @@ func (w *Writer) writeLineLocked(line []byte) error {
 		if closeErr := w.closeFileLocked(); closeErr != nil {
 			writeErr = errors.Join(writeErr, closeErr)
 		}
-		w.recordWriteError()
 		return fmt.Errorf("audit: write segment: %w", writeErr)
 	}
 	w.fileSize += int64(n)
@@ -317,8 +320,7 @@ func (w *Writer) openSegmentLocked(ts time.Time, incrementSeq bool) error {
 	}
 
 	w.pruneLocked(ts.UTC())
-	w.pruneSizeLocked(ts.UTC())
-	return nil
+	return w.pruneSizeLocked(ts.UTC())
 }
 
 func (w *Writer) latestSeqForDay(day string) (int, error) {
@@ -384,14 +386,14 @@ type segmentMeta struct {
 	active bool
 }
 
-func (w *Writer) pruneSizeLocked(now time.Time) {
+func (w *Writer) pruneSizeLocked(now time.Time) error {
 	if w.maxTotalBytes <= 0 {
-		return
+		return nil
 	}
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
 		w.diagf("audit: size-prune readdir %s: %v\n", w.dir, err)
-		return
+		return nil
 	}
 	activeName := segmentFileName(w.day, w.seq)
 	var (
@@ -421,7 +423,7 @@ func (w *Writer) pruneSizeLocked(now time.Time) {
 		})
 	}
 	if total <= w.maxTotalBytes {
-		return
+		return nil
 	}
 	sort.Slice(segs, func(i, j int) bool {
 		if segs[i].day != segs[j].day {
@@ -445,7 +447,7 @@ func (w *Writer) pruneSizeLocked(now time.Time) {
 		removed += seg.size
 	}
 	if removed <= 0 {
-		return
+		return nil
 	}
 	if w.onSizePrune != nil {
 		w.onSizePrune(removed)
@@ -457,12 +459,14 @@ func (w *Writer) pruneSizeLocked(now time.Time) {
 	}, now.UTC())
 	line, mErr := json.Marshal(ev)
 	if mErr != nil {
-		return
+		return nil
 	}
 	line = append(line, '\n')
 	if wErr := w.writeLineLocked(line); wErr != nil {
 		w.diagf("audit: write audit-size-pruned event: %v\n", wErr)
+		return wErr
 	}
+	return nil
 }
 
 func sanitizeEvent(ev Event, now time.Time) Event {
