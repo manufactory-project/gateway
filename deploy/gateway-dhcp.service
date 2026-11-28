@@ -1,0 +1,12 @@
+[Unit]
+Description=gateway DHCPv4 server (dnsmasq)
+After=gateway.service
+Requires=gateway.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/run/gateway-dataplane/dnsmasq.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,90 @@
+version: '3'
+
+env:
+  # Pin Go 1.26.2 to match go.mod (go 1.26) and WSL golangci-lint built with Go 1.26.
+  GOTOOLCHAIN: go1.26.2
+
+tasks:
+  lint:
+    desc: Run golangci-lint and enforce gofmt, goleak coverage, and no-nolint:errcheck
+    cmds:
+      - |
+        set -eu
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "lint: gofmt found unformatted files:" >&2
+          echo "$unformatted" >&2
+          exit 1
+        fi
+      - golangci-lint run ./...
+      - |
+        set -eu
+        fail=0
+        for dir in $(find . -path './.git' -prune -o -name '*_test.go' -exec dirname {} + | sort -u); do
+          if ! sed 's|//.*||' "$dir"/*_test.go | grep -qE '\bgoleak\.VerifyTestMain[[:space:]]*\('; then
+            echo "lint: $dir has _test.go files but no goleak.VerifyTestMain call" >&2
+            fail=1
+          fi
+        done
+        exit "$fail"
+      - |
+        set -eu
+        if find . -path './.git' -prune -o -name '*.go' -exec grep -HnE '(//|/\*)[[:space:]]*nolint:[[:space:]]*([a-zA-Z0-9_-]+[[:space:]]*,[[:space:]]*)*errcheck\b' {} + | grep .; then
+          echo "lint: nolint directive naming errcheck is forbidden" >&2
+          exit 1
+        fi
+      - |
+        set -eu
+        out=$(go run golang.org/x/tools/cmd/deadcode@v0.42.0 ./...)
+        if [ -n "$out" ]; then
+          echo "lint: deadcode found unreachable functions:" >&2
+          echo "$out" >&2
+          exit 1
+        fi
+      - |
+        set -eu
+        if go list -deps ./internal/admin | grep -E 'github\.com/manufactory-project/gateway/internal/(proxy|secret|policy|netguard)$'; then
+          echo "lint: internal/admin must not depend on proxy, secret, policy, or netguard" >&2
+          exit 1
+        fi
+        if go list -deps ./cmd/gateway-probe | grep -E 'github\.com/manufactory-project/gateway/internal/(proxy|secret|policy|netguard)$'; then
+          echo "lint: cmd/gateway-probe must not depend on proxy, secret, policy, or netguard" >&2
+          exit 1
+        fi
+        if go list -deps ./cmd/gateway-probe | grep -v '^github\.com/manufactory-project/gateway/cmd/gateway-probe$' | grep -E '^[^/]+\.[^/]+/'; then
+          echo "lint: cmd/gateway-probe must be stdlib-only" >&2
+          exit 1
+        fi
+      - |
+        set -eu
+        if find . -path './.git' -prune -o -name '*.go' -exec grep -Hn 'NOW\.md:' {} + | grep .; then
+          echo "lint: NOW.md: reference is forbidden in .go files" >&2
+          exit 1
+        fi
+      - |
+        set -eu
+        go mod tidy -diff
+      - |
+        set -eu
+        bad=$(git log --no-merges --format='%an <%ae>|%cn <%ce>' | awk -F'|' 'NF != 2 || $1 != "Manufactory Bot <bot@manufactory.systems>" || ($2 != "Manufactory Bot <bot@manufactory.systems>" && $2 != "GitHub <noreply@github.com>")')
+        if [ -n "$bad" ]; then
+          echo "lint: commit identity check failed (expected author Manufactory Bot <bot@manufactory.systems>, committer bot or GitHub):" >&2
+          echo "$bad" >&2
+          exit 1
+        fi
+
+  test:
+    desc: Run Go tests with race detector (goleak enforced in tests)
+    cmds:
+      - go test -race -count=1 ./...
+
+  check:
+    desc: Run lint and race-checked tests
+    cmds:
+      - task: lint
+      - task: test
+
+  e2e:
+    desc: Run real Incus E2E harness against a throwaway project (pass flags after --)
+    cmds:
+      - ./e2e/run.sh {{.CLI_ARGS}}
