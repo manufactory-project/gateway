@@ -3,7 +3,9 @@ package proxy_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,6 +50,53 @@ func do(t *testing.T, c *http.Client, method, url string, hdr map[string]string)
 		}
 	})
 	return resp
+}
+
+func readAll(t *testing.T, r io.Reader) string {
+	t.Helper()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(b)
+}
+
+func TestBoundHostNeverServesPartialResponses(t *testing.T) {
+	secretValue := "sk-" + strings.Repeat("Z", 40)
+	secretFile := writeSecretFile(t, t.TempDir(), "key", secretValue)
+	var sawRange atomic.Bool
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Range") != "" || r.Header.Get("If-Range") != "" {
+				sawRange.Store(true)
+			}
+			if r.URL.Path == "/always-partial" {
+				w.Header().Set("Content-Range", "bytes 0-9/100")
+				w.WriteHeader(http.StatusPartialContent)
+				if _, err := io.WriteString(w, secretValue[:10]); err != nil {
+					return
+				}
+				return
+			}
+			http.ServeContent(w, r, "f.txt", time.Time{}, strings.NewReader("prefix:"+secretValue+":suffix"))
+		}),
+		RulesYAML: boundRule("r", "api.example.com", secretFile),
+	})
+	c := gw.H1Client(t, "api.example.com")
+
+	resp := do(t, c, http.MethodGet, "https://api.example.com/raw", map[string]string{"Range": "bytes=0-26", "If-Range": `"x"`})
+	if body := readAll(t, resp.Body); resp.StatusCode != http.StatusOK || body != "prefix:mf_ph_key:suffix" {
+		t.Fatalf("ranged request = %d %q, want the whole redacted body", resp.StatusCode, body)
+	}
+	if sawRange.Load() {
+		t.Fatal("Range or If-Range reached a bound host")
+	}
+
+	partial := do(t, c, http.MethodGet, "https://api.example.com/always-partial", nil)
+	if body := readAll(t, partial.Body); partial.StatusCode != http.StatusBadGateway || strings.Contains(body, secretValue[:10]) {
+		t.Fatalf("unsolicited 206 = %d %q, want 502 without upstream bytes", partial.StatusCode, body)
+	}
 }
 
 func TestUnreadableBoundSecretFailsBeforeDispatch(t *testing.T) {

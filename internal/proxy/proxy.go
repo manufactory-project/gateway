@@ -411,7 +411,7 @@ func completionMetricReason(admitReason, errText string) string {
 	}
 	switch errText {
 	case TeardownRevoked, TeardownGrantExpired, TeardownReload, TeardownClientCanceled,
-		"compressed-response-on-bound-host",
+		"compressed-response-on-bound-host", "partial-response-on-bound-host",
 		"unexpected-101", "unexpected-101-non-websocket":
 		return errText
 	default:
@@ -541,7 +541,10 @@ func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
 	rc.secretNames = secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, pairs, rc.dstPort)
 	if rc.dec.HasBindings {
 		rc.redactor = secret.NewRedactor(pairs)
-		// Force identity encoding on every request to a bound host.
+		// A bound host must answer whole and unencoded: ranges and compression
+		// would both let a secret past the scrubber.
+		rc.outHeaders.Del("Range")
+		rc.outHeaders.Del("If-Range")
 		rc.outHeaders.Set("Accept-Encoding", "identity")
 	}
 	return true
@@ -685,6 +688,8 @@ func refuseBoundResponse(rc *reqContext, resp *http.Response) string {
 		return ""
 	case !isIdentityContentEncoding(resp.Header.Values("Content-Encoding")):
 		return "compressed-response-on-bound-host"
+	case resp.StatusCode == http.StatusPartialContent:
+		return "partial-response-on-bound-host"
 	default:
 		return ""
 	}
