@@ -16,12 +16,14 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -94,10 +96,10 @@ func Init(certPath, keyPath string) (CA, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 
-	if err := writeAtomic(keyPath, keyPEM, 0o600); err != nil {
+	if err := writeNew(keyPath, keyPEM, 0o600); err != nil {
 		return CA{}, fmt.Errorf("ca: write key %s: %w", keyPath, err)
 	}
-	if err := writeAtomic(certPath, certPEM, 0o644); err != nil {
+	if err := writeNew(certPath, certPEM, 0o644); err != nil {
 		rmErr := os.Remove(keyPath)
 		return CA{}, errors.Join(fmt.Errorf("ca: write cert %s: %w", certPath, err), rmErr)
 	}
@@ -123,13 +125,13 @@ func Load(certPath, keyPath string) (CA, error) {
 	if err != nil {
 		return CA{}, fmt.Errorf("ca: parse cert %s: %w", certPath, err)
 	}
-	if !cert.IsCA {
-		return CA{}, fmt.Errorf("ca: cert %s is not a CA certificate", certPath)
+	if err := checkCA(cert, time.Now()); err != nil {
+		return CA{}, fmt.Errorf("ca: cert %s: %w", certPath, err)
 	}
 	// Re-encode strictly the first CERTIFICATE block so trailing blocks never leak.
 	cleanCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBlock.Bytes})
 
-	rawKey, err := os.ReadFile(keyPath)
+	rawKey, err := readPrivateFile(keyPath)
 	if err != nil {
 		return CA{}, fmt.Errorf("ca: read key %s: %w", keyPath, err)
 	}
@@ -308,29 +310,64 @@ func randomSerial() (*big.Int, error) {
 	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 }
 
-func writeAtomic(path string, data []byte, perm os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+// checkCA refuses a certificate that cannot act as a signing CA right now.
+func checkCA(cert *x509.Certificate, now time.Time) error {
+	switch {
+	case !cert.IsCA:
+		return errors.New("not a CA certificate")
+	case cert.KeyUsage&x509.KeyUsageCertSign == 0:
+		return errors.New("key usage does not include certificate signing")
+	case now.Before(cert.NotBefore):
+		return fmt.Errorf("not valid until %s", cert.NotBefore.UTC().Format(time.RFC3339))
+	case now.After(cert.NotAfter):
+		return fmt.Errorf("expired at %s", cert.NotAfter.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// readPrivateFile reads a key file through one descriptor, refusing a symlink and
+// any file that is accessible to group or other.
+func readPrivateFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err == nil && (!fi.Mode().IsRegular() || fi.Mode().Perm()&0o077 != 0) {
+		err = fmt.Errorf("must be a regular file with no group or other access (mode %v)", fi.Mode())
+	}
+	var raw []byte
+	if err == nil {
+		raw, err = io.ReadAll(f)
+	}
+	return raw, errors.Join(err, f.Close())
+}
+
+// writeNew creates path with exactly perm and data, or fails if path exists in any
+// form (a symlink included): it writes a fresh temp file in the same directory,
+// fsyncs it, and hard-links it into place, which never replaces or follows anything.
+func writeNew(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	f, err := os.CreateTemp(dir, ".ca-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		closeErr := f.Close()
-		rmErr := os.Remove(tmp)
-		return errors.Join(err, closeErr, rmErr)
+	tmp := f.Name()
+	err = f.Chmod(perm)
+	if err == nil {
+		_, err = f.Write(data)
 	}
-	if err := f.Close(); err != nil {
-		rmErr := os.Remove(tmp)
-		return errors.Join(err, rmErr)
+	if err == nil {
+		err = f.Sync()
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		rmErr := os.Remove(tmp)
-		return errors.Join(err, rmErr)
+	err = errors.Join(err, f.Close())
+	if err == nil {
+		err = os.Link(tmp, path)
 	}
-	return nil
+	return errors.Join(err, os.Remove(tmp))
 }
 
 func fileExists(path string) (bool, error) {

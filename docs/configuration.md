@@ -218,7 +218,7 @@ A rule that pins grants no access by itself, and is subject to every `deny`. Ups
 | `cert_path` | yes | CA certificate that guests trust |
 | `key_path` | yes | Its private key |
 
-`gateway ca init --cert PATH --key PATH` creates both, valid for ten years. It refuses to overwrite existing files and writes the key with mode `0600`, so give the `gateway` group read access afterwards.
+`gateway ca init --cert PATH --key PATH` creates both, valid for ten years. It refuses to overwrite existing files and writes the key with mode `0600`; chown it to the `gateway` user. The daemon refuses a key that group or other can access, a symlinked key, and a certificate that is not a CA, lacks the certificate-signing key usage, or is expired or not yet valid.
 
 ### `audit`
 
@@ -329,7 +329,7 @@ A grant allows one exact host for one principal until it expires. It exists only
 gateway grant --principal guest0 --host example.com --ttl 5m
 ```
 
-The port defaults to 443 and the TTL to `5m`; `--methods` and `--paths` take comma-separated lists. A grant competes with the `allow` rules under [the same precedence](#which-rule-wins), is overridden by any `deny`, and carries no secrets or pins.
+The port defaults to 443 and the TTL to `5m`; `--methods` and `--paths` take comma-separated lists. A grant competes with the `allow` rules under [the same precedence](#which-rule-wins), is overridden by any `deny`, and carries no secrets or pins. A grant lasts at most 1 hour and at most 32 grants can be live at once; a request beyond either is refused and audited. Every admin audit record carries the caller's `peer_uid` and `peer_pid` from the socket, and a grant is recorded before it becomes live.
 
 The CLI cannot grant WebSocket access. Use the admin API, where `ttl` is required:
 

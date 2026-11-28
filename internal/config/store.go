@@ -230,7 +230,9 @@ func (s *Store) WatchSIGHUP(ctx context.Context, onResult func(*Snapshot, []stri
 
 // AddGrant validates and inserts an ephemeral in-memory TTL grant.
 // Grants accept exact hostnames only (no wildcards), ports 80 or 443, and positive TTLs.
-func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths []string, ttl time.Duration, allowWebSocket bool) (Grant, error) {
+// Each beforeLive func runs with the validated grant before it becomes live, with
+// no store lock held; if one fails the grant is never inserted and its error is returned.
+func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths []string, ttl time.Duration, allowWebSocket bool, beforeLive ...func(Grant) error) (Grant, error) {
 	if ttl <= 0 {
 		return Grant{}, errors.New("grant: ttl must be > 0")
 	}
@@ -308,9 +310,21 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(ttl),
 	}
+	s.mu.Unlock()
+
+	for _, fn := range beforeLive {
+		if err := fn(g); err != nil {
+			return Grant{}, err
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.gen != startGen {
+		return Grant{}, errors.New("grant: concurrent reload wiped grants; retry")
+	}
 	s.grants[g.ID] = g
 	s.grantGen++
-	s.mu.Unlock()
 	return g, nil
 }
 

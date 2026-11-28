@@ -98,7 +98,19 @@ type Options struct {
 	Audit        *audit.Writer
 	Metrics      *metrics.Collector
 	OnServeError func(error)
+	// MaxGrantTTL caps a grant's lifetime and MaxGrants the number of live grants;
+	// zero selects DefaultMaxGrantTTL and DefaultMaxGrants.
+	MaxGrantTTL time.Duration
+	MaxGrants   int
 }
+
+// Defaults for Options.MaxGrantTTL and Options.MaxGrants.
+const (
+	DefaultMaxGrantTTL = time.Hour
+	DefaultMaxGrants   = 32
+)
+
+var errAuditUnavailable = errors.New("audit sink unavailable")
 
 // Server serves the Admin API strictly over a local Unix domain socket (mode 0660).
 type Server struct {
@@ -109,6 +121,10 @@ type Server struct {
 	audit        *audit.Writer
 	metrics      *metrics.Collector
 	onServeError func(error)
+	maxGrantTTL  time.Duration
+	maxGrants    int
+
+	grantMu sync.Mutex // serializes grant creation so the live-grant cap holds
 
 	ln  net.Listener
 	srv *http.Server
@@ -123,7 +139,15 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.Store == nil || opts.Flows == nil || opts.Audit == nil || opts.OnServeError == nil {
 		return nil, errors.New("admin: store, flows, audit, and onServeError are required")
 	}
+	if opts.MaxGrantTTL <= 0 {
+		opts.MaxGrantTTL = DefaultMaxGrantTTL
+	}
+	if opts.MaxGrants <= 0 {
+		opts.MaxGrants = DefaultMaxGrants
+	}
 	return &Server{
+		maxGrantTTL:  opts.MaxGrantTTL,
+		maxGrants:    opts.MaxGrants,
 		socketPath:   opts.SocketPath,
 		socketGroup:  opts.SocketGroup,
 		store:        opts.Store,
@@ -136,36 +160,9 @@ func NewServer(opts Options) (*Server, error) {
 
 // Start binds the Unix domain socket with permissions 0660 and serves requests.
 func (s *Server) Start() error {
-	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o750); err != nil {
-		return fmt.Errorf("admin: mkdir socket dir: %w", err)
-	}
-	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("admin: remove stale socket %s: %w", s.socketPath, err)
-	}
-
-	ln, err := net.Listen("unix", s.socketPath)
+	ln, err := s.listen()
 	if err != nil {
-		return fmt.Errorf("admin: listen unix %s: %w", s.socketPath, err)
-	}
-	if err := os.Chmod(s.socketPath, 0o660); err != nil {
-		closeErr := ln.Close()
-		return errors.Join(fmt.Errorf("admin: chmod 0660 %s: %w", s.socketPath, err), closeErr)
-	}
-	if s.socketGroup != "" {
-		grp, err := user.LookupGroup(s.socketGroup)
-		if err != nil {
-			closeErr := ln.Close()
-			return errors.Join(fmt.Errorf("admin: lookup group %q: %w", s.socketGroup, err), closeErr)
-		}
-		gid, err := strconv.Atoi(grp.Gid)
-		if err != nil {
-			closeErr := ln.Close()
-			return errors.Join(fmt.Errorf("admin: parse gid %q: %w", grp.Gid, err), closeErr)
-		}
-		if err := os.Chown(s.socketPath, -1, gid); err != nil {
-			closeErr := ln.Close()
-			return errors.Join(fmt.Errorf("admin: chown socket group %q: %w", s.socketGroup, err), closeErr)
-		}
+		return err
 	}
 
 	mux := http.NewServeMux()
@@ -179,7 +176,8 @@ func (s *Server) Start() error {
 
 	s.ln = ln
 	s.srv = &http.Server{
-		Handler:           mux,
+		Handler:           s.requirePeer(mux),
+		ConnContext:       peerConnContext,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -194,6 +192,87 @@ func (s *Server) Start() error {
 		})
 	}()
 	return nil
+}
+
+// listen binds the socket inside a private (0700) directory, sets its final mode
+// and group there, and only then renames it into place, so the socket is never
+// reachable with a mode wider than 0660 or the wrong group.
+func (s *Server) listen() (net.Listener, error) {
+	dir := filepath.Dir(s.socketPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, fmt.Errorf("admin: mkdir socket dir: %w", err)
+	}
+	staging, err := os.MkdirTemp(dir, ".admin-")
+	if err != nil {
+		return nil, fmt.Errorf("admin: staging dir: %w", err)
+	}
+	ln, err := s.listenIn(staging)
+	rmErr := os.RemoveAll(staging)
+	if err != nil {
+		return nil, errors.Join(err, rmErr)
+	}
+	if rmErr != nil {
+		return nil, errors.Join(fmt.Errorf("admin: remove staging dir: %w", rmErr), ln.Close())
+	}
+	return ln, nil
+}
+
+func (s *Server) listenIn(staging string) (net.Listener, error) {
+	staged := filepath.Join(staging, "sock")
+	ln, err := net.Listen("unix", staged)
+	if err != nil {
+		return nil, fmt.Errorf("admin: listen unix %s: %w", s.socketPath, err)
+	}
+	fail := func(err error) (net.Listener, error) { return nil, errors.Join(err, ln.Close()) }
+	if err := os.Chmod(staged, 0o660); err != nil {
+		return fail(fmt.Errorf("admin: chmod 0660 %s: %w", s.socketPath, err))
+	}
+	if s.socketGroup != "" {
+		grp, err := user.LookupGroup(s.socketGroup)
+		if err != nil {
+			return fail(fmt.Errorf("admin: lookup group %q: %w", s.socketGroup, err))
+		}
+		gid, err := strconv.Atoi(grp.Gid)
+		if err != nil {
+			return fail(fmt.Errorf("admin: parse gid %q: %w", grp.Gid, err))
+		}
+		if err := os.Chown(staged, -1, gid); err != nil {
+			return fail(fmt.Errorf("admin: chown socket group %q: %w", s.socketGroup, err))
+		}
+	}
+	if err := os.Rename(staged, s.socketPath); err != nil {
+		return fail(fmt.Errorf("admin: install socket %s: %w", s.socketPath, err))
+	}
+	return ln, nil
+}
+
+// requirePeer refuses any request whose peer credentials could not be read, so
+// every served request can be attributed.
+func (s *Server) requirePeer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p, ok := r.Context().Value(peerKey{}).(peer); !ok || p.err != nil {
+			writeError(w, http.StatusForbidden, "peer credentials unavailable")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// record writes ev to the audit log stamped with the caller's uid and pid.
+func (s *Server) record(r *http.Request, ev audit.Event) error {
+	p, ok := r.Context().Value(peerKey{}).(peer)
+	if !ok {
+		return errors.New("admin: request has no peer credentials")
+	}
+	ev.PeerUID, ev.PeerPID = &p.uid, &p.pid
+	return s.audit.WriteSync(ev)
+}
+
+// revokeGrant is the only way a grant is revoked: the grant and every flow
+// running under it go together.
+func (s *Server) revokeGrant(id string) (g config.Grant, existed bool, revokedFlows int) {
+	g, existed = s.store.RevokeGrant(id)
+	return g, existed, s.flows.RevokeByGrant(id)
 }
 
 func serveUntilClosed(srv *http.Server, ln net.Listener, onErr func(error)) {
@@ -232,13 +311,13 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	snap, wiped, revokedFlows, err := s.store.Reload()
 	if err != nil {
 		if s.metrics != nil {
 			s.metrics.ObserveReload(false)
 		}
-		if aErr := s.audit.WriteSync(audit.Event{
+		if aErr := s.record(r, audit.Event{
 			Kind:   audit.KindLifecycle,
 			Reason: "reload-failed",
 			Error:  err.Error(),
@@ -252,7 +331,7 @@ func (s *Server) handleReload(w http.ResponseWriter, _ *http.Request) {
 	if s.metrics != nil {
 		s.metrics.ObserveReload(true)
 	}
-	if aErr := s.audit.WriteSync(audit.Event{
+	if aErr := s.record(r, audit.Event{
 		Kind:         audit.KindLifecycle,
 		Reason:       "reload",
 		ConfigHash:   snap.Hash,
@@ -315,18 +394,17 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		reason = "revoke-flow"
 	case req.GrantID != "":
 		var deletedGrant config.Grant
-		deletedGrant, revokedGrant = s.store.RevokeGrant(req.GrantID)
+		deletedGrant, revokedGrant, revokedFlows = s.revokeGrant(req.GrantID)
 		principal = deletedGrant.Principal
 		host = deletedGrant.Host
 		port = int(deletedGrant.Port)
-		revokedFlows = s.flows.RevokeByGrant(req.GrantID)
 		reason = "revoke-grant"
 	case req.Principal != "":
 		revokedFlows = s.flows.RevokeByPrincipal(req.Principal, req.Host)
 		reason = "revoke-principal"
 	}
 
-	if err := s.audit.WriteSync(audit.Event{
+	if err := s.record(r, audit.Event{
 		Kind:         audit.KindRevoke,
 		Principal:    principal,
 		Host:         host,
@@ -361,31 +439,55 @@ func (s *Server) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid ttl duration")
 		return
 	}
-	g, err := s.store.AddGrant(req.Principal, req.Host, req.Port, req.Methods, req.Paths, ttl, req.AllowWebSocket)
-	if err != nil {
+	refuse := func(status int, reason string) {
+		if aErr := s.record(r, audit.Event{
+			Kind: audit.KindGrant, Principal: req.Principal, Host: req.Host, Port: int(req.Port),
+			TTL: req.TTL, Effect: audit.EffectDeny, Reason: reason,
+		}); aErr != nil {
+			status, reason = http.StatusServiceUnavailable, errAuditUnavailable.Error()
+		}
+		writeError(w, status, reason)
+	}
+	if ttl > s.maxGrantTTL {
+		refuse(http.StatusBadRequest, "grant-ttl-exceeds-max")
+		return
+	}
+	s.grantMu.Lock()
+	defer s.grantMu.Unlock()
+	if len(s.store.ActiveGrants()) >= s.maxGrants {
+		refuse(http.StatusTooManyRequests, "grant-limit-reached")
+		return
+	}
+	// The grant-created record is written before the grant exists, so a grant is
+	// never live without being audited and there is nothing to roll back.
+	g, err := s.store.AddGrant(req.Principal, req.Host, req.Port, req.Methods, req.Paths, ttl, req.AllowWebSocket, func(g config.Grant) error {
+		allowWS := g.AllowWebSocket
+		if err := s.record(r, audit.Event{
+			Kind:           audit.KindGrant,
+			Principal:      g.Principal,
+			Host:           g.Host,
+			Port:           int(g.Port),
+			Methods:        g.Methods,
+			Paths:          g.Paths,
+			AllowWebSocket: &allowWS,
+			GrantID:        g.ID,
+			TTL:            ttl.String(),
+			ExpiresAt:      g.ExpiresAt.UTC().Format(time.RFC3339),
+			Effect:         audit.EffectAllow,
+			Reason:         "grant-created",
+		}); err != nil {
+			return errors.Join(errAuditUnavailable, err)
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errAuditUnavailable):
+		writeError(w, http.StatusServiceUnavailable, errAuditUnavailable.Error())
+	case err != nil:
 		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	default:
+		writeJSON(w, http.StatusCreated, g)
 	}
-	allowWS := g.AllowWebSocket
-	if err := s.audit.WriteSync(audit.Event{
-		Kind:           audit.KindGrant,
-		Principal:      g.Principal,
-		Host:           g.Host,
-		Port:           int(g.Port),
-		Methods:        g.Methods,
-		Paths:          g.Paths,
-		AllowWebSocket: &allowWS,
-		GrantID:        g.ID,
-		TTL:            ttl.String(),
-		ExpiresAt:      g.ExpiresAt.UTC().Format(time.RFC3339),
-		Effect:         audit.EffectAllow,
-		Reason:         "grant-created",
-	}); err != nil {
-		s.store.RevokeGrant(g.ID)
-		writeError(w, http.StatusServiceUnavailable, "audit sink unavailable")
-		return
-	}
-	writeJSON(w, http.StatusCreated, g)
 }
 
 func (s *Server) handleDeleteGrant(w http.ResponseWriter, r *http.Request) {
@@ -394,9 +496,8 @@ func (s *Server) handleDeleteGrant(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing grant id")
 		return
 	}
-	deletedGrant, existed := s.store.RevokeGrant(id)
-	revokedFlows := s.flows.RevokeByGrant(id)
-	if err := s.audit.WriteSync(audit.Event{
+	deletedGrant, existed, revokedFlows := s.revokeGrant(id)
+	if err := s.record(r, audit.Event{
 		Kind:         audit.KindRevoke,
 		Principal:    deletedGrant.Principal,
 		Host:         deletedGrant.Host,

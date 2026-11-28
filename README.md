@@ -99,9 +99,10 @@ Add the config and create the CA. [examples/two-links.yaml](examples/two-links.y
 install -o root -g gateway -m 0640 examples/two-links.yaml /etc/gateway/gateway.yaml
 
 gateway ca init --cert /etc/gateway/ca/ca.crt --key /etc/gateway/ca/ca.key
-chown root:gateway /etc/gateway/ca/ca.crt /etc/gateway/ca/ca.key
+chown root:gateway /etc/gateway/ca/ca.crt
+chown gateway:gateway /etc/gateway/ca/ca.key
 chmod 0644 /etc/gateway/ca/ca.crt
-chmod 0640 /etc/gateway/ca/ca.key
+chmod 0600 /etc/gateway/ca/ca.key
 ```
 
 Anyone who has `ca.key` and sits between a guest and the gateway can impersonate any TLS server to that guest. Keep it on the gateway.

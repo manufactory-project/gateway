@@ -94,6 +94,8 @@ type Event struct {
 	Count          uint64    `json:"count,omitempty"`
 	Error          string    `json:"error,omitempty"`
 	ConfigHash     string    `json:"config_hash,omitempty"`
+	PeerUID        *int      `json:"peer_uid,omitempty"`
+	PeerPID        *int      `json:"peer_pid,omitempty"`
 }
 
 // Options configures an audit Writer.

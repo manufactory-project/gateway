@@ -65,7 +65,7 @@ Not prevented:
 
 | Risk | Effect | What you can do |
 |---|---|---|
-| `ca.key_path` is a trust anchor with no name constraints | Anyone with the key and a position between a guest and the gateway can impersonate any TLS server to that guest. It does not let them intercept the gateway's own upstream connections | Keep the key on the gateway, readable only by root and the `gateway` group |
+| `ca.key_path` is a trust anchor with no name constraints | Anyone with the key and a position between a guest and the gateway can impersonate any TLS server to that guest. It does not let them intercept the gateway's own upstream connections | Keep the key on the gateway, readable only by the `gateway` user |
 | The daemon does not read the live nftables ruleset at startup | It checks sysctls and a marker file that `netsetup` writes. If the table is removed afterwards, the daemon does not notice | Start it through the shipped unit, which reruns `netsetup`. Run `gateway dataplane check` as root to monitor |
 | `gateway dataplane check` checks that the table and chains exist | Altered rules inside a chain pass | Restrict who has root on the gateway |
 | Removed links are blocked by interface name, only once `netsetup` has run | They are open between boot and `netsetup`, if it fails before loading rules, if another tool flushes the ruleset, or if the interface is renamed or added to a bridge or bond. A link removed before this record existed, or whose record is lost, is not blocked after a reboot | Detach removed guests; do not flush the ruleset |

@@ -366,9 +366,10 @@ incus file push "$REPO_ROOT/deploy/gateway-dhcp.service" "${GW_INST}/etc/systemd
 gw_exec bash -ceu '
   chown root:gateway /etc/gateway/gateway.yaml
   /usr/local/bin/gateway ca init --cert /etc/gateway/ca/ca.crt --key /etc/gateway/ca/ca.key
-  chown root:gateway /etc/gateway/ca/ca.crt /etc/gateway/ca/ca.key
+  chown root:gateway /etc/gateway/ca/ca.crt
+  chown gateway:gateway /etc/gateway/ca/ca.key
   chmod 0644 /etc/gateway/ca/ca.crt
-  chmod 0640 /etc/gateway/ca/ca.key
+  chmod 0600 /etc/gateway/ca/ca.key
   systemctl daemon-reload
 '
 
