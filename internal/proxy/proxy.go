@@ -635,9 +635,18 @@ func (s *Server) prepare(w http.ResponseWriter, rc *reqContext) bool {
 		rc.deny(w, http.StatusForbidden, "secret-unresolved")
 		return false
 	}
-	rc.secretNames = secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, pairs, rc.dstPort)
+	applied, err := secret.ApplyRequest(rc.outHeaders, rc.dec.MatchedBindings, pairs, rc.dstPort)
+	if err != nil {
+		var misplaced *secret.MisplacedError
+		if errors.As(err, &misplaced) {
+			rc.secretNames = []string{misplaced.Name}
+		}
+		rc.deny(w, http.StatusForbidden, "placeholder-misplaced")
+		return false
+	}
+	rc.secretNames = applied.Names
 	if rc.dec.HasBindings {
-		rc.redactor = secret.NewRedactor(pairs)
+		rc.redactor = secret.NewRedactor(append(pairs, applied.Echoes...))
 		// A bound host must answer whole and unencoded: ranges and compression
 		// would both let a secret past the scrubber.
 		rc.outHeaders.Del("Range")

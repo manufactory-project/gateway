@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
@@ -108,7 +109,11 @@ func TestApplyRequestSubstitutionAndUnconditionalPostSubSweep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveHostPairs: %v", err)
 	}
-	names := secret.ApplyRequest(hdr, []config.BindingConfig{bindingBasic}, pairs, 443)
+	applied, err := secret.ApplyRequest(hdr, []config.BindingConfig{bindingBasic}, pairs, 443)
+	if err != nil {
+		t.Fatalf("ApplyRequest: %v", err)
+	}
+	names := applied.Names
 	if len(names) != 1 || names[0] != "forge-basic" || len(pairs) != 1 {
 		t.Fatalf("unexpected names=%v pairs=%+v", names, pairs)
 	}
@@ -129,8 +134,11 @@ func TestApplyRequestSubstitutionAndUnconditionalPostSubSweep(t *testing.T) {
 	hdr80 := make(http.Header)
 	hdr80.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("git:mf_ph_A")))
 	hdr80.Set("Proxy-Authorization", "Bearer abc")
-	names80 := secret.ApplyRequest(hdr80, []config.BindingConfig{bindingBasic}, pairs, 80)
-	if len(names80) != 0 {
+	applied80, err := secret.ApplyRequest(hdr80, []config.BindingConfig{bindingBasic}, pairs, 80)
+	if err != nil {
+		t.Fatalf("ApplyRequest :80: %v", err)
+	}
+	if names80 := applied80.Names; len(names80) != 0 {
 		t.Fatalf("port 80 must never substitute secrets, got %v", names80)
 	}
 	if hdr80.Get("Authorization") != "" || hdr80.Get("Proxy-Authorization") != "" {
@@ -210,5 +218,107 @@ func TestStreamingRedactorPrefixSecretAcrossChunkBoundary(t *testing.T) {
 	}
 	if got != "lead mf_ph_long tail" {
 		t.Fatalf("got %q, want %q", got, "lead mf_ph_long tail")
+	}
+}
+
+func writeSecret(t *testing.T, val string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "sec")
+	if err := os.WriteFile(p, []byte(val+"\n"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	return p
+}
+
+// TestPlaceholderMustBeExactBoundHeaderValue pins that the guest cannot choose where
+// the placeholder sits: only the exact scheme form is substituted, every other
+// mention in the bound header is refused, and a header without the placeholder passes.
+func TestPlaceholderMustBeExactBoundHeaderValue(t *testing.T) {
+	const ph = "mf_ph_exact"
+	real := "real-" + randSecret(t)
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	mk := func(scheme string) config.BindingConfig {
+		return config.BindingConfig{Name: "n-" + scheme, Host: "h.example", Header: "Authorization", Scheme: scheme, Placeholder: ph, SecretFile: writeSecret(t, real)}
+	}
+	cases := []struct {
+		scheme, in string
+		want       string // "" means refused
+	}{
+		{"bearer", "Bearer " + ph, "Bearer " + real},
+		{"bearer", "bearer " + ph, "bearer " + real},
+		{"bearer", "Bearer x" + ph, ""},
+		{"bearer", "Bearer " + ph + "x", ""},
+		{"bearer", "Bearer  " + ph, ""},
+		{"bearer", "Bearer " + ph + " " + ph, ""},
+		{"bearer", "Token " + ph, ""},
+		{"token", "Token " + ph, "Token " + real},
+		{"token", "Bearer " + ph, ""},
+		{"raw", ph, real},
+		{"raw", "prefix-" + ph, ""},
+		{"raw", ph + ",other", ""},
+		{"basic", "Basic " + b64("git:"+ph), "Basic " + b64("git:"+real)},
+		{"basic", "Basic " + b64(":"+ph), "Basic " + b64(":"+real)},
+		{"basic", "Basic " + b64("git:x"+ph), ""},
+		{"basic", "Basic " + b64(ph+":pw"), ""},
+		{"basic", "Basic " + b64("git:"+ph+":more"), ""},
+		{"basic", "Bearer " + ph, ""},
+		// Positive control: a header with no placeholder at all is the guest's own credential.
+		{"bearer", "Bearer guest-own-token", "Bearer guest-own-token"},
+	}
+	for _, tc := range cases {
+		b := mk(tc.scheme)
+		pairs, err := secret.ResolveHostPairs([]config.BindingConfig{b})
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		hdr := http.Header{"Authorization": {tc.in}}
+		applied, err := secret.ApplyRequest(hdr, []config.BindingConfig{b}, pairs, 443)
+		if tc.want == "" {
+			var mis *secret.MisplacedError
+			if !errors.As(err, &mis) || mis.Name != b.Name {
+				t.Errorf("%s %q: err = %v, want *MisplacedError", tc.scheme, tc.in, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s %q: unexpected error %v", tc.scheme, tc.in, err)
+			continue
+		}
+		if got := hdr.Get("Authorization"); got != tc.want {
+			t.Errorf("%s %q: Authorization = %q, want %q", tc.scheme, tc.in, got, tc.want)
+		}
+		if tc.want != tc.in && len(applied.Names) != 1 {
+			t.Errorf("%s %q: names = %v", tc.scheme, tc.in, applied.Names)
+		}
+	}
+}
+
+// TestBasicAuthEchoIsScrubbed pins that a response echoing the whole Basic header
+// the gateway sent (base64(user:secret)) comes back as the guest's own value.
+func TestBasicAuthEchoIsScrubbed(t *testing.T) {
+	const ph = "mf_ph_echo"
+	real := "real-" + randSecret(t)
+	b := config.BindingConfig{Name: "echo", Host: "h.example", Header: "Authorization", Scheme: "basic", Placeholder: ph, SecretFile: writeSecret(t, real)}
+	pairs, err := secret.ResolveHostPairs([]config.BindingConfig{b})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	guest := "Basic " + base64.StdEncoding.EncodeToString([]byte("git:"+ph))
+	hdr := http.Header{"Authorization": {guest}}
+	applied, err := secret.ApplyRequest(hdr, []config.BindingConfig{b}, pairs, 443)
+	if err != nil {
+		t.Fatalf("ApplyRequest: %v", err)
+	}
+	sent := hdr.Get("Authorization")
+	if sent == guest {
+		t.Fatal("control: Authorization was not substituted")
+	}
+	red := secret.NewRedactor(append(pairs, applied.Echoes...))
+	if got := red.ScrubString(`{"auth":"` + sent + `"}`); got != `{"auth":"`+guest+`"}` {
+		t.Fatalf("echoed Basic header not scrubbed: %q", got)
+	}
+	// Control: a Redactor built without the echoes would have let it through.
+	if got := secret.NewRedactor(pairs).ScrubString(sent); got != sent {
+		t.Fatalf("control: bare-secret redactor unexpectedly scrubbed the encoded form: %q", got)
 	}
 }

@@ -274,8 +274,11 @@ func TestBearerBindingSubstitutesOnlyBearerScheme(t *testing.T) {
 `, secFile),
 	})
 
-	send := func(authHeader string) string {
+	send := func(authHeader string) (string, int) {
 		t.Helper()
+		mu.Lock()
+		lastAuth = ""
+		mu.Unlock()
 		req, err := http.NewRequest(http.MethodGet, "https://bearer.example.com/check", nil)
 		if err != nil {
 			t.Fatalf("NewRequest: %v", err)
@@ -288,23 +291,29 @@ func TestBearerBindingSubstitutesOnlyBearerScheme(t *testing.T) {
 		if err := resp.Body.Close(); err != nil {
 			t.Fatalf("close body: %v", err)
 		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("Do(%q) status = %d, want 200", authHeader, resp.StatusCode)
-		}
 		mu.Lock()
 		got := lastAuth
 		mu.Unlock()
-		return got
+		return got, resp.StatusCode
 	}
 
-	if got := send("Bearer mf_ph_bearer_tok"); got != "Bearer "+secVal {
-		t.Fatalf("Bearer scheme got %q, want %q", got, "Bearer "+secVal)
+	if got, status := send("Bearer mf_ph_bearer_tok"); status != http.StatusOK || got != "Bearer "+secVal {
+		t.Fatalf("Bearer scheme got %q (status %d), want %q (200)", got, status, "Bearer "+secVal)
 	}
-	if got := send("Token mf_ph_bearer_tok"); got != "" {
-		t.Fatalf("non-Bearer Token scheme must not substitute or leak placeholder, got %q", got)
+	// The placeholder anywhere but exactly "Bearer <placeholder>" is refused, never forwarded.
+	for _, bad := range []string{"Token mf_ph_bearer_tok", "mf_ph_bearer_tok", "Bearer x mf_ph_bearer_tok"} {
+		if got, status := send(bad); status != http.StatusForbidden || got != "" {
+			t.Fatalf("%q: status %d upstream saw %q, want 403 and nothing forwarded", bad, status, got)
+		}
 	}
-	if got := send("mf_ph_bearer_tok"); got != "" {
-		t.Fatalf("raw placeholder on bearer binding must not substitute or leak, got %q", got)
+	var refused int
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Reason == "placeholder-misplaced" && ev.Status == http.StatusForbidden && len(ev.Secrets) == 1 && ev.Secrets[0] == "api-bearer" {
+			refused++
+		}
+	}
+	if refused != 3 {
+		t.Fatalf("audited %d placeholder-misplaced refusals, want 3", refused)
 	}
 }
 
