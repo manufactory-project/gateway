@@ -910,10 +910,17 @@ rules:
 func TestMetricsReasonLabelAndCompletionAuditFailureCounts(t *testing.T) {
 	inUpstream := make(chan struct{})
 	releaseUpstream := make(chan struct{})
+	auditFailed := make(chan struct{}, 1)
 	gw := newTestGateway(t, testGatewaySpec{
 		AuditMaxFileBytes: 180,
 		OnCleanupFirst:    func() { close(releaseUpstream) },
-		Hosts:             []string{"met.example.com"},
+		OnAuditWriteError: func() {
+			select {
+			case auditFailed <- struct{}{}:
+			default:
+			}
+		},
+		Hosts: []string{"met.example.com"},
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/fail-complete-audit" {
 				close(inUpstream)
@@ -969,6 +976,13 @@ func TestMetricsReasonLabelAndCompletionAuditFailureCounts(t *testing.T) {
 	releaseUpstream <- struct{}{}
 	if err := <-doneCh; err != nil {
 		t.Fatalf("GET /fail-complete-audit: %v", err)
+	}
+
+	// The guest can finish reading before the completion audit is attempted.
+	select {
+	case <-auditFailed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("completion audit write never failed")
 	}
 
 	rec := httptest.NewRecorder()

@@ -120,6 +120,7 @@ type testGatewaySpec struct {
 	StartGrantPruner  bool
 	OnCleanupFirst    func()
 	UpstreamH1        bool
+	OnAuditWriteError func()
 }
 
 type testGateway struct {
@@ -245,7 +246,12 @@ func newTestGateway(t testing.TB, spec testGatewaySpec) *testGateway {
 	aw, err := audit.NewWriter(audit.Options{
 		Dir:          auditDir,
 		MaxFileBytes: spec.AuditMaxFileBytes,
-		OnWriteError: col.IncAuditWriteError,
+		OnWriteError: func() {
+			col.IncAuditWriteError()
+			if spec.OnAuditWriteError != nil {
+				spec.OnAuditWriteError()
+			}
+		},
 	})
 	if err != nil {
 		t.Fatalf("audit.NewWriter: %v", err)
