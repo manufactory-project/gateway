@@ -268,6 +268,14 @@ func TestAuditSinkFailureReturns503NoUpstreamDial(t *testing.T) {
 	if !got503 {
 		t.Fatal("proxy did not return 503 when audit sink became unwritable")
 	}
+
+	rec := httptest.NewRecorder()
+	gw.Metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	mText := rec.Body.String()
+	wantMetric := `gateway_requests_total{effect="deny",principal="worker-test",reason="audit-unavailable",status="503"} 2`
+	if !strings.Contains(mText, wantMetric) {
+		t.Fatalf("/metrics missing %q:\n%s", wantMetric, mText)
+	}
 }
 
 type stepResolver struct {
@@ -720,7 +728,9 @@ func TestUpstreamResponseHeaderTimeoutAudits502(t *testing.T) {
 `,
 	})
 
-	resp, err := gw.H1Client(t, "slowhdr.example.com").Get("https://slowhdr.example.com/stall")
+	client := gw.H1Client(t, "slowhdr.example.com")
+	client.Timeout = 2 * time.Second
+	resp, err := client.Get("https://slowhdr.example.com/stall")
 	if err != nil {
 		t.Fatalf("GET /stall: %v", err)
 	}

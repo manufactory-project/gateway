@@ -571,6 +571,9 @@ func (s *Server) relay(w http.ResponseWriter, rc *reqContext) {
 
 	// Fail-closed admission audit BEFORE dialing upstream.
 	if err := rc.auditAdmitted(); err != nil {
+		if rc.srv.onRequest != nil {
+			rc.srv.onRequest(rc.srv.link.Principal, string(audit.EffectDeny), http.StatusServiceUnavailable, "audit-unavailable")
+		}
 		http.Error(w, "audit sink unavailable", http.StatusServiceUnavailable)
 		return
 	}
