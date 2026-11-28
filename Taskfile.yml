@@ -1,13 +1,14 @@
 version: '3'
 
 env:
-  # Pin Go 1.26.2 to match go.mod (go 1.26) and WSL golangci-lint built with Go 1.26.
-  GOTOOLCHAIN: go1.26.2
+  # Pin the patched Go release that go.mod requires.
+  GOTOOLCHAIN: go1.26.11
 
 tasks:
   lint:
     desc: Run golangci-lint and enforce gofmt, goleak coverage, and no-nolint:errcheck
     cmds:
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - |
         set -eu
         unformatted=$(gofmt -l .)

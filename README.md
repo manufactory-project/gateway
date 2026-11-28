@@ -73,7 +73,7 @@ apt-get update
 apt-get install -y nftables dnsmasq-base iproute2 ca-certificates curl git jq
 ```
 
-Install Go 1.26 or later by following [go.dev/doc/install](https://go.dev/doc/install). Ubuntu 24.04's `golang-go` package is older. Then clone and build:
+Install Go 1.26.11 or later by following [go.dev/doc/install](https://go.dev/doc/install). Ubuntu 24.04's `golang-go` package is older. Then clone and build:
 
 ```bash
 git clone https://github.com/manufactory-project/gateway.git

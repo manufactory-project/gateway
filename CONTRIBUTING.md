@@ -10,7 +10,7 @@ Develop on Linux. CI runs on Ubuntu 24.04 with these tools:
 
 | Tool | Version | Used for |
 |---|---|---|
-| Go | 1.26.2 (set by `GOTOOLCHAIN` in the Taskfile) | build and test |
+| Go | 1.26.11 (set by `GOTOOLCHAIN` in the Taskfile) | build and test |
 | [Task](https://taskfile.dev) | 3.54.0 | running checks |
 | golangci-lint | 2.12.2 | `task lint` |
 | ShellCheck | 0.11.0 | `e2e/run.sh` |
@@ -59,6 +59,7 @@ The script refuses to use an existing project, asks before creating one, and del
 ## Rules that lint enforces
 
 - `gofmt` reports no files.
+- `govulncheck` finds no known vulnerabilities in reachable code.
 - Every directory with tests calls `goleak.VerifyTestMain`.
 - `//nolint:errcheck` is not allowed. Handle the error; `errcheck` also rejects discarding it with `_`.
 - Any other `nolint` directive names its linter and explains why.
