@@ -370,3 +370,11 @@ func TestLongPathGlobStillRejects(t *testing.T) {
 		}
 	}
 }
+
+func TestHostBindingsCoverEveryPrincipal(t *testing.T) {
+	eval := twoPrincipalEvaluator(t)
+	d := eval.DecideRequest("bob", "api.example.com", 443, "GET", "/")
+	if !d.Allow || !d.HasBindings || len(d.HostBindings) != 1 || len(d.MatchedBindings) != 0 || d.AllowWebSocket {
+		t.Fatalf("bob on alice's bound host = %+v; want redaction bindings, no substitution, no websocket", d)
+	}
+}

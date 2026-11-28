@@ -46,7 +46,7 @@ type hostPattern struct {
 
 type compiledSet struct {
 	byPrincipal map[string][]compiledRule
-	boundHosts  map[string]map[string][]config.BindingConfig // principal -> exact host -> bindings
+	boundHosts  map[string][]config.BindingConfig // exact host -> every principal's bindings
 	wsDefault   int64
 }
 
@@ -86,7 +86,7 @@ func (e *Evaluator) currentCompiled() *compiledSet {
 func compileConfig(cfg *config.Config) *compiledSet {
 	cs := &compiledSet{
 		byPrincipal: make(map[string][]compiledRule),
-		boundHosts:  make(map[string]map[string][]config.BindingConfig),
+		boundHosts:  make(map[string][]config.BindingConfig),
 		wsDefault:   cfg.HTTP.WSMaxEgressBytes,
 	}
 	for _, r := range cfg.Rules {
@@ -111,15 +111,8 @@ func compileConfig(cfg *config.Config) *compiledSet {
 		}
 		cs.byPrincipal[r.Principal] = append(cs.byPrincipal[r.Principal], cr)
 
-		if len(r.Bindings) > 0 {
-			m := cs.boundHosts[r.Principal]
-			if m == nil {
-				m = make(map[string][]config.BindingConfig)
-				cs.boundHosts[r.Principal] = m
-			}
-			for _, b := range r.Bindings {
-				m[b.Host] = append(m[b.Host], b)
-			}
+		for _, b := range r.Bindings {
+			cs.boundHosts[b.Host] = append(cs.boundHosts[b.Host], b)
 		}
 	}
 	return cs
@@ -179,7 +172,7 @@ func (e *Evaluator) decide(principal, rawHost string, port uint16, hostScope boo
 
 	cs := e.currentCompiled()
 	grants := e.store.ActiveGrants()
-	hostBindings := slices.Clone(cs.boundHosts[principal][host])
+	hostBindings := slices.Clone(cs.boundHosts[host])
 	hasBindings := len(hostBindings) > 0
 
 	best, hasBest := matchBestCandidate(cs, grants, principal, host, port, hostScope, methodUpper, reqPath)
