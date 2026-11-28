@@ -108,9 +108,11 @@ func (a testFlowAdapter) ListFlows() []admin.FlowInfo {
 	return out
 }
 
-func (a testFlowAdapter) CountFlows() int                   { return a.flows.Count() }
-func (a testFlowAdapter) RevokeByID(id string) int          { return a.flows.RevokeByID(id) }
-func (a testFlowAdapter) RevokeByGrant(id string) int       { return a.flows.RevokeByGrant(id, proxy.TeardownRevoked) }
+func (a testFlowAdapter) CountFlows() int          { return a.flows.Count() }
+func (a testFlowAdapter) RevokeByID(id string) int { return a.flows.RevokeByID(id) }
+func (a testFlowAdapter) RevokeByGrant(id string) int {
+	return a.flows.RevokeByGrant(id, proxy.TeardownRevoked)
+}
 func (a testFlowAdapter) RevokeByPrincipal(p, h string) int { return a.flows.RevokeByPrincipal(p, h) }
 
 func tcpPort(t *testing.T, addr net.Addr) uint16 {

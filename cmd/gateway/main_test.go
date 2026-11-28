@@ -788,9 +788,9 @@ rules:
 }
 
 type grantExpiredOrderSpy struct {
-	flows          *proxy.FlowRegistry
-	seen           atomic.Bool
-	flowsAtAudit   atomic.Int64
+	flows        *proxy.FlowRegistry
+	seen         atomic.Bool
+	flowsAtAudit atomic.Int64
 }
 
 func (s *grantExpiredOrderSpy) Write(p []byte) (int, error) {

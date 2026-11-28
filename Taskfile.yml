@@ -6,8 +6,16 @@ env:
 
 tasks:
   lint:
-    desc: Run golangci-lint and enforce goleak coverage and no-nolint:errcheck
+    desc: Run golangci-lint and enforce gofmt, goleak coverage, and no-nolint:errcheck
     cmds:
+      - |
+        set -eu
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "lint: gofmt found unformatted files:" >&2
+          echo "$unformatted" >&2
+          exit 1
+        fi
       - golangci-lint run ./...
       - |
         set -eu

@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	DefaultFakeCIDR            = "198.18.0.0/15"
-	DefaultDNSTTLSeconds       = 60
+	DefaultFakeCIDR                      = "198.18.0.0/15"
+	DefaultDNSTTLSeconds                 = 60
 	DefaultMaxRequestBodyBytes           = 32 << 20 // 32 MiB
 	DefaultWSMaxEgressBytes              = 64 << 20 // 64 MiB
 	DefaultMaxHeaderBytes                = 32 << 10 // 32 KiB
@@ -30,13 +30,13 @@ const (
 	DefaultUpstreamResponseHeaderTimeout = "10m"
 	DefaultAuditRetainDays               = 30
 	MaxAuditRetainDays                   = int(math.MaxInt64 / int64(24*time.Hour))
-	DefaultAuditMaxFileBytes             = 100 << 20        // 100 MiB
-	DefaultAuditMaxTotalBytes            = int64(10) << 30  // 10 GiB
+	DefaultAuditMaxFileBytes             = 100 << 20       // 100 MiB
+	DefaultAuditMaxTotalBytes            = int64(10) << 30 // 10 GiB
 	DefaultHTTPSPort                     = 10443
-	DefaultHTTPPort            = 10080
-	DefaultDNSPort             = 10053
-	DefaultDHCPLeaseTime       = "12h"
-	PlaceholderPrefix          = "mf_ph_"
+	DefaultHTTPPort                      = 10080
+	DefaultDNSPort                       = 10053
+	DefaultDHCPLeaseTime                 = "12h"
+	PlaceholderPrefix                    = "mf_ph_"
 )
 
 // Config is the validated, normalized gateway configuration.

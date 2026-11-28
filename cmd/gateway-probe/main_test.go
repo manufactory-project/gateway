@@ -98,8 +98,8 @@ func TestMockChecksAndSameIPMode(t *testing.T) {
 
 	// Start mock HTTPS server enforcing SNI == allow.example.test and Host == allow.example.test.
 	var (
-		sniMu        sync.Mutex
-		sawEmptySNI  bool
+		sniMu       sync.Mutex
+		sawEmptySNI bool
 	)
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,

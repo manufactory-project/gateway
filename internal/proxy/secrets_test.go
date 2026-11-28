@@ -345,9 +345,9 @@ func TestBindingScopedToOwningRuleAndSingleSnapshotRedaction(t *testing.T) {
 	secFile := writeSecretFile(t, secDir, "scoped.secret", secScoped+"\n")
 
 	var (
-		mu             sync.Mutex
-		lastKey        string
-		lastAcceptEnc  string
+		mu            sync.Mutex
+		lastKey       string
+		lastAcceptEnc string
 	)
 	gw := newTestGateway(t, testGatewaySpec{
 		Hosts: []string{"scoped.example.com"},

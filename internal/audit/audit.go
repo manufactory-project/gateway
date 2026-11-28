@@ -58,16 +58,16 @@ const (
 // Event is one structured JSONL audit record.
 // Redaction is enforced by schema: header values and query values have no fields here.
 type Event struct {
-	Version    int       `json:"version"`
-	Time       time.Time `json:"time"`
-	Kind       Kind      `json:"kind"`
-	Principal  string    `json:"principal,omitempty"`
-	Link       string    `json:"link,omitempty"`
-	SrcIP      string    `json:"src_ip,omitempty"`
-	Protocol   string    `json:"protocol,omitempty"`
-	Host       string    `json:"host,omitempty"`
-	Address    string    `json:"address,omitempty"`
-	Port       int       `json:"port,omitempty"`
+	Version        int       `json:"version"`
+	Time           time.Time `json:"time"`
+	Kind           Kind      `json:"kind"`
+	Principal      string    `json:"principal,omitempty"`
+	Link           string    `json:"link,omitempty"`
+	SrcIP          string    `json:"src_ip,omitempty"`
+	Protocol       string    `json:"protocol,omitempty"`
+	Host           string    `json:"host,omitempty"`
+	Address        string    `json:"address,omitempty"`
+	Port           int       `json:"port,omitempty"`
 	QType          string    `json:"qtype,omitempty"`
 	Method         string    `json:"method,omitempty"`
 	Methods        []string  `json:"methods,omitempty"`
@@ -82,14 +82,14 @@ type Event struct {
 	AllowWebSocket *bool     `json:"allow_websocket,omitempty"`
 	RevokedFlows   *int      `json:"revoked_flows,omitempty"`
 	TTL            string    `json:"ttl,omitempty"`
-	ExpiresAt  string    `json:"expires_at,omitempty"`
-	FlowID     string    `json:"flow_id,omitempty"`
-	Secrets    []string  `json:"secrets,omitempty"`
-	BytesOut     int64     `json:"bytes_out,omitempty"`
-	BytesIn      int64     `json:"bytes_in,omitempty"`
-	BytesRemoved int64     `json:"bytes_removed,omitempty"`
-	Error        string    `json:"error,omitempty"`
-	ConfigHash   string    `json:"config_hash,omitempty"`
+	ExpiresAt      string    `json:"expires_at,omitempty"`
+	FlowID         string    `json:"flow_id,omitempty"`
+	Secrets        []string  `json:"secrets,omitempty"`
+	BytesOut       int64     `json:"bytes_out,omitempty"`
+	BytesIn        int64     `json:"bytes_in,omitempty"`
+	BytesRemoved   int64     `json:"bytes_removed,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	ConfigHash     string    `json:"config_hash,omitempty"`
 }
 
 // Options configures an audit Writer.

@@ -122,10 +122,10 @@ func NewServer(opts Options) (*Server, error) {
 		return nil, errors.New("admin: store, flows, and audit are required")
 	}
 	return &Server{
-		socketPath:  opts.SocketPath,
-		socketGroup: opts.SocketGroup,
-		store:       opts.Store,
-		flows:       opts.Flows,
+		socketPath:   opts.SocketPath,
+		socketGroup:  opts.SocketGroup,
+		store:        opts.Store,
+		flows:        opts.Flows,
 		audit:        opts.Audit,
 		metrics:      opts.Metrics,
 		onServeError: opts.OnServeError,

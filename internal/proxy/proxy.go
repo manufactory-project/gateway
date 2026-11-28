@@ -33,13 +33,13 @@ const statusClientClosedRequest = 499
 
 // Options configures a per-link MITM proxy Server.
 type Options struct {
-	Link          config.LinkConfig
-	Store         *config.Store
-	Evaluator     *policy.Evaluator
-	Audit         *audit.Writer
-	Leaves        *ca.LeafCache
-	Dialer      *netguard.Dialer
-	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	Link           config.LinkConfig
+	Store          *config.Store
+	Evaluator      *policy.Evaluator
+	Audit          *audit.Writer
+	Leaves         *ca.LeafCache
+	Dialer         *netguard.Dialer
+	DialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
 	Flows          *FlowRegistry
 	OnRequest      func(principal, effect string, status int, reason string)
 	OnConnRejected func(link string)
@@ -338,21 +338,21 @@ func (s *Server) auditDeniedSNI(srcIP, sni, reason, ruleID string) {
 }
 
 type reqContext struct {
-	srv         *Server
-	r           *http.Request
-	srcIP       string
-	proto       string
-	host        string
-	dstPort     uint16
+	srv           *Server
+	r             *http.Request
+	srcIP         string
+	proto         string
+	host          string
+	dstPort       uint16
 	dec           policy.Decision
 	admitSnap     *config.Snapshot
 	admitGrantGen uint64
 	wantWS        bool
-	maxBody     int64
-	flowID      string
-	secretNames []string
-	subPairs    []secret.Pair
-	outHeaders  http.Header
+	maxBody       int64
+	flowID        string
+	secretNames   []string
+	subPairs      []secret.Pair
+	outHeaders    http.Header
 }
 
 func (rc *reqContext) baseEvent(kind audit.Kind) audit.Event {
