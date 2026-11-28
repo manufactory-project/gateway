@@ -43,6 +43,8 @@ type Options struct {
 	Audit          *audit.Writer
 	Leaves         *ca.LeafCache
 	Dialer         *netguard.Dialer
+	// DialContext is a test hook: tests redirect ports 443 and 80 to local mock
+	// upstreams, still through netguard.Dialer. Production leaves it nil.
 	DialContext    func(ctx context.Context, network, addr string) (net.Conn, error)
 	Flows          *FlowRegistry
 	OnRequest      func(principal, effect string, status int, reason string)
