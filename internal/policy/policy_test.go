@@ -319,3 +319,54 @@ rules:
 		t.Fatalf("DecideDNS(unknown.example.com) = %+v, want reason=default-deny", d)
 	}
 }
+
+func twoPrincipalEvaluator(t *testing.T) *policy.Evaluator {
+	t.Helper()
+	long := "/" + strings.Repeat("a", 80)
+	cfg := `
+ca: {cert_path: /tmp/ca.crt, key_path: /tmp/ca.key}
+audit: {dir: /tmp/audit}
+links:
+  - {name: a, principal: alice, subnet: 127.9.1.0/28, gateway_ip: 127.9.1.1}
+  - {name: b, principal: bob, subnet: 127.9.2.0/28, gateway_ip: 127.9.2.1}
+rules:
+  - id: alice-bound
+    principal: alice
+    effect: allow
+    hosts: [api.example.com]
+    bindings:
+      - {name: k, host: api.example.com, header: Authorization, scheme: bearer, placeholder: mf_ph_k, secret_file: /tmp/k}
+  - id: bob-open
+    principal: bob
+    effect: allow
+    hosts: [api.example.com]
+    allow_websocket: true
+  - id: bob-long
+    principal: bob
+    effect: allow
+    hosts: [long.example.com]
+    paths: ["` + long + `/*"]
+`
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	store, err := config.NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	return policy.NewEvaluator(store)
+}
+
+func TestLongPathGlobStillRejects(t *testing.T) {
+	eval := twoPrincipalEvaluator(t)
+	long := "/" + strings.Repeat("a", 80)
+	if d := eval.DecideRequest("bob", "long.example.com", 443, "GET", long+"/x"); !d.Allow {
+		t.Fatalf("long pattern should match: %+v", d)
+	}
+	for _, reqPath := range []string{long, long + "/x/y", "/other"} {
+		if d := eval.DecideRequest("bob", "long.example.com", 443, "GET", reqPath); d.Allow {
+			t.Fatalf("long pattern admitted %q", reqPath)
+		}
+	}
+}

@@ -295,6 +295,18 @@ rules:
 	if err != nil || len(relRes.WipedGrants) != 1 || relRes.WipedGrants[0] != g2.ID {
 		t.Fatalf("Reload = (%+v, %v)", relRes, err)
 	}
+
+	// A grant that cannot be audited is rolled back.
+	before := len(store.ActiveGrants())
+	if err := aw.Close(); err != nil {
+		t.Fatalf("close audit writer: %v", err)
+	}
+	if _, err := client.CreateGrant(ctx, admin.GrantRequest{Principal: "worker-claude", Host: "unaudited.example.com", TTL: "5m"}); err == nil {
+		t.Fatal("grant succeeded with an unwritable audit sink")
+	}
+	if got := len(store.ActiveGrants()); got != before {
+		t.Fatalf("active grants = %d after failed audit, want %d", got, before)
+	}
 }
 
 // TestStressReloadRevokeH1H2SSEAndSlowlorisBounds hammers SIGHUP + Admin Reload +

@@ -30,6 +30,14 @@ func boundRule(id, host, secretFile string) string {
 `, id, host, host, secretFile)
 }
 
+const openRule = `
+  - id: open
+    principal: worker-test
+    effect: allow
+    hosts: [api.example.com]
+    ports: [443]
+`
+
 // do sends req with a deadline so that a stalled response fails an assertion.
 func do(t *testing.T, c *http.Client, method, url string, hdr map[string]string) *http.Response {
 	t.Helper()
@@ -244,6 +252,46 @@ func TestReloadRemovingTheAdmittingRuleTearsDownItsFlow(t *testing.T) {
 	_, _, revoked, err := gw.Store.Reload()
 	if err != nil || revoked != 1 {
 		t.Fatalf("reload revoked %d flows, err %v; want 1 although another rule still allows the request", revoked, err)
+	}
+}
+
+func TestUpstreamSwitchingProtocolsWithoutUpgradeIsRefused(t *testing.T) {
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			writeRawHTTP1(w, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n")
+		}),
+		RulesYAML:  openRule,
+		UpstreamH1: true,
+	})
+	resp := do(t, gw.H1Client(t, "api.example.com"), http.MethodGet, "https://api.example.com/x", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	for _, ev := range gw.AuditEvents(t) {
+		if ev.Error == "unexpected-101" {
+			return
+		}
+	}
+	t.Fatal("no completion event with error unexpected-101")
+}
+
+func TestHeadersNamedByConnectionAreNotForwarded(t *testing.T) {
+	var leaked atomic.Bool
+	var reached atomic.Bool
+	gw := newTestGateway(t, testGatewaySpec{
+		Hosts: []string{"api.example.com"},
+		Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			reached.Store(true)
+			leaked.Store(r.Header.Get("X-Hop") != "")
+		}),
+		RulesYAML:  openRule,
+		UpstreamH1: true,
+	})
+	resp := do(t, gw.H1Client(t, "api.example.com"), http.MethodGet, "https://api.example.com/x",
+		map[string]string{"Connection": "X-Hop", "X-Hop": "secret-hop-value"})
+	if resp.StatusCode != http.StatusOK || !reached.Load() || leaked.Load() {
+		t.Fatalf("status = %d, reached = %v, X-Hop forwarded = %v; want 200, true, false", resp.StatusCode, reached.Load(), leaked.Load())
 	}
 }
 
