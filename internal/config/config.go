@@ -596,16 +596,11 @@ func validateDHCP(d DHCPConfig) error {
 	return nil
 }
 
-type principalHost struct {
-	principal string
-	host      string
-}
-
 func validateRules(cfg *Config, declaredPrincipals map[string]bool) error {
 	seenIDs := make(map[string]bool, len(cfg.Rules))
 	seenPlaceholders := make(map[string]string)
-	boundHosts := make(map[principalHost]string)
-	wsHosts := make(map[principalHost]string)
+	boundHosts := make(map[string]string) // exact host -> rule id
+	wsHosts := make(map[string]string)    // host pattern -> rule id
 
 	for i := range cfg.Rules {
 		r := &cfg.Rules[i]
@@ -618,7 +613,7 @@ func validateRules(cfg *Config, declaredPrincipals map[string]bool) error {
 		}
 		if r.AllowWebSocket {
 			for _, h := range r.Hosts {
-				wsHosts[principalHost{principal: r.Principal, host: h}] = r.ID
+				wsHosts[h] = r.ID
 			}
 		}
 		if err := validateRuleBindings(r, seenHosts, seenPlaceholders, boundHosts); err != nil {
@@ -721,7 +716,7 @@ func validateRuleFlags(r *RuleConfig, has443 bool) error {
 	return nil
 }
 
-func validateRuleBindings(r *RuleConfig, seenHosts map[string]bool, seenPlaceholders map[string]string, boundHosts map[principalHost]string) error {
+func validateRuleBindings(r *RuleConfig, seenHosts map[string]bool, seenPlaceholders map[string]string, boundHosts map[string]string) error {
 	seenBindings := make(map[string]bool, len(r.Bindings))
 	for bi := range r.Bindings {
 		b := &r.Bindings[bi]
@@ -736,22 +731,20 @@ func validateRuleBindings(r *RuleConfig, seenHosts map[string]bool, seenPlacehol
 			return fmt.Errorf("rules[%s].bindings[%s]: duplicate placeholder %q (already used by rule %q)", r.ID, b.Name, b.Placeholder, prevRule)
 		}
 		seenPlaceholders[b.Placeholder] = r.ID
-		boundHosts[principalHost{principal: r.Principal, host: b.Host}] = r.ID
+		boundHosts[b.Host] = r.ID
 	}
 	return nil
 }
 
-// Cross-rule safety check: a host with a binding for a principal must not also
-// have allow_websocket enabled on another rule for the same principal.
-func checkWebSocketBindingConflicts(boundHosts, wsHosts map[principalHost]string) error {
-	for bh, bRuleID := range boundHosts {
-		for wh, wRuleID := range wsHosts {
-			if bh.principal != wh.principal {
-				continue
-			}
-			if bh.host == wh.host || wildcardMatches(wh.host, bh.host) {
-				return fmt.Errorf("rules[%s]: allow_websocket on %q conflicts with binding on host %q in rule %q for principal %q",
-					wRuleID, wh.host, bh.host, bRuleID, bh.principal)
+// Cross-rule safety check: a host with a binding, whichever principal owns it,
+// must not be reachable by allow_websocket on any rule, because a bound host's
+// responses are redacted for every principal and WebSocket frames are not.
+func checkWebSocketBindingConflicts(boundHosts, wsHosts map[string]string) error {
+	for bound, bRuleID := range boundHosts {
+		for pattern, wRuleID := range wsHosts {
+			if pattern == bound || wildcardMatches(pattern, bound) {
+				return fmt.Errorf("rules[%s]: allow_websocket on %q conflicts with binding on host %q in rule %q",
+					wRuleID, pattern, bound, bRuleID)
 			}
 		}
 	}

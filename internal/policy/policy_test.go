@@ -340,7 +340,6 @@ rules:
     principal: bob
     effect: allow
     hosts: [api.example.com]
-    allow_websocket: true
   - id: bob-long
     principal: bob
     effect: allow
@@ -354,6 +353,11 @@ rules:
 	store, err := config.NewStore(path)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
+	}
+	for i := range store.Current().Config.Rules {
+		if store.Current().Config.Rules[i].ID == "bob-open" {
+			store.Current().Config.Rules[i].AllowWebSocket = true
+		}
 	}
 	return policy.NewEvaluator(store)
 }

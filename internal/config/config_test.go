@@ -157,6 +157,16 @@ func TestConfigValidationInvariants(t *testing.T) {
 			wantError: "conflicts with binding",
 		},
 		{
+			name:      "reject another principal's websocket on bound host",
+			yaml:      validYAML + "\n  - id: other-ws\n    principal: worker-codex\n    effect: allow\n    hosts: [forge.internal.example]\n    ports: [443]\n    allow_websocket: true\n",
+			wantError: "conflicts with binding",
+		},
+		{
+			name:      "reject another principal's wildcard websocket covering bound host",
+			yaml:      validYAML + "\n  - id: other-ws-wild\n    principal: worker-codex\n    effect: allow\n    hosts: [\"*.internal.example\"]\n    ports: [443]\n    allow_websocket: true\n",
+			wantError: "conflicts with binding",
+		},
+		{
 			name:      "reject duplicate placeholder across bindings",
 			yaml:      validYAML + "\n  - id: dup-ph\n    principal: worker-codex\n    effect: allow\n    hosts: [api.example.com]\n    ports: [443]\n    bindings:\n      - name: b2\n        host: api.example.com\n        header: Authorization\n        scheme: bearer\n        placeholder: mf_ph_forgejo\n        secret_file: /run/credentials/gateway/other\n",
 			wantError: "duplicate placeholder",
@@ -379,6 +389,9 @@ func TestReloadRefusesImmutableSectionsConcurrentGrantAndMultiCallbacks(t *testi
 	}
 	if _, err := store.AddGrant("worker-claude", "forge.internal.example", 443, nil, nil, time.Minute, true); err == nil {
 		t.Fatal("expected AddGrant with allow_websocket on bound host to fail")
+	}
+	if _, err := store.AddGrant("worker-codex", "forge.internal.example", 443, nil, nil, time.Minute, true); err == nil {
+		t.Fatal("expected AddGrant with allow_websocket on another principal's bound host to fail")
 	}
 	if _, err := store.AddGrant("worker-claude", "glob.example.com", 443, nil, []string{"/**/a/**"}, time.Minute, false); err == nil {
 		t.Fatal("expected AddGrant with two '**' wildcards to fail")

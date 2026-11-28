@@ -278,9 +278,6 @@ func (s *Store) AddGrant(principal, rawHost string, port uint16, methods, paths 
 	}
 	if allowWebSocket {
 		for _, r := range snap.Config.Rules {
-			if r.Principal != principal {
-				continue
-			}
 			for _, b := range r.Bindings {
 				if b.Host == host {
 					s.mu.Unlock()
