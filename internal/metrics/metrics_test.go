@@ -1,60 +1,40 @@
-package metrics_test
+package metrics
 
 import (
 	"context"
 	"io"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/goleak"
-
-	"github.com/manufactory-project/gateway/internal/metrics"
 )
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func freePort(t *testing.T, ip string) uint16 {
-	t.Helper()
-	ln, err := net.Listen("tcp4", ip+":0")
-	if err != nil {
-		t.Fatalf("freePort %s: %v", ip, err)
-	}
-	ta, ok := ln.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("unexpected addr type %T", ln.Addr())
-	}
-	p := uint16(ta.Port)
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close freePort: %v", err)
-	}
-	return p
-}
-
 func TestMetricsExplicitBindAndExposition(t *testing.T) {
-	col := metrics.NewCollector(metrics.Options{
+	col := NewCollector(Options{
 		ActiveFlows:  func() int { return 3 },
 		ActiveGrants: func() int { return 1 },
 	})
 
 	// Containment: wildcard listen addresses (including v4-mapped ::ffff:0.0.0.0) are forbidden.
 	for _, bad := range []string{"0.0.0.0:9102", ":9102", "[::]:9102", "[::ffff:0.0.0.0]:9102", "localhost:9102"} {
-		if _, err := metrics.NewServer(bad, col, func(error) {}); err == nil {
+		if _, err := NewServer(bad, col, func(error) {}); err == nil {
 			t.Fatalf("expected NewServer(%q) to fail", bad)
 		}
 	}
 
 	// Positive control: explicit loopback IP binds and serves Prometheus metrics.
-	listenAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(freePort(t, "127.0.0.1"))))
-	if _, err := metrics.NewServer(listenAddr, col, nil); err == nil {
+	// Port 0 lets the server pick its port, so no other test can take it first.
+	const listenAddr = "127.0.0.1:0"
+	if _, err := NewServer(listenAddr, col, nil); err == nil {
 		t.Fatal("expected metrics.NewServer with nil onServeError to fail")
 	}
-	srv, err := metrics.NewServer(listenAddr, col, func(error) {})
+	srv, err := NewServer(listenAddr, col, func(error) {})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -79,7 +59,7 @@ func TestMetricsExplicitBindAndExposition(t *testing.T) {
 	tr := &http.Transport{}
 	t.Cleanup(tr.CloseIdleConnections)
 	client := &http.Client{Transport: tr}
-	resp, err := client.Get("http://" + listenAddr + "/metrics")
+	resp, err := client.Get("http://" + srv.ln.Addr().String() + "/metrics")
 	if err != nil {
 		t.Fatalf("GET /metrics: %v", err)
 	}
