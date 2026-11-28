@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,7 +100,7 @@ func TestAdmissionRecheckOfBoundRuleChangedBetweenPrepareAndRegister(t *testing.
 				Leaves:       ca.NewLeafCache(rootCA),
 				Flows:        NewFlowRegistry(),
 				OnServeError: func(error) {},
-				DialContext: func(context.Context, string, string) (net.Conn, error) {
+				DialContext: func(context.Context, string, string, netip.Addr) (net.Conn, error) {
 					dialHits.Add(1)
 					return nil, net.ErrClosed
 				},
