@@ -460,6 +460,7 @@ func (s *Server) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	// The grant-created record is written before the grant exists, so a grant is
 	// never live without being audited and there is nothing to roll back.
+	var recorded config.Grant // set once its grant-created record is written
 	g, err := s.store.AddGrant(req.Principal, req.Host, req.Port, req.Methods, req.Paths, ttl, req.AllowWebSocket, func(g config.Grant) error {
 		allowWS := g.AllowWebSocket
 		if err := s.record(r, audit.Event{
@@ -478,8 +479,19 @@ func (s *Server) handleCreateGrant(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return errors.Join(errAuditUnavailable, err)
 		}
+		recorded = g
 		return nil
 	})
+	if err != nil && recorded.ID != "" {
+		// The insert failed after the record was written (a reload wiped grants in
+		// between): say that this grant never went live.
+		if aErr := s.record(r, audit.Event{
+			Kind: audit.KindGrant, Principal: recorded.Principal, Host: recorded.Host, Port: int(recorded.Port),
+			GrantID: recorded.ID, Effect: audit.EffectDeny, Reason: "grant-aborted", Error: err.Error(),
+		}); aErr != nil {
+			err = errors.Join(errAuditUnavailable, aErr)
+		}
+	}
 	switch {
 	case errors.Is(err, errAuditUnavailable):
 		writeError(w, http.StatusServiceUnavailable, errAuditUnavailable.Error())

@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/manufactory-project/gateway/internal/admin"
 	"github.com/manufactory-project/gateway/internal/audit"
@@ -46,6 +48,11 @@ type adminEnv struct {
 
 func newAdminEnv(t *testing.T, opts admin.Options) *adminEnv {
 	t.Helper()
+	return newAdminEnvAudit(t, opts, audit.Options{})
+}
+
+func newAdminEnvAudit(t *testing.T, opts admin.Options, auditOpts audit.Options) *adminEnv {
+	t.Helper()
 	dir := t.TempDir()
 	auditDir := filepath.Join(dir, "audit")
 	cfgPath := filepath.Join(dir, "gateway.yaml")
@@ -74,7 +81,8 @@ links:
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	aw, err := audit.NewWriter(audit.Options{Dir: auditDir})
+	auditOpts.Dir = auditDir
+	aw, err := audit.NewWriter(auditOpts)
 	if err != nil {
 		t.Fatalf("audit.NewWriter: %v", err)
 	}
@@ -271,5 +279,113 @@ func TestAdminSocketModeAndNoStagingLeftovers(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("socket dir holds %d entries, want only the socket", len(entries))
+	}
+}
+
+// mirrorSink collects the audit stdout mirror, which keeps every record even when
+// the size-pruned segments no longer do, and wakes waiters on each one.
+type mirrorSink struct {
+	mu    sync.Mutex
+	buf   strings.Builder
+	wrote chan struct{}
+}
+
+func (m *mirrorSink) Write(p []byte) (int, error) {
+	m.mu.Lock()
+	m.buf.Write(p)
+	m.mu.Unlock()
+	select {
+	case m.wrote <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+func (m *mirrorSink) events(t *testing.T) []audit.Event {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []audit.Event
+	for _, line := range strings.Split(strings.TrimSpace(m.buf.String()), "\n") {
+		var ev audit.Event
+		if line != "" {
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// TestGrantAbortedWhenAReloadLandsBeforeItGoesLive pins that a grant whose
+// grant-created record was written but which a reload kept from going live gets a
+// grant-aborted record with the same id, so the log never shows a phantom grant.
+func TestGrantAbortedWhenAReloadLandsBeforeItGoesLive(t *testing.T) {
+	var armed atomic.Bool
+	var store *config.Store
+	mirror := &mirrorSink{wrote: make(chan struct{}, 64)}
+	// Every write rotates and prunes the previous segment, and the prune callback
+	// runs inside WriteSync: a reload there lands exactly between the record being
+	// written and the grant being inserted.
+	e := newAdminEnvAudit(t, admin.Options{}, audit.Options{
+		MaxFileBytes: 1, MaxTotalBytes: 1, Stdout: mirror,
+		OnSizePrune: func(int64) {
+			if armed.Load() {
+				if _, _, _, err := store.Reload(); err != nil {
+					t.Errorf("Reload: %v", err)
+				}
+			}
+		},
+	})
+	store = e.store
+	ctx := context.Background()
+
+	ok, err := e.client.CreateGrant(ctx, grantReq("5m"))
+	if err != nil {
+		t.Fatalf("control: grant without a racing reload: %v", err)
+	}
+	armed.Store(true)
+	if _, err := e.client.CreateGrant(ctx, grantReq("5m")); err == nil {
+		t.Fatal("grant that a reload kept from going live was reported created")
+	}
+	armed.Store(false)
+
+	deadline := time.After(10 * time.Second)
+	for {
+		var aborted []audit.Event
+		for _, ev := range mirror.events(t) {
+			if ev.Reason == "grant-aborted" {
+				aborted = append(aborted, ev)
+			}
+		}
+		if len(aborted) == 1 {
+			break
+		}
+		select {
+		case <-mirror.wrote:
+		case <-deadline:
+			t.Fatalf("no grant-aborted record for the phantom grant; saw %d", len(aborted))
+		}
+	}
+	created, aborted := map[string]bool{}, map[string]bool{}
+	for _, ev := range mirror.events(t) {
+		switch ev.Reason {
+		case "grant-created":
+			created[ev.GrantID] = true
+		case "grant-aborted":
+			aborted[ev.GrantID] = true
+		}
+	}
+	if len(created) != 2 || len(aborted) != 1 {
+		t.Fatalf("created=%v aborted=%v, want two created and one aborted", created, aborted)
+	}
+	for id := range aborted {
+		if !created[id] || id == ok.ID {
+			t.Fatalf("grant-aborted %s does not match the phantom grant-created record", id)
+		}
+	}
+	if got := len(e.store.ActiveGrants()); got != 0 {
+		t.Fatalf("live grants = %d, want 0 (the reload wiped the control grant)", got)
 	}
 }

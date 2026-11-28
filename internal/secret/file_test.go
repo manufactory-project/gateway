@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/manufactory-project/gateway/internal/secret"
 )
@@ -71,8 +72,24 @@ func TestFileResolverRefusesUnsafeFiles(t *testing.T) {
 		"directory":      dir,
 		"device":         "/dev/zero",
 	} {
-		if got, err := res.Resolve(p); err == nil {
-			t.Errorf("%s: Resolve = %q, want an error", name, got)
+		// Without the regular-file check a FIFO that holds data blocks the read
+		// forever, so the call is guarded and a hang is reported as that failure.
+		type result struct {
+			val string
+			err error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			v, err := res.Resolve(p)
+			ch <- result{v, err}
+		}()
+		select {
+		case r := <-ch:
+			if r.err == nil {
+				t.Errorf("%s: Resolve = %q, want an error", name, r.val)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: Resolve blocked on a non-regular secret file; it must be refused before reading", name)
 		}
 	}
 }
