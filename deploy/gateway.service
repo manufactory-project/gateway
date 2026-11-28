@@ -1,0 +1,25 @@
+[Unit]
+Description=gateway egress-only network gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=gateway
+Group=gateway
+ExecStartPre=+/usr/local/bin/gateway netsetup --config /etc/gateway/gateway.yaml
+ExecStart=/usr/local/bin/gateway run --config /etc/gateway/gateway.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RuntimeDirectory=gateway
+RuntimeDirectoryMode=0750
+LogsDirectory=gateway/audit
+
+[Install]
+WantedBy=multi-user.target

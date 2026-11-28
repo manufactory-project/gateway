@@ -1,0 +1,38 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - funlen
+    - gocognit
+    - govet
+    - ineffassign
+    - nolintlint
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocognit:
+      min-complexity: 40
+    funlen:
+      lines: 120
+      statements: 80
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    rules:
+      - path: _test\.go$
+        linters:
+          - funlen
+          - gocognit
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

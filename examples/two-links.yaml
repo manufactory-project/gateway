@@ -1,0 +1,79 @@
+# Two-link gateway v0.1 example with allow rules for one test upstream.
+
+ca:
+  cert_path: /etc/gateway/ca/ca.crt
+  key_path: /etc/gateway/ca/ca.key
+
+audit:
+  # Managed by LogsDirectory=gateway/audit in deploy/gateway.service.
+  dir: /var/log/gateway/audit
+  retain_days: 30
+  max_file_bytes: 104857600
+  max_total_bytes: 10737418240
+  stdout_json: true
+
+admin:
+  socket: /run/gateway/admin.sock
+  socket_group: gateway
+
+metrics:
+  listen: 127.0.0.1:9102
+
+dataplane:
+  ready_file: /run/gateway-dataplane/dataplane.ready
+  dhcp:
+    user: dnsmasq
+    lease_file: /var/lib/gateway/dnsmasq.leases
+    config_path: /run/gateway-dataplane/dnsmasq.conf
+    lease_time: 12h
+
+dns:
+  fake_cidr: 198.18.0.0/15
+  ttl_seconds: 60
+
+http:
+  max_request_body_bytes: 33554432
+  ws_max_egress_bytes: 67108864
+  max_header_bytes: 32768
+  max_conns_per_link: 512
+  upstream_response_header_timeout: 10m
+
+links:
+  - name: sbx0
+    interface: sbx0
+    principal: guest0
+    subnet: 10.200.0.0/28
+    gateway_ip: 10.200.0.1
+    https_port: 10443
+    http_port: 10080
+    dns_port: 10053
+    ct_zone: 101
+    route_table: 101
+
+  - name: sbx1
+    interface: sbx1
+    principal: guest1
+    subnet: 10.200.0.16/28
+    gateway_ip: 10.200.0.17
+    https_port: 10443
+    http_port: 10080
+    dns_port: 10053
+    ct_zone: 102
+    route_table: 102
+
+rules:
+  - id: guest0-test-upstream
+    principal: guest0
+    effect: allow
+    hosts: [httpbingo.org]
+    ports: [443]
+    methods: [GET, POST]
+    paths: ["/**"]
+
+  - id: guest1-test-upstream
+    principal: guest1
+    effect: allow
+    hosts: [httpbingo.org]
+    ports: [443]
+    methods: [GET, POST]
+    paths: ["/**"]
